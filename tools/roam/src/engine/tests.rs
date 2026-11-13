@@ -215,3 +215,14 @@ fn a_closed_computer_is_not_offered_to() {
     std::thread::sleep(Duration::from_millis(700));
     assert!(b.status.try_iter().last().is_none_or(|s| s.asks.is_empty()));
 }
+
+#[test]
+fn a_mac_swipe_is_the_same_shortcut_on_windows() {
+    use crate::keys::{D, LEFT_CTRL, LEFT_GUI, RIGHT, TAB};
+    let up = super::swipe_keys(Swipe::Up, Os::Windows);
+    assert_eq!(up, [(LEFT_GUI, true), (TAB, true), (TAB, false), (LEFT_GUI, false)]);
+    assert_eq!(super::swipe_keys(Swipe::Down, Os::Windows)[1], (D, true));
+    let right = super::swipe_keys(Swipe::Right, Os::Windows);
+    assert_eq!(right[..3], [(LEFT_CTRL, true), (LEFT_GUI, true), (RIGHT, true)]);
+    assert_eq!(super::swipe_keys(Swipe::Up, Os::Mac)[0], (LEFT_CTRL, true));
+}

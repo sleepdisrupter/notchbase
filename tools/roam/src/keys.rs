@@ -11,6 +11,12 @@ pub const RIGHT_SHIFT: u16 = 0xE5;
 pub const RIGHT_ALT: u16 = 0xE6;
 pub const RIGHT_GUI: u16 = 0xE7;
 pub const ESCAPE: u16 = 0x29;
+pub const TAB: u16 = 0x2B;
+pub const D: u16 = 0x07;
+pub const RIGHT: u16 = 0x4F;
+pub const LEFT: u16 = 0x50;
+pub const DOWN: u16 = 0x51;
+pub const UP: u16 = 0x52;
 pub const H: u16 = 0x0B;
 pub const L: u16 = 0x0F;
 

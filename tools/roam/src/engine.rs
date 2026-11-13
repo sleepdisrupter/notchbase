@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bulk::{self, Arrived, Content, Hello};
 use crate::crypto::{self, Ephemeral, Handshake, Identity, commit, hex, unhex};
-use crate::input::{self, Copied, Input, Platform, Play};
+use crate::input::{self, Copied, Input, Platform, Play, Swipe};
 use crate::keys;
 use crate::layout::{self, Computer, Rect, Step};
 use crate::link::Link;
@@ -1586,6 +1586,13 @@ impl Core {
                 let speed = self.scroll_speed(peer);
                 self.queue_to(peer, Message::Wheel { dx: dx * speed, dy: dy * speed }, now);
             }
+            Input::Swipe(swipe) => {
+                let os = self.peers.get(&peer).map_or(Os::Other, |p| p.os);
+                self.note(&format!("trackpad swipe {swipe:?} for {}", self.who(peer)));
+                for (hid, down) in swipe_keys(swipe, os) {
+                    self.queue_to(peer, Message::Key { hid, down }, now);
+                }
+            }
         }
     }
 
@@ -2047,6 +2054,26 @@ fn local_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
 fn blocked(err: &std::io::Error) -> bool {
     matches!(err.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::HostUnreachable)
         || matches!(err.raw_os_error(), Some(1 | 13 | 65))
+}
+
+/// The shortcut that does what a trackpad swipe does on a Mac, on a computer of kind `os`: the
+/// keys pressed in order and let go in reverse.
+fn swipe_keys(swipe: Swipe, os: Os) -> Vec<(u16, bool)> {
+    use keys::{D, DOWN, LEFT, LEFT_CTRL, LEFT_GUI, RIGHT, TAB, UP};
+    let held: &[u16] = match (os, swipe) {
+        // Windows' own touchpad: three fingers up is Task View, down shows the desktop, and
+        // four fingers sideways switch desktops.
+        (Os::Windows, Swipe::Up) => &[LEFT_GUI, TAB],
+        (Os::Windows, Swipe::Down) => &[LEFT_GUI, D],
+        (Os::Windows, Swipe::Left) => &[LEFT_CTRL, LEFT_GUI, LEFT],
+        (Os::Windows, Swipe::Right) => &[LEFT_CTRL, LEFT_GUI, RIGHT],
+        // Another Mac: the keyboard shortcuts for the same things.
+        (_, Swipe::Up) => &[LEFT_CTRL, UP],
+        (_, Swipe::Down) => &[LEFT_CTRL, DOWN],
+        (_, Swipe::Left) => &[LEFT_CTRL, LEFT],
+        (_, Swipe::Right) => &[LEFT_CTRL, RIGHT],
+    };
+    held.iter().map(|&hid| (hid, true)).chain(held.iter().rev().map(|&hid| (hid, false))).collect()
 }
 
 /// One incoming transfer, on its own thread: checks it belongs to a live session with the

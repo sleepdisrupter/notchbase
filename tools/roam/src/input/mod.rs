@@ -35,6 +35,21 @@ pub enum Input {
         hid: u16,
         down: bool,
     },
+    /// A trackpad swipe the system would act on itself, such as Mission Control.
+    Swipe(Swipe),
+}
+
+/// The system's own trackpad swipes, by what they do on a Mac.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Swipe {
+    /// Mission Control.
+    Up,
+    /// App Exposé.
+    Down,
+    /// To the space on the left.
+    Left,
+    /// To the space on the right.
+    Right,
 }
 
 /// Input to play back as if it came from this computer's own mouse and keyboard.

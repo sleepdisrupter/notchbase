@@ -15,7 +15,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 
-use super::{Input, Platform, Play, Sink, Watchdog};
+use super::{Input, Platform, Play, Sink, Swipe, Watchdog};
 use crate::keys;
 use crate::layout::Rect;
 
@@ -144,6 +144,9 @@ const SCROLL: u32 = 22;
 const OTHER_DOWN: u32 = 25;
 const OTHER_UP: u32 = 26;
 const OTHER_DRAGGED: u32 = 27;
+/// The system's trackpad gestures, and the swipes that drive Mission Control and Spaces.
+const GESTURE: u32 = 29;
+const DOCK_CONTROL: u32 = 30;
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_BY_INPUT: u32 = 0xFFFF_FFFF;
 
@@ -158,6 +161,16 @@ const SCROLL_POINT_1: u32 = 96;
 const SCROLL_POINT_2: u32 = 97;
 const SCROLL_CONTINUOUS: u32 = 88;
 const USER_DATA: u32 = 42;
+const GESTURE_HID_TYPE: u32 = 110;
+const SWIPE_MOTION: u32 = 123;
+const SWIPE_PROGRESS: u32 = 124;
+const GESTURE_PHASE: u32 = 132;
+/// The gesture HID type of a Mission Control or Spaces swipe.
+const DOCK_SWIPE: i64 = 23;
+const MOTION_HORIZONTAL: i64 = 1;
+const MOTION_VERTICAL: i64 = 2;
+const PHASE_BEGAN: i64 = 1;
+const PHASE_ENDED: i64 = 4;
 
 /// Marks the events Roam posts, so its own tap lets them by.
 const MARK: i64 = 0x526F_616D; // "Roam"
@@ -243,7 +256,40 @@ struct Tap {
     sink: Sink,
     captured: Arc<AtomicBool>,
     port: AtomicPtr<c_void>,
+    /// A second tap, at the session level, for the system's gestures.
+    gestures: AtomicPtr<c_void>,
     local: Mutex<HashSet<u16>>,
+    swipe: Mutex<Swiping>,
+}
+
+/// A Mission Control or Spaces swipe so far.
+#[derive(Default)]
+struct Swiping {
+    motion: i64,
+    progress: f64,
+}
+
+impl Swiping {
+    /// Follows one event of the swipe. The swipe, once it ends.
+    fn follow(&mut self, phase: i64, motion: i64, progress: f64) -> Option<Swipe> {
+        if phase == PHASE_BEGAN {
+            *self = Swiping::default();
+        }
+        if motion != 0 {
+            self.motion = motion;
+        }
+        self.progress += progress;
+        if phase != PHASE_ENDED {
+            return None;
+        }
+        let swiping = std::mem::take(self);
+        match swiping.motion {
+            _ if swiping.progress == 0.0 => None,
+            MOTION_HORIZONTAL => Some(if swiping.progress > 0.0 { Swipe::Right } else { Swipe::Left }),
+            MOTION_VERTICAL => Some(if swiping.progress < 0.0 { Swipe::Up } else { Swipe::Down }),
+            _ => None,
+        }
+    }
 }
 
 struct Running {
@@ -496,10 +542,11 @@ extern "C" fn tapped(_proxy: Ref, kind: u32, event: Ref, user: *mut c_void) -> R
     // SAFETY: `user` is the `Tap` kept alive by `Running` for as long as the tap exists.
     let tap = unsafe { &*(user as *const Tap) };
     if kind == TAP_DISABLED_BY_TIMEOUT || kind == TAP_DISABLED_BY_INPUT {
-        let port = tap.port.load(Ordering::Acquire);
-        if !port.is_null() {
-            // SAFETY: the port is valid while the tap runs.
-            unsafe { CGEventTapEnable(port, true) };
+        for port in [tap.port.load(Ordering::Acquire), tap.gestures.load(Ordering::Acquire)] {
+            if !port.is_null() {
+                // SAFETY: the ports are valid while the tap runs.
+                unsafe { CGEventTapEnable(port, true) };
+            }
         }
         return event;
     }
@@ -555,6 +602,23 @@ extern "C" fn tapped(_proxy: Ref, kind: u32, event: Ref, user: *mut c_void) -> R
                 };
                 (tap.sink)(Input::Wheel { dx: dx as f32, dy: dy as f32 });
                 swallow
+            }
+            // While the cursor is on another computer, the system's swipes don't act here: Mission
+            // Control and Spaces swipes become the same thing over there.
+            GESTURE | DOCK_CONTROL => {
+                if !captured {
+                    return event;
+                }
+                if CGEventGetIntegerValueField(event, GESTURE_HID_TYPE) == DOCK_SWIPE {
+                    let phase = CGEventGetIntegerValueField(event, GESTURE_PHASE);
+                    let motion = CGEventGetIntegerValueField(event, SWIPE_MOTION);
+                    let progress = CGEventGetDoubleValueField(event, SWIPE_PROGRESS);
+                    let ended = tap.swipe.lock().unwrap_or_else(|e| e.into_inner()).follow(phase, motion, progress);
+                    if let Some(swipe) = ended {
+                        (tap.sink)(Input::Swipe(swipe));
+                    }
+                }
+                std::ptr::null_mut()
             }
             KEY_DOWN | KEY_UP => {
                 let code = CGEventGetIntegerValueField(event, KEYCODE) as u16;
@@ -633,7 +697,9 @@ impl Platform for Mac {
             sink,
             captured: self.captured.clone(),
             port: AtomicPtr::new(std::ptr::null_mut()),
+            gestures: AtomicPtr::new(std::ptr::null_mut()),
             local: Mutex::new(HashSet::new()),
+            swipe: Mutex::new(Swiping::default()),
         });
         let (ready, started) = std::sync::mpsc::channel::<Result<usize, String>>();
         let keep = tap.clone();
@@ -653,6 +719,8 @@ impl Platform for Mac {
                 OTHER_DOWN,
                 OTHER_UP,
                 OTHER_DRAGGED,
+                GESTURE,
+                DOCK_CONTROL,
             ]
             .iter()
             .fold(0, |mask, kind| mask | (1 << kind));
@@ -676,8 +744,28 @@ impl Platform for Mac {
                 CFRetain(run_loop);
                 CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
                 CGEventTapEnable(port, true);
+                // Gestures may only be seen at the session level. Whichever tap sees one first
+                // decides: one that swallows it keeps it from the other.
+                let gesture_mask = (1u64 << GESTURE) | (1u64 << DOCK_CONTROL);
+                let gestures = CGEventTapCreate(SESSION_TAP, 0, 0, gesture_mask, tapped, user);
+                let gesture_source = if gestures.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    keep.gestures.store(gestures, Ordering::Release);
+                    let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), gestures, 0);
+                    CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
+                    CGEventTapEnable(gestures, true);
+                    source
+                };
                 let _ = ready.send(Ok(run_loop as usize));
                 CFRunLoopRun();
+                if !gestures.is_null() {
+                    CGEventTapEnable(gestures, false);
+                    keep.gestures.store(std::ptr::null_mut(), Ordering::Release);
+                    CFMachPortInvalidate(gestures);
+                    CFRelease(gesture_source);
+                    CFRelease(gestures);
+                }
                 CGEventTapEnable(port, false);
                 keep.port.store(std::ptr::null_mut(), Ordering::Release);
                 CFMachPortInvalidate(port);
