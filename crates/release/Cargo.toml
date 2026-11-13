@@ -1,0 +1,21 @@
+[package]
+name = "notchbase-release"
+version = "0.1.0"
+edition.workspace = true
+description = "notchbase versions, reading releases from GitHub, downloading them and the install contract, shared by the app and its installer"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+notchbase-net.workspace = true
+serde = { workspace = true, features = ["derive"] }
+ureq = { workspace = true, features = ["native-tls", "json"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[dev-dependencies]
+serde_json.workspace = true

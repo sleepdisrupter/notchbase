@@ -1,0 +1,313 @@
+[workspace]
+members = ["crates/*", "dock", "sdk", "setup", "tools/*"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/sleepdisrupter/notchbase"
+homepage = "https://github.com/sleepdisrupter/notchbase"
+rust-version = "1.88"
+
+[workspace.dependencies]
+egui = "0.36"
+image = { version = "0.25", default-features = false }
+jiff = "0.2"
+notchbase-build = { path = "crates/build" }
+notchbase-net = { path = "crates/net" }
+notchbase-paint = { path = "crates/paint" }
+notchbase-release = { path = "crates/release" }
+notchbase-sdk = { path = "sdk" }
+notchbase-spectrum = { path = "crates/spectrum" }
+notchbase-usage = { path = "crates/usage" }
+notchbase-wasapi = { path = "crates/wasapi" }
+raw-window-handle = "0.6"
+serde = "1"
+serde_json = "1"
+sha2 = "0.11"
+ureq = { version = "3", default-features = false }
+windows = "0.62"
+windows-sys = "0.61"
+
+[package]
+name = "notchbase"
+version = "0.23.24"
+edition.workspace = true
+description = "A fluid notch for macOS and Windows that actually does things"
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alerts = { path = "tools/alerts" }
+arboard = "3"
+base64 = "0.23"
+battery = { path = "tools/battery" }
+calendar = { path = "tools/calendar" }
+camera-mic = { path = "tools/camera-mic" }
+color-picker = { path = "tools/color-picker" }
+downloads = { path = "tools/downloads" }
+egui.workspace = true
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links"] }
+egui_glow = { version = "0.36", features = ["winit"] }
+flacenc = { version = "0.5", default-features = false }
+flate2 = "1"
+focus-status = { path = "tools/focus-status" }
+global-hotkey = "0.8"
+glow = "0.17"
+glutin = "0.32"
+glutin-winit = "0.5"
+hound = "3.5"
+image = { workspace = true, features = ["png", "jpeg", "webp", "tiff", "bmp", "gif", "ico"] }
+jiff.workspace = true
+keep-awake = { path = "tools/keep-awake" }
+libloading = "0.8"
+lopdf = { version = "0.45", default-features = false }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+memchr = "2"
+notchbase-net.workspace = true
+notchbase-paint.workspace = true
+notchbase-release.workspace = true
+notchbase-sdk.workspace = true
+notchbase-spectrum.workspace = true
+notchbase-usage.workspace = true
+png = "0.18"
+roam = { path = "tools/roam" }
+raw-window-handle.workspace = true
+screen-recorder = { path = "tools/screen-recorder" }
+screenshot = { path = "tools/screenshot" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2.workspace = true
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac",
+    "adpcm",
+    "aiff",
+    "alac",
+    "caf",
+    "flac",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
+timer = { path = "tools/timer" }
+ureq = { workspace = true, features = ["native-tls", "json"] }
+wasmi = { version = "2", default-features = false, features = ["stable", "std", "validate", "portable-dispatch"] }
+winit = "0.30"
+
+[build-dependencies]
+notchbase-build.workspace = true
+
+[dev-dependencies]
+wasmi = { version = "2", default-features = false, features = ["wat"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "FoundationErrors",
+    "NSArray",
+    "NSBundle",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSDistributedNotificationCenter",
+    "NSEnumerator",
+    "NSError",
+    "NSFileManager",
+    "NSGeometry",
+    "NSNotification",
+    "NSOperation",
+    "NSProcessInfo",
+    "NSProgress",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-quartz-core",
+    "libc",
+    "NSAppearance",
+    "NSApplication",
+    "NSColor",
+    "NSColorSampler",
+    "NSColorSpace",
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
+    "NSEvent",
+    "NSFilePromiseReceiver",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageRep",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSSavePanel",
+    "NSScreen",
+    "NSSharingService",
+    "NSView",
+    "NSVisualEffectView",
+    "NSWindow",
+    "NSWorkspace",
+] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-core-media",
+    "AVAsset",
+    "AVAssetExportSession",
+    "AVAssetImageGenerator",
+    "AVAssetTrack",
+    "AVAsynchronousKeyValueLoading",
+    "AVError",
+    "AVMediaFormat",
+    "AVTime",
+    "AVVideoSettings",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFCGTypes",
+    "CFDate",
+    "CFMachPort",
+    "CFRunLoop",
+    "CFString",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGEvent",
+    "CGEventTypes",
+    "CGBitmapContext",
+    "CGColor",
+    "CGColorSpace",
+    "CGContext",
+    "CGImage",
+    "CGPath",
+    "CGWindow",
+] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-graphics",
+    "CALayer",
+    "CAShapeLayer",
+    "CATransaction",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMTime"] }
+objc2-event-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "EKCalendar",
+    "EKCalendarItem",
+    "EKEvent",
+    "EKEventStore",
+    "EKObject",
+    "EKParticipant",
+    "EKSource",
+    "EKTypes",
+] }
+objc2-quick-look-thumbnailing = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "QLThumbnailGenerationRequest",
+    "QLThumbnailGenerator",
+    "QLThumbnailRepresentation",
+] }
+
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-av-foundation",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-core-media",
+    "libc",
+    "SCRecordingOutput",
+    "SCShareableContent",
+    "SCStream",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+notchbase-wasapi.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows = { workspace = true, features = [
+    "Foundation",
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+windows-future = "0.3"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

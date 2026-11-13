@@ -1,0 +1,13 @@
+[package]
+name = "notes"
+version = "0.1.0"
+edition = "2024"
+description = "Quick notes in the notch: jot, pin one as a live activity, and keep a Markdown copy in any folder"
+license = "MIT"
+repository = "https://github.com/sleepdisrupter/notchbase"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+notchbase-sdk = { path = "../../sdk" }

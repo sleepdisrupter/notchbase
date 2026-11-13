@@ -1,0 +1,31 @@
+# Build output
+/target
+/dist
+/Distributable
+
+# Local secrets and signing-certificate backups
+.env
+.env.*
+*.p12
+
+# The old Supabase release setup, kept only on the computer that published through it
+/supabase/
+/wiki/Supabase.md
+/scripts/publish-macos.sh
+/scripts/publish-windows.ps1
+/scripts/release-windows.ps1
+/publish.bat
+/release.bat
+
+# Assistant and editor settings
+/.claude/
+CLAUDE.md
+CLAUDE.local.md
+.idea/
+.vscode/
+*.swp
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini

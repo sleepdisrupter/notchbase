@@ -1,0 +1,14 @@
+[package]
+name = "notchbase-paint"
+version = "0.1.0"
+edition.workspace = true
+description = "The hand-painted UI kit notchbase and its installer share: canvas, glass, glyphs, controls, fonts and springs"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+egui.workspace = true
+notchbase-spectrum.workspace = true

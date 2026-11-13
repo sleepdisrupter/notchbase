@@ -1,0 +1,12 @@
+[package]
+name = "screenshot"
+version = "0.1.0"
+edition.workspace = true
+description = "Capture a region of the screen to the clipboard or a folder"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notchbase-sdk.workspace = true

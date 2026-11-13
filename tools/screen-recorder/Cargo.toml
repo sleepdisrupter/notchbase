@@ -1,0 +1,12 @@
+[package]
+name = "screen-recorder"
+version = "0.1.0"
+edition.workspace = true
+description = "Record an area of the screen with microphone and desktop audio"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notchbase-sdk.workspace = true

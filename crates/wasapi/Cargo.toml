@@ -1,0 +1,19 @@
+[package]
+name = "notchbase-wasapi"
+version = "0.1.0"
+edition.workspace = true
+description = "Windows audio capture for notchbase and its installer: WASAPI clients, loopback and the COM apartment"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: How do I...?
+    url: https://github.com/sleepdisrupter/notchbase/blob/master/wiki/Home.md
+    about: The wiki explains every feature and setting.

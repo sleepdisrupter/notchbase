@@ -1,0 +1,15 @@
+[package]
+name = "notchbase-usage"
+version = "0.1.0"
+edition.workspace = true
+description = "Claude and ChatGPT plan usage, shared by notchbase's Stats page and its dock"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+notchbase-net.workspace = true
+serde_json.workspace = true
+ureq.workspace = true

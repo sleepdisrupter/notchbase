@@ -1,0 +1,12 @@
+[package]
+name = "color-picker"
+version = "0.1.0"
+edition.workspace = true
+description = "Pick any color on screen and copy it"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notchbase-sdk.workspace = true

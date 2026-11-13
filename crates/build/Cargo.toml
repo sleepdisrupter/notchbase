@@ -1,0 +1,10 @@
+[package]
+name = "notchbase-build"
+version = "0.1.0"
+edition.workspace = true
+description = "Build-script helpers shared by notchbase and its installer: the Windows icon"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false

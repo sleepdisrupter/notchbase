@@ -1,0 +1,2117 @@
+//! The part that runs all the time: finds nearby computers, keeps a session with each one on
+//! the desk, and moves the cursor between them. It runs on its own threads, so input never waits
+//! for the notch to draw: a mouse move goes from the system's hook to the network in
+//! microseconds.
+//!
+//! The controlling computer decides everything about the cursor: it keeps the cursor's position
+//! on every computer itself and knows the desk, so crossing to the next screen happens the moment
+//! you reach the edge, with no round trip. The controlled computer just shows what it's told.
+
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, ToSocketAddrs, UdpSocket};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::bulk::{self, Arrived, Content, Hello};
+use crate::crypto::{self, Ephemeral, Handshake, Identity, commit, hex, unhex};
+use crate::input::{self, Copied, Input, Platform, Play};
+use crate::keys;
+use crate::layout::{self, Computer, Rect, Step};
+use crate::link::Link;
+use crate::smooth::{FRAME, Smoother};
+use crate::wire::{BUTTONS, Beacon, CLIP_CHUNK, Id, Key, Message, Os, Packet, Refusal};
+
+pub const PORT: u16 = 47911;
+const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 71, 11);
+
+const MS: u64 = 1_000;
+const SECOND: u64 = 1_000_000;
+const BEACON_EVERY: u64 = SECOND;
+/// A computer not heard for this long is no longer nearby.
+const GONE: u64 = 5 * SECOND;
+const OFFER_EVERY: u64 = 500 * MS;
+/// While the cursor is on another computer, packets go out at least this often. A steady trickle
+/// keeps both Wi-Fi radios awake, so the next move isn't delayed by a radio waking from sleep.
+const BUSY_EVERY: u64 = 20 * MS;
+const IDLE_EVERY: u64 = 250 * MS;
+/// Mouse moves closer together than this share a packet: a fast mouse reports 1,000 to 8,000
+/// times a second, and that many packets would crowd the Wi-Fi for no gain.
+const COALESCE: u64 = 1_500;
+/// After the mouse stops, a packet without movement follows this soon, so the other computer
+/// knows it stopped rather than wondering whether Wi-Fi went quiet.
+const STILL: u64 = 4 * MS;
+/// With no word for this long while the cursor is away, it comes home and held keys are let go.
+const STALL: u64 = 1_500 * MS;
+/// With no word for this long, the session is over (and is started again when possible).
+const DEAD: u64 = 8 * SECOND;
+const STATUS_EVERY: u64 = 100 * MS;
+const SCREENS_EVERY: u64 = 2 * SECOND;
+/// How often typed addresses are looked up again, and the name and networks read again.
+const LOOKUP_EVERY: u64 = 5 * SECOND;
+const MOST_CLIPBOARD: usize = 512 * 1024;
+const CORNER: f64 = 12.0;
+/// Text up to this long goes on the link; longer goes over TCP, as images and files do.
+const SHORT_TEXT: usize = 16 * 1024;
+/// How many received copies of files are kept, newest first.
+const KEEP_RECEIVED: usize = 4;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prefs {
+    pub open: bool,
+    pub name: String,
+    pub smoothing: bool,
+    pub corners: bool,
+    pub clipboard: bool,
+    pub modifiers: keys::Modifiers,
+    pub addresses: Vec<String>,
+    pub fast_wifi: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            open: true,
+            name: String::new(),
+            smoothing: true,
+            corners: true,
+            clipboard: true,
+            modifiers: keys::Modifiers::Same,
+            addresses: Vec::new(),
+            fast_wifi: true,
+        }
+    }
+}
+
+/// Where a computer sits on the desk, in points.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Placement {
+    pub id: String,
+    pub at: [f64; 2],
+    /// How far a scroll here goes on that computer: 1 is the same, 2 twice as far.
+    #[serde(default = "same_speed")]
+    pub scroll: f64,
+}
+
+fn same_speed() -> f64 {
+    1.0
+}
+
+pub enum Control {
+    Prefs(Prefs),
+    Desk(Vec<Placement>),
+    /// The code on the other computer matches (when we control it), or we allow it to control us.
+    Allow(String),
+    Decline(String),
+    /// Try a computer that said no again.
+    Retry(String),
+    Forget(String),
+    /// Bring the cursor back to this computer.
+    Home,
+    /// Stop being controlled.
+    Release,
+    /// Ask the system for the permission Roam is missing.
+    AskPermission,
+    /// Tests: stop hearing the network, as if Wi-Fi dropped out.
+    #[cfg(test)]
+    Deaf(bool),
+}
+
+enum Event {
+    Packet(Vec<u8>, SocketAddr, u64),
+    Input(Input, u64),
+    Control(Control),
+    /// The clipboard as read for `Purpose`, with its digest.
+    Clipboard(Option<(Copied, [u8; 32])>, Purpose),
+    /// A big clipboard is coming in over TCP for `session`, from `from`: the answer is the key.
+    Bulk {
+        session: u32,
+        from: IpAddr,
+        answer: Sender<Option<[u8; 32]>>,
+    },
+    /// A big clipboard came in.
+    Arrived(Arrived),
+    /// The clipboard now holds what came over, which has this digest.
+    ClipSet([u8; 32]),
+    /// A line for the log, from another thread.
+    Note(String),
+    /// Slow lookups, done on their own thread: the computer's name, the typed addresses and
+    /// the networks it's on.
+    Looked {
+        name: String,
+        addresses: Vec<SocketAddr>,
+        networks: Vec<(Ipv4Addr, Ipv4Addr)>,
+    },
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    /// The cursor went to this peer: send it our clipboard.
+    Entering(Id),
+    /// The cursor left us for the controller: send it ours.
+    Leaving,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkState {
+    None,
+    Connecting,
+    /// Waiting for the codes to be checked.
+    Pairing,
+    Connected,
+    Declined,
+    Busy,
+    Closed,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerView {
+    pub id: String,
+    pub name: String,
+    pub os: Os,
+    pub displays: Vec<Rect>,
+    pub ppu: f64,
+    pub open: bool,
+    pub nearby: bool,
+    pub paired: bool,
+    pub link: LinkState,
+    /// The round trip, in milliseconds.
+    pub rtt: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ask {
+    pub id: String,
+    pub name: String,
+    pub code: String,
+    /// We'd control them (and check the code), rather than they us (and allow it).
+    pub controlling: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Status {
+    pub me: Option<PeerView>,
+    pub peers: Vec<PeerView>,
+    /// Who is controlling this computer.
+    pub controller: Option<String>,
+    /// The computer our cursor is on, when it isn't here.
+    pub away_on: Option<String>,
+    /// Another computer's cursor is on this one.
+    pub here: bool,
+    pub locked: bool,
+    pub asks: Vec<Ask>,
+    pub problem: Option<String>,
+    /// This computer's addresses, for typing into the other one.
+    pub addresses: Vec<String>,
+}
+
+/// A running engine. Dropping it stops everything and gives the mouse and keyboard back.
+pub struct Engine {
+    events: Sender<Event>,
+}
+
+impl Engine {
+    pub fn start(
+        data: PathBuf,
+        platform: Box<dyn Platform>,
+        prefs: Prefs,
+        desk: Vec<Placement>,
+        port: u16,
+    ) -> (Engine, Receiver<Status>) {
+        let (events, inbox) = mpsc::channel();
+        let (status_out, status) = mpsc::channel();
+        let sender = events.clone();
+        let spawned = std::thread::Builder::new().name("roam".into()).spawn(move || {
+            let mut core = Core::new(data, platform, prefs, desk, port, sender, status_out);
+            core.run(inbox);
+        });
+        if let Err(err) = spawned {
+            eprintln!("roam: couldn't start: {err}");
+        }
+        (Engine { events }, status)
+    }
+
+    pub fn send(&self, control: Control) {
+        let _ = self.events.send(Event::Control(control));
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let _ = self.events.send(Event::Stop);
+    }
+}
+
+struct Peer {
+    key: Key,
+    name: String,
+    os: Os,
+    addr: SocketAddr,
+    open: bool,
+    busy: bool,
+    displays: Vec<Rect>,
+    ppu: f64,
+    seen: u64,
+    refused: Option<(Refusal, u64)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Side {
+    Controller,
+    Controlled,
+}
+
+enum Phase {
+    Offered {
+        ephemeral: Ephemeral,
+        sent: u64,
+    },
+    Answered {
+        ephemeral: Ephemeral,
+        commit: [u8; 32],
+        peer_key: Key,
+    },
+    Pairing {
+        link: Link,
+        code: u32,
+        mine: bool,
+        theirs: bool,
+    },
+    Live {
+        link: Link,
+    },
+    /// Only while one phase turns into the next.
+    Moving,
+}
+
+struct Session {
+    id: u32,
+    side: Side,
+    addr: SocketAddr,
+    phase: Phase,
+    started: u64,
+    /// The controller's revealed key, to reveal again if the answer comes twice.
+    revealed: Option<Key>,
+}
+
+impl Session {
+    fn link(&mut self) -> Option<&mut Link> {
+        match &mut self.phase {
+            Phase::Pairing { link, .. } | Phase::Live { link } => Some(link),
+            _ => None,
+        }
+    }
+
+    fn live(&mut self) -> Option<&mut Link> {
+        match &mut self.phase {
+            Phase::Live { link } => Some(link),
+            _ => None,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(self.phase, Phase::Live { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cursor {
+    Home,
+    Away { peer: Id, at: [f64; 2], left_from: [f64; 2] },
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Saved {
+    secret: String,
+    #[serde(default)]
+    paired: HashMap<String, SavedPeer>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedPeer {
+    key: String,
+    name: String,
+}
+
+/// How evenly the cursor's packets come and go, written to the log every few seconds while
+/// the cursor is on another computer, to tell a bad network from a slow computer.
+#[derive(Default)]
+struct Gaps {
+    since: u64,
+    last: u64,
+    count: u32,
+    longest: u64,
+    over_20: u32,
+    over_50: u32,
+}
+
+impl Gaps {
+    fn record(&mut self, now: u64) {
+        if self.since == 0 {
+            self.since = now;
+        }
+        if self.last != 0 {
+            let gap = now.saturating_sub(self.last);
+            // A pause in moving the mouse isn't a gap.
+            if gap < 250 * MS {
+                self.longest = self.longest.max(gap);
+                self.over_20 += u32::from(gap > 20 * MS);
+                self.over_50 += u32::from(gap > 50 * MS);
+            }
+        }
+        self.last = now;
+        self.count += 1;
+    }
+
+    fn report(&mut self, now: u64, what: &str) -> Option<String> {
+        if self.since == 0 || now.saturating_sub(self.since) < 5 * SECOND {
+            return None;
+        }
+        let seconds = now.saturating_sub(self.since) as f64 / SECOND as f64;
+        let line = format!(
+            "{what}: {:.0} a second, longest gap {:.1} ms, {} gaps over 20 ms, {} over 50 ms",
+            f64::from(self.count) / seconds,
+            self.longest as f64 / MS as f64,
+            self.over_20,
+            self.over_50
+        );
+        *self = Gaps::default();
+        Some(line)
+    }
+}
+
+#[derive(Default)]
+struct Clip {
+    id: u32,
+    total: u16,
+    parts: Vec<Option<Vec<u8>>>,
+}
+
+struct Core {
+    data: PathBuf,
+    platform: Box<dyn Platform>,
+    prefs: Prefs,
+    placements: Vec<Placement>,
+    port: u16,
+    events: Sender<Event>,
+    status_out: Sender<Status>,
+    clock: Instant,
+    socket: Option<Arc<UdpSocket>>,
+    running: Arc<AtomicBool>,
+    identity: Identity,
+    paired: HashMap<Id, SavedPeer>,
+    peers: HashMap<Id, Peer>,
+    sessions: HashMap<Id, Session>,
+    screens: (Vec<Rect>, f64),
+    screens_at: u64,
+    beacon_at: u64,
+    status_at: u64,
+    last_status: Option<Status>,
+    problem: Option<String>,
+    listening: bool,
+    listen_at: u64,
+    joined: HashSet<Ipv4Addr>,
+    blocked: bool,
+    networks: Vec<(Ipv4Addr, Ipv4Addr)>,
+    host_name: String,
+    typed: Vec<SocketAddr>,
+    lookup_at: u64,
+    looking: Arc<AtomicBool>,
+    // The controller's side.
+    cursor: Cursor,
+    held_buttons: u8,
+    held_keys: HashSet<u16>,
+    sent_keys: HashMap<Id, HashSet<u16>>,
+    locked: bool,
+    pending_motion: Option<[f32; 2]>,
+    /// The last packet to the computer the cursor is on carried movement.
+    moving: bool,
+    // The controlled side.
+    here: bool,
+    smoother: Smoother,
+    played_keys: HashSet<u16>,
+    played_buttons: u8,
+    /// The cursor went home here because the controller went quiet, not because it left.
+    stalled: bool,
+    clip_in: Clip,
+    clip_seen: Option<[u8; 32]>,
+    clip_next: u32,
+    fast: bool,
+    steady: bool,
+    steady_at: u64,
+    log: Option<std::fs::File>,
+    gaps: Gaps,
+    #[cfg(test)]
+    deaf: bool,
+}
+
+impl Core {
+    fn new(
+        data: PathBuf,
+        platform: Box<dyn Platform>,
+        prefs: Prefs,
+        placements: Vec<Placement>,
+        port: u16,
+        events: Sender<Event>,
+        status_out: Sender<Status>,
+    ) -> Self {
+        let saved = load(&data);
+        let identity = unhex::<32>(&saved.secret).map(Identity::from_secret);
+        let fresh = identity.is_none();
+        let identity = identity.unwrap_or_else(Identity::generate);
+        let paired = saved.paired.into_iter().filter_map(|(id, peer)| Some((unhex::<8>(&id)?, peer))).collect();
+        let smoothing = prefs.smoothing;
+        let mut core = Self {
+            data,
+            platform,
+            prefs,
+            placements,
+            port,
+            events,
+            status_out,
+            clock: Instant::now(),
+            socket: None,
+            running: Arc::new(AtomicBool::new(true)),
+            identity,
+            paired,
+            peers: HashMap::new(),
+            sessions: HashMap::new(),
+            screens: (Vec::new(), 1.0),
+            screens_at: 0,
+            beacon_at: 0,
+            status_at: 0,
+            last_status: None,
+            problem: None,
+            listening: false,
+            listen_at: 0,
+            joined: HashSet::new(),
+            blocked: false,
+            networks: local_networks(),
+            host_name: computer_name(),
+            typed: Vec::new(),
+            lookup_at: 0,
+            looking: Arc::new(AtomicBool::new(false)),
+            cursor: Cursor::Home,
+            held_buttons: 0,
+            held_keys: HashSet::new(),
+            sent_keys: HashMap::new(),
+            locked: false,
+            pending_motion: None,
+            moving: false,
+            here: false,
+            smoother: Smoother::new(smoothing),
+            played_keys: HashSet::new(),
+            played_buttons: 0,
+            stalled: false,
+            clip_in: Clip::default(),
+            clip_seen: None,
+            clip_next: 1,
+            fast: false,
+            steady: false,
+            steady_at: 0,
+            log: None,
+            gaps: Gaps::default(),
+            #[cfg(test)]
+            deaf: false,
+        };
+        if fresh {
+            core.save();
+        }
+        core.log = open_log(&core.data);
+        core.note(&format!("Roam started on {} ({:?})", core.host_name, Os::here()));
+        core.screens = core.platform.screens();
+        core
+    }
+
+    /// Writes a line to roam.log, so a dropout can be explained afterwards.
+    fn note(&mut self, text: &str) {
+        use std::io::Write;
+        let Some(log) = &mut self.log else { return };
+        let at = self.clock.elapsed().as_secs_f64();
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let _ = writeln!(log, "{wall} +{at:.3}s {text}");
+    }
+
+    fn who(&self, id: Id) -> String {
+        self.peers.get(&id).map_or_else(|| hex(&id), |p| p.name.clone())
+    }
+
+    fn now(&self) -> u64 {
+        self.clock.elapsed().as_micros() as u64 + 1
+    }
+
+    fn save(&self) {
+        let saved = Saved {
+            secret: hex(&self.identity.secret_bytes()),
+            paired: self.paired.iter().map(|(id, peer)| (hex(id), peer.clone())).collect(),
+        };
+        let _ = std::fs::create_dir_all(&self.data);
+        if let Ok(text) = serde_json::to_string_pretty(&saved) {
+            let path = self.data.join("roam.json");
+            let temporary = self.data.join("roam.json.tmp");
+            if std::fs::write(&temporary, text).is_ok() {
+                let _ = std::fs::rename(&temporary, &path);
+            }
+        }
+    }
+
+    fn bind(&mut self) {
+        match open_socket(self.port) {
+            Ok(socket) => {
+                let socket = Arc::new(socket);
+                let reader = socket.clone();
+                let events = self.events.clone();
+                let running = self.running.clone();
+                let clock = self.clock;
+                let _ = std::thread::Builder::new().name("roam-network".into()).spawn(move || {
+                    input::urgent_thread();
+                    let mut buffer = [0u8; 2048];
+                    while running.load(Ordering::Relaxed) {
+                        match reader.recv_from(&mut buffer) {
+                            Ok((length, from)) => {
+                                let now = clock.elapsed().as_micros() as u64 + 1;
+                                if events.send(Event::Packet(buffer[..length].to_vec(), from, now)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) => {}
+                            // Windows reports an earlier send's "port unreachable" here.
+                            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                        }
+                    }
+                });
+                self.socket = Some(socket);
+                self.problem = None;
+                self.listen_for_bulk();
+            }
+            Err(err) => self.problem = Some(format!("Roam couldn't use the network: {err}")),
+        }
+    }
+
+    fn run(&mut self, inbox: Receiver<Event>) {
+        input::urgent_thread();
+        self.bind();
+        loop {
+            let now = self.now();
+            let wait = self.next_deadline(now).saturating_sub(now).max(100);
+            match inbox.recv_timeout(Duration::from_micros(wait)) {
+                Ok(Event::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                Ok(event) => self.handle(event),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            // Handle everything already waiting before doing the timed work.
+            loop {
+                match inbox.try_recv() {
+                    Ok(Event::Stop) => return self.shut_down(),
+                    Ok(event) => self.handle(event),
+                    Err(_) => break,
+                }
+            }
+            self.tick();
+        }
+        self.shut_down();
+    }
+
+    fn shut_down(&mut self) {
+        self.go_home(None);
+        self.release_played();
+        for (id, session) in &mut self.sessions {
+            if let Some(link) = session.link() {
+                link.queue(Message::Bye);
+                let packet = link.packet(0, None);
+                if let (Some(socket), Some(peer)) = (&self.socket, self.peers.get(id)) {
+                    let _ = socket.send_to(&packet, peer.addr);
+                }
+            }
+        }
+        if self.listening {
+            self.platform.stop_listening();
+        }
+        self.platform.fast(false);
+        self.platform.steady_wifi(false);
+        self.platform.reveal();
+        self.running.store(false, Ordering::Relaxed);
+    }
+
+    fn handle(&mut self, event: Event) {
+        match event {
+            #[cfg(test)]
+            Event::Packet(..) if self.deaf => {}
+            Event::Packet(bytes, from, at) => self.packet(&bytes, from, at),
+            Event::Input(input, at) => self.input(input, at),
+            Event::Control(control) => self.control(control),
+            Event::Clipboard(copied, purpose) => self.clipboard_read(copied, purpose),
+            Event::Bulk { session, from, answer } => {
+                let key = self
+                    .sessions
+                    .values_mut()
+                    .find(|s| s.id == session && s.addr.ip() == from)
+                    .and_then(Session::live)
+                    .map(|link| link.bulk_receive());
+                let _ = answer.send(key);
+            }
+            Event::Arrived(arrived) => self.arrived(arrived),
+            Event::ClipSet(digest) => self.clip_seen = Some(digest),
+            Event::Note(text) => self.note(&text),
+            Event::Looked { name, addresses, networks } => {
+                self.host_name = name;
+                self.typed = addresses;
+                self.networks = networks;
+            }
+            Event::Stop => {}
+        }
+    }
+
+    fn next_deadline(&self, now: u64) -> u64 {
+        let mut next = now + 50 * MS;
+        if self.pending_motion.is_some() {
+            let sent = self.away_link_sent().unwrap_or(0);
+            next = next.min((sent + COALESCE).max(now + 100));
+        }
+        if self.smoother.pending() {
+            next = next.min(now + FRAME);
+        }
+        if self.moving
+            && let Some(sent) = self.away_link_sent()
+        {
+            next = next.min((sent + STILL).max(now + 100));
+        }
+        if matches!(self.cursor, Cursor::Away { .. }) || self.here {
+            next = next.min(now + BUSY_EVERY / 2);
+        }
+        next
+    }
+
+    /// When the last packet went to the computer the cursor is on.
+    fn away_link_sent(&self) -> Option<u64> {
+        let Cursor::Away { peer, .. } = self.cursor else { return None };
+        match &self.sessions.get(&peer)?.phase {
+            Phase::Live { link } => Some(link.sent),
+            _ => None,
+        }
+    }
+
+    /// Looks up the computer's name and the typed addresses on another thread: either can take
+    /// seconds, and the engine thread must never wait.
+    fn look_up(&mut self) {
+        if self.looking.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let typed = self.prefs.addresses.clone();
+        let events = self.events.clone();
+        let looking = self.looking.clone();
+        let spawned = std::thread::Builder::new().name("roam-lookup".into()).spawn(move || {
+            let mut addresses = Vec::new();
+            for address in typed {
+                let with_port = if address.contains(':') { address } else { format!("{address}:{PORT}") };
+                if let Ok(found) = with_port.to_socket_addrs() {
+                    addresses.extend(found.filter(SocketAddr::is_ipv4));
+                }
+            }
+            // Listing the networks takes tens of milliseconds on Windows: never on the engine
+            // thread, where it would pause the cursor.
+            let _ = events.send(Event::Looked { name: computer_name(), addresses, networks: local_networks() });
+            looking.store(false, Ordering::Release);
+        });
+        if spawned.is_err() {
+            self.looking.store(false, Ordering::Release);
+        }
+    }
+
+    // ---------------------------------------------------------------- timed work
+
+    fn tick(&mut self) {
+        let now = self.now();
+        if now >= self.screens_at {
+            self.screens_at = now + SCREENS_EVERY;
+            let screens = self.platform.screens();
+            if screens != self.screens {
+                self.screens = screens;
+                let (displays, ppu) = self.screens.clone();
+                for session in self.sessions.values_mut() {
+                    if session.side == Side::Controlled
+                        && let Some(link) = session.live()
+                    {
+                        link.queue(Message::Screens { ppu: ppu as f32, displays: displays.clone() });
+                    }
+                }
+            }
+        }
+        let away = matches!(self.cursor, Cursor::Away { .. });
+        if away || self.here {
+            let what = if away { "cursor moves sent" } else { "cursor moves heard" };
+            if let Some(line) = self.gaps.report(now, what) {
+                let rtt = self.sessions.values_mut().filter_map(|s| s.live()).find_map(|l| l.rtt());
+                let rtt = rtt.map_or(-1.0, |us| us / 1000.0);
+                self.note(&format!("{line}; round trip {rtt:.1} ms"));
+            }
+        } else if self.gaps.since != 0 {
+            self.gaps = Gaps::default();
+        }
+        if now >= self.lookup_at {
+            self.lookup_at = now + LOOKUP_EVERY;
+            self.look_up();
+        }
+        if matches!(self.cursor, Cursor::Away { .. }) {
+            // Tell the mouse and keyboard Roam is still here, and notice if they let go.
+            self.platform.alive();
+            if !self.platform.still_captured() {
+                self.note("the mouse and keyboard let go by themselves (Roam was too slow to check in)");
+                self.go_home(None);
+            }
+        }
+        if now >= self.beacon_at {
+            self.beacon_at = now + BEACON_EVERY;
+            self.beacon(None);
+            self.offer_to_desk(now);
+        }
+        if self.here
+            && let Some(at) = self.smoother.poll(now)
+        {
+            self.play_move(at);
+        }
+        self.keep_sessions(now);
+        self.flush(now, false);
+        let away = matches!(self.cursor, Cursor::Away { .. }) || self.here;
+        let fast = away || self.sessions.values().any(Session::is_live);
+        if fast != self.fast {
+            self.fast = fast;
+            self.platform.fast(fast);
+        }
+        let steady = fast && self.prefs.fast_wifi;
+        if steady != self.steady || (steady && now >= self.steady_at) {
+            self.steady = steady;
+            self.steady_at = now + 2 * SECOND;
+            self.platform.steady_wifi(steady);
+        }
+        self.platform.tick();
+        self.listen_if_needed();
+        if now >= self.status_at {
+            self.status_at = now + STATUS_EVERY;
+            let status = self.status(now);
+            if self.last_status.as_ref() != Some(&status) {
+                let _ = self.status_out.send(status.clone());
+                self.last_status = Some(status);
+            }
+        }
+    }
+
+    fn keep_sessions(&mut self, now: u64) {
+        let mut ended = Vec::new();
+        for (id, session) in &mut self.sessions {
+            let heard = match &mut session.phase {
+                Phase::Pairing { link, .. } | Phase::Live { link } => link.heard,
+                // A handshake gets a few seconds.
+                _ => session.started,
+            };
+            if now.saturating_sub(heard) > DEAD {
+                ended.push(*id);
+            }
+        }
+        for id in ended {
+            self.note(&format!("no word from {} for 8 s: session over", self.who(id)));
+            self.end_session(id, false);
+        }
+        // Stalled: bring the cursor home, let go of held keys.
+        if let Cursor::Away { peer, .. } = self.cursor
+            && self
+                .sessions
+                .get_mut(&peer)
+                .and_then(Session::live)
+                .is_none_or(|link| now.saturating_sub(link.heard) > STALL)
+        {
+            self.note(&format!("no word from {} for 1.5 s: cursor comes home", self.who(peer)));
+            self.go_home(None);
+        }
+        if self.here {
+            let controller = self.sessions.values_mut().find(|s| s.side == Side::Controlled).and_then(Session::live);
+            if controller.is_none_or(|link| now.saturating_sub(link.heard) > STALL) {
+                self.note("no word from the controller for 1.5 s: letting go here");
+                self.leave_here();
+                self.stalled = true;
+            }
+        }
+    }
+
+    /// Sends packets that are due: right away when `urgent`, otherwise when something is
+    /// waiting or the link has been quiet long enough.
+    fn flush(&mut self, now: u64, urgent: bool) {
+        let away = match self.cursor {
+            Cursor::Away { peer, .. } => Some(peer),
+            Cursor::Home => None,
+        };
+        let motion = self.pending_motion.take();
+        let here = self.here;
+        let Some(socket) = self.socket.clone() else { return };
+        for (id, session) in &mut self.sessions {
+            let addr = session.addr;
+            let busy = away == Some(*id) || (here && session.side == Side::Controlled);
+            match &mut session.phase {
+                Phase::Pairing { link, .. } | Phase::Live { link } => {
+                    let mine = away == Some(*id);
+                    let since = now.saturating_sub(link.sent);
+                    let paced = urgent || since >= COALESCE;
+                    let every = if busy { BUSY_EVERY } else { IDLE_EVERY };
+                    let still = mine && self.moving && motion.is_none() && since >= STILL;
+                    let send = (mine && motion.is_some() && paced)
+                        || (urgent && mine)
+                        || link.due(now)
+                        || since >= every
+                        || still;
+                    let moved = if mine && send { motion } else { None };
+                    if mine && motion.is_some() && !send {
+                        self.pending_motion = motion;
+                    }
+                    if mine && send {
+                        self.moving = moved.is_some();
+                    }
+                    if moved.is_some() {
+                        self.gaps.record(now);
+                    }
+                    if send {
+                        let packet = link.packet(now, moved);
+                        let _ = socket.send_to(&packet, addr);
+                    }
+                }
+                Phase::Offered { ephemeral, sent } if now.saturating_sub(*sent) >= OFFER_EVERY => {
+                    *sent = now;
+                    let offer = Packet::Offer {
+                        id: self.identity.id,
+                        key: self.identity.key,
+                        session: session.id,
+                        commit: ephemeral.commitment(),
+                    };
+                    let _ = socket.send_to(&offer.encode(), addr);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- discovery
+
+    fn beacon(&mut self, to: Option<SocketAddr>) {
+        let Some(socket) = self.socket.clone() else { return };
+        let (displays, ppu) = self.screens.clone();
+        let busy = self.sessions.values().any(|s| s.side == Side::Controlled && s.is_live());
+        let beacon = Packet::Beacon(Beacon {
+            id: self.identity.id,
+            key: self.identity.key,
+            port: self.port,
+            os: Os::here(),
+            open: self.prefs.open,
+            busy,
+            ppu: ppu as f32,
+            displays,
+            name: self.name(),
+        })
+        .encode();
+        if let Some(to) = to {
+            let _ = socket.send_to(&beacon, to);
+            return;
+        }
+        let mut targets = vec![
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, PORT)),
+            SocketAddr::V4(SocketAddrV4::new(GROUP, PORT)),
+        ];
+        // Each network's own broadcast address as well: with a VPN or several networks, the
+        // all-networks one only leaves through one of them.
+        for &(ip, broadcast) in &self.networks {
+            if self.joined.insert(ip) {
+                let _ = socket.join_multicast_v4(&GROUP, &ip);
+            }
+            targets.push(SocketAddr::V4(SocketAddrV4::new(broadcast, PORT)));
+        }
+        targets.extend(self.typed.iter().copied());
+        targets.extend(self.peers.values().map(|peer| peer.addr));
+        targets.sort();
+        targets.dedup();
+        let mut sent = 0;
+        let mut refused = 0;
+        for target in &targets {
+            match socket.send_to(&beacon, target) {
+                Ok(_) => sent += 1,
+                Err(err) if blocked(&err) => refused += 1,
+                Err(_) => {}
+            }
+        }
+        // Everything refused: the system is keeping Roam off the network.
+        self.blocked = sent == 0 && refused > 0;
+    }
+
+    fn name(&self) -> String {
+        let chosen = self.prefs.name.trim();
+        if !chosen.is_empty() {
+            return chosen.to_owned();
+        }
+        self.host_name.clone()
+    }
+
+    fn heard_beacon(&mut self, beacon: Beacon, from: SocketAddr, now: u64) {
+        if beacon.id == self.identity.id || crypto::id_of(&beacon.key) != beacon.id {
+            return;
+        }
+        let addr = SocketAddr::new(from.ip(), beacon.port);
+        let new = !self.peers.contains_key(&beacon.id);
+        let refused = self.peers.get(&beacon.id).and_then(|p| p.refused);
+        let peer = Peer {
+            key: beacon.key,
+            name: if beacon.name.trim().is_empty() { "Computer".into() } else { beacon.name },
+            os: beacon.os,
+            addr,
+            open: beacon.open,
+            busy: beacon.busy,
+            displays: beacon.displays,
+            ppu: f64::from(beacon.ppu),
+            seen: now,
+            refused,
+        };
+        let renamed = self.paired.get(&beacon.id).filter(|p| p.name != peer.name && p.key == hex(&peer.key)).is_some();
+        if renamed && let Some(saved) = self.paired.get_mut(&beacon.id) {
+            saved.name = peer.name.clone();
+        }
+        self.peers.insert(beacon.id, peer);
+        if renamed {
+            self.save();
+        }
+        if new {
+            // Answer straight away so both see each other within a moment.
+            self.beacon(Some(addr));
+            self.offer_to_desk(now);
+        }
+    }
+
+    fn placed(&self) -> HashSet<Id> {
+        self.placements.iter().filter_map(|p| unhex::<8>(&p.id)).filter(|id| *id != self.identity.id).collect()
+    }
+
+    /// Starts a session with each computer on the desk that is around and willing.
+    fn offer_to_desk(&mut self, now: u64) {
+        for id in self.placed() {
+            if self.sessions.contains_key(&id) {
+                continue;
+            }
+            let Some(peer) = self.peers.get(&id) else { continue };
+            let refused_lately =
+                peer.refused.is_some_and(|(why, at)| why == Refusal::Declined || now.saturating_sub(at) < 3 * SECOND);
+            if now.saturating_sub(peer.seen) > GONE || !peer.open || refused_lately {
+                continue;
+            }
+            let session = crypto::random::<4>();
+            let session = u32::from_le_bytes(session) | 1;
+            let addr = peer.addr;
+            self.sessions.insert(
+                id,
+                Session {
+                    id: session,
+                    side: Side::Controller,
+                    addr,
+                    phase: Phase::Offered { ephemeral: Ephemeral::generate(), sent: 0 },
+                    started: now,
+                    revealed: None,
+                },
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------- the handshake
+
+    fn packet(&mut self, bytes: &[u8], from: SocketAddr, now: u64) {
+        let Some(packet) = Packet::decode(bytes) else { return };
+        match packet {
+            Packet::Beacon(beacon) => self.heard_beacon(beacon, from, now),
+            Packet::Offer { id, key, session, commit } => self.offered(id, key, session, commit, from, now),
+            Packet::Answer { id, key, session, ephemeral } => self.answered(id, key, session, ephemeral, from, now),
+            Packet::Reveal { session, ephemeral } => self.revealed(session, ephemeral, from, now),
+            Packet::Refuse { session, why } => {
+                let found = self.sessions.iter().find(|(_, s)| s.id == session && s.side == Side::Controller);
+                if let Some((&id, _)) = found {
+                    self.sessions.remove(&id);
+                    if let Some(peer) = self.peers.get_mut(&id) {
+                        peer.refused = Some((why, now));
+                    }
+                }
+            }
+            Packet::Sealed { session, seq, body } => self.sealed(session, seq, &body, from, now),
+            Packet::Reset { session } => {
+                let found = self.sessions.iter().find(|(_, s)| s.id == session).map(|(id, _)| *id);
+                if let Some(id) = found
+                    && self.sessions.get(&id).is_some_and(|s| s.side == Side::Controller && from == s.addr)
+                {
+                    self.note(&format!("{} has no such session (it restarted?): starting over", self.who(id)));
+                    self.end_session(id, false);
+                    self.offer_to_desk(now);
+                }
+            }
+        }
+    }
+
+    fn send(&self, packet: &Packet, to: SocketAddr) {
+        if let Some(socket) = &self.socket {
+            let _ = socket.send_to(&packet.encode(), to);
+        }
+    }
+
+    fn offered(&mut self, id: Id, key: Key, session: u32, commitment: [u8; 32], from: SocketAddr, now: u64) {
+        if crypto::id_of(&key) != id || id == self.identity.id {
+            return;
+        }
+        if !self.prefs.open {
+            return self.send(&Packet::Refuse { session, why: Refusal::Closed }, from);
+        }
+        // Already in this handshake: answer again (the answer may have been lost).
+        if let Some(existing) = self.sessions.get(&id) {
+            if existing.id == session && existing.side == Side::Controlled {
+                if let Phase::Answered { ephemeral, .. } = &existing.phase {
+                    let answer = Packet::Answer {
+                        id: self.identity.id,
+                        key: self.identity.key,
+                        session,
+                        ephemeral: ephemeral.key,
+                    };
+                    self.send(&answer, from);
+                }
+                return;
+            }
+            // We control them and hear from them: an offer now is a stray one, and taking it
+            // would swap who controls whom mid-use.
+            if existing.side == Side::Controller
+                && let Phase::Live { link } = &existing.phase
+                && now.saturating_sub(link.heard) < STALL
+            {
+                self.note(&format!("ignored an offer from {}, which we control", self.who(id)));
+                return;
+            }
+            // We were offering to them at the same time: the lower id gets to control.
+            if existing.side == Side::Controller && !existing.is_live() && self.identity.id < id {
+                return;
+            }
+        }
+        let other_controller = self.sessions.iter().any(|(other, s)| {
+            *other != id && s.side == Side::Controlled && matches!(s.phase, Phase::Live { .. } | Phase::Pairing { .. })
+        });
+        if other_controller {
+            return self.send(&Packet::Refuse { session, why: Refusal::Busy }, from);
+        }
+        if self.sessions.get(&id).is_some_and(|s| s.side == Side::Controlled) {
+            // A new session from the same controller replaces the old one (it restarted).
+            self.note(&format!("{} started a new session: replacing the old one", self.who(id)));
+            self.end_session(id, false);
+        }
+        self.sessions.remove(&id);
+        let ephemeral = Ephemeral::generate();
+        let answer = Packet::Answer { id: self.identity.id, key: self.identity.key, session, ephemeral: ephemeral.key };
+        self.send(&answer, from);
+        let phase = Phase::Answered { ephemeral, commit: commitment, peer_key: key };
+        self.sessions.insert(
+            id,
+            Session { id: session, side: Side::Controlled, addr: from, phase, started: now, revealed: None },
+        );
+    }
+
+    fn answered(&mut self, id: Id, key: Key, session: u32, peer_ephemeral: Key, from: SocketAddr, now: u64) {
+        if crypto::id_of(&key) != id {
+            return;
+        }
+        let Some(existing) = self.sessions.get_mut(&id) else { return };
+        if existing.id != session || existing.side != Side::Controller {
+            return;
+        }
+        let Phase::Offered { .. } = existing.phase else {
+            // Answer repeated after we moved on: reveal again.
+            return self.reveal_again(id, from);
+        };
+        let Phase::Offered { ephemeral, .. } = std::mem::replace(&mut existing.phase, Phase::Moving) else {
+            return;
+        };
+        let handshake = Handshake {
+            identity: &self.identity,
+            ephemeral: &ephemeral,
+            peer_key: key,
+            peer_ephemeral,
+            session,
+            controller: true,
+        };
+        let Some(agreed) = handshake.agree() else {
+            self.sessions.remove(&id);
+            return;
+        };
+        self.send(&Packet::Reveal { session, ephemeral: ephemeral.key }, from);
+        let code = agreed.code;
+        let link = Link::new(session, agreed, now);
+        let trusted = self.trusts(id, &key);
+        if let Some(existing) = self.sessions.get_mut(&id) {
+            existing.addr = from;
+            existing.phase = Phase::Pairing { link, code, mine: trusted, theirs: false };
+            existing.revealed = Some(ephemeral.key);
+        }
+        if trusted && let Some(link) = self.sessions.get_mut(&id).and_then(Session::link) {
+            link.queue(Message::Allowed);
+        }
+    }
+
+    fn reveal_again(&self, id: Id, to: SocketAddr) {
+        let Some(session) = self.sessions.get(&id) else { return };
+        if let Some(ephemeral) = session.revealed {
+            self.send(&Packet::Reveal { session: session.id, ephemeral }, to);
+        }
+    }
+
+    fn revealed(&mut self, session: u32, peer_ephemeral: Key, from: SocketAddr, now: u64) {
+        let Some((&id, existing)) =
+            self.sessions.iter_mut().find(|(_, s)| s.id == session && s.side == Side::Controlled)
+        else {
+            return;
+        };
+        if existing.addr.ip() != from.ip() {
+            return;
+        }
+        let Phase::Answered { commit: commitment, peer_key, .. } = &existing.phase else { return };
+        if commit(&peer_ephemeral) != *commitment {
+            return;
+        }
+        let peer_key = *peer_key;
+        let Phase::Answered { ephemeral, .. } = std::mem::replace(&mut existing.phase, Phase::Moving) else {
+            return;
+        };
+        let handshake = Handshake {
+            identity: &self.identity,
+            ephemeral: &ephemeral,
+            peer_key,
+            peer_ephemeral,
+            session,
+            controller: false,
+        };
+        let Some(agreed) = handshake.agree() else {
+            self.sessions.remove(&id);
+            return;
+        };
+        let code = agreed.code;
+        let trusted = self.trusts(id, &peer_key);
+        let mut link = Link::new(session, agreed, now);
+        if trusted {
+            link.queue(Message::Allowed);
+        }
+        if let Some(existing) = self.sessions.get_mut(&id) {
+            existing.phase = Phase::Pairing { link, code, mine: trusted, theirs: false };
+        }
+        // Make sure we know who this is, even if their beacons don't reach us.
+        if !self.peers.contains_key(&id) {
+            self.peers.insert(
+                id,
+                Peer {
+                    key: peer_key,
+                    name: self.paired.get(&id).map_or_else(|| "Computer".into(), |p| p.name.clone()),
+                    os: Os::Other,
+                    addr: from,
+                    open: false,
+                    busy: false,
+                    displays: Vec::new(),
+                    ppu: 1.0,
+                    seen: now,
+                    refused: None,
+                },
+            );
+            self.beacon(Some(from));
+        }
+    }
+
+    fn trusts(&self, id: Id, key: &Key) -> bool {
+        self.paired.get(&id).is_some_and(|saved| saved.key == hex(key))
+    }
+
+    fn sealed(&mut self, session: u32, seq: u64, body: &[u8], from: SocketAddr, now: u64) {
+        let Some((&id, existing)) = self.sessions.iter_mut().find(|(_, s)| s.id == session) else {
+            return self.send(&Packet::Reset { session }, from);
+        };
+        let side = existing.side;
+        let Some(link) = existing.link() else { return };
+        let Some(incoming) = link.receive(now, seq, body) else { return };
+        // Follow the other computer if its address changed (it moved to another network).
+        existing.addr = from;
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.addr = SocketAddr::new(from.ip(), peer.addr.port());
+            peer.seen = now;
+        }
+        let controlled = side == Side::Controlled && existing.is_live();
+        let mut motion = incoming.motion.map(|m| m.at);
+        if controlled && self.here && motion.is_none() {
+            // A packet without movement: the controller's mouse is still.
+            self.smoother.heard(now, false);
+        }
+        // The cursor went home after a hiccup but the controller kept going: pick it back up.
+        if controlled && !self.here && self.stalled && motion.is_some() {
+            self.note("the controller is back: picking the cursor up again");
+            self.stalled = false;
+            self.arrive();
+        }
+        for message in incoming.messages {
+            // A click or key lands where the cursor is now, not where the buffer has it.
+            if controlled
+                && self.here
+                && matches!(message, Message::Key { .. } | Message::Button { .. } | Message::Wheel { .. })
+            {
+                if let Some(at) = motion.take() {
+                    self.move_to(incoming.time, now, at);
+                }
+                if let Some(at) = self.smoother.catch_up() {
+                    self.play_move(at);
+                }
+            }
+            self.message(id, side, message, now);
+        }
+        if controlled
+            && self.here
+            && let Some(at) = motion
+        {
+            self.gaps.record(now);
+            self.move_to(incoming.time, now, at);
+        }
+    }
+
+    fn move_to(&mut self, sent: u32, now: u64, at: [f32; 2]) {
+        if let Some(at) = self.smoother.push(sent, now, at) {
+            self.play_move(at);
+        }
+    }
+
+    fn play_move(&mut self, at: [f32; 2]) {
+        self.platform.play(Play::Move([f64::from(at[0]), f64::from(at[1])]));
+    }
+
+    /// Another computer's cursor arrives here.
+    fn arrive(&mut self) {
+        self.here = true;
+        self.smoother.reset();
+        self.smoother.set_on(self.prefs.smoothing);
+        self.platform.arrive();
+    }
+
+    fn message(&mut self, id: Id, side: Side, message: Message, now: u64) {
+        let live = self.sessions.get(&id).is_some_and(Session::is_live);
+        match message {
+            Message::Allowed => self.allowed(id, false, now),
+            Message::Bye => {
+                self.note(&format!("{} said goodbye", self.who(id)));
+                self.end_session(id, true);
+            }
+            Message::Screens { ppu, displays } if side == Side::Controller => {
+                if let Some(peer) = self.peers.get_mut(&id) {
+                    peer.ppu = f64::from(ppu).clamp(0.25, 8.0);
+                    peer.displays = displays;
+                }
+            }
+            _ if !live => {}
+            // From here on: the controlled side, hearing its controller.
+            _ if side != Side::Controlled => {
+                if let Message::Clip { .. } = message {
+                    self.clip(message, side);
+                }
+            }
+            Message::Enter { at } => {
+                self.note(&format!("{}'s cursor arrived", self.who(id)));
+                self.stalled = false;
+                self.arrive();
+                self.play_move(at);
+            }
+            Message::Leave => {
+                self.note(&format!("{}'s cursor left", self.who(id)));
+                self.stalled = false;
+                self.leave_here();
+                self.platform.depart();
+            }
+            Message::Key { hid, down } => {
+                if down {
+                    self.played_keys.insert(hid);
+                } else {
+                    self.played_keys.remove(&hid);
+                }
+                self.platform.play(Play::Key { hid, down });
+            }
+            Message::Button { button, down } if button < BUTTONS => {
+                if down {
+                    self.played_buttons |= 1 << button;
+                } else {
+                    self.played_buttons &= !(1 << button);
+                }
+                self.platform.play(Play::Button { button, down });
+            }
+            Message::Wheel { dx, dy } => self.platform.play(Play::Wheel { dx, dy }),
+            message @ Message::Clip { .. } => self.clip(message, side),
+            _ => {}
+        }
+    }
+
+    /// One side said yes: ours (`mine`) or theirs.
+    fn allowed(&mut self, id: Id, mine: bool, now: u64) {
+        let Some(session) = self.sessions.get_mut(&id) else { return };
+        let Phase::Pairing { mine: our_yes, theirs, .. } = &mut session.phase else { return };
+        if mine {
+            if *our_yes {
+                return;
+            }
+            *our_yes = true;
+            if let Some(link) = session.link() {
+                link.queue(Message::Allowed);
+            }
+        } else {
+            *theirs = true;
+        }
+        let Phase::Pairing { mine: true, theirs: true, .. } = session.phase else { return };
+        if let Phase::Pairing { link, .. } = std::mem::replace(&mut session.phase, Phase::Moving) {
+            session.phase = Phase::Live { link };
+        }
+        let side = session.side;
+        let role = if side == Side::Controller { "we control it" } else { "it controls us" };
+        let addr = session.addr;
+        self.note(&format!("connected to {} at {addr}: {role}", self.who(id)));
+        // Remember them for next time.
+        if let Some(peer) = self.peers.get(&id) {
+            let saved = SavedPeer { key: hex(&peer.key), name: peer.name.clone() };
+            let changed = self.paired.get(&id).is_none_or(|old| old.key != saved.key);
+            self.paired.insert(id, saved);
+            if changed {
+                self.save();
+            }
+        }
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.refused = None;
+        }
+        if side == Side::Controlled {
+            let (displays, ppu) = self.screens.clone();
+            if let Some(link) = self.sessions.get_mut(&id).and_then(Session::live) {
+                link.queue(Message::Screens { ppu: ppu as f32, displays });
+            }
+        }
+        self.flush(now, true);
+    }
+
+    fn end_session(&mut self, id: Id, they_ended: bool) {
+        if let Cursor::Away { peer, .. } = self.cursor
+            && peer == id
+        {
+            self.go_home(None);
+        }
+        let Some(mut session) = self.sessions.remove(&id) else { return };
+        if session.side == Side::Controlled {
+            self.stalled = false;
+            self.leave_here();
+            self.platform.reveal();
+        }
+        if !they_ended && let Some(link) = session.link() {
+            link.queue(Message::Bye);
+            let packet = link.packet(self.now(), None);
+            if let Some(socket) = &self.socket {
+                let _ = socket.send_to(&packet, session.addr);
+            }
+        }
+        self.sent_keys.remove(&id);
+    }
+
+    // ---------------------------------------------------------------- the controller's cursor
+
+    fn listen_if_needed(&mut self) {
+        let wanted = self.sessions.values().any(|s| s.side == Side::Controller && s.is_live());
+        if wanted == self.listening {
+            return;
+        }
+        let now = self.now();
+        if wanted && now < self.listen_at {
+            return;
+        }
+        if wanted {
+            let events = self.events.clone();
+            let clock = self.clock;
+            let sink = Box::new(move |input: Input| {
+                let now = clock.elapsed().as_micros() as u64 + 1;
+                let _ = events.send(Event::Input(input, now));
+            });
+            match self.platform.listen(sink) {
+                Ok(()) => self.listening = true,
+                Err(err) => {
+                    self.problem = Some(err);
+                    // Try again in a while, in case the permission was given.
+                    self.listen_at = now + 2 * SECOND;
+                    return;
+                }
+            }
+        } else {
+            self.go_home(None);
+            self.platform.stop_listening();
+            self.listening = false;
+        }
+        self.problem = None;
+    }
+
+    /// The desk as it stands: this computer and every connected computer on it.
+    fn desk(&self) -> (Vec<Computer>, Vec<Option<Id>>) {
+        let mut desk = Vec::new();
+        let mut ids = Vec::new();
+        let (displays, ppu) = self.screens.clone();
+        let mine = hex(&self.identity.id);
+        let my_spot = self.placements.iter().find(|p| p.id == mine).map_or([0.0, 0.0], |p| p.at);
+        desk.push(Computer::new("me", displays, ppu, my_spot));
+        ids.push(None);
+        for placement in &self.placements {
+            let Some(id) = unhex::<8>(&placement.id) else { continue };
+            if id == self.identity.id
+                || !self.sessions.get(&id).is_some_and(|s| s.side == Side::Controller && s.is_live())
+            {
+                continue;
+            }
+            let Some(peer) = self.peers.get(&id) else { continue };
+            if peer.displays.is_empty() {
+                continue;
+            }
+            desk.push(Computer::new(placement.id.clone(), peer.displays.clone(), peer.ppu, placement.at));
+            ids.push(Some(id));
+        }
+        (desk, ids)
+    }
+
+    fn corner_for(&self, os: Os) -> f64 {
+        if self.prefs.corners && os == Os::Mac { CORNER } else { 0.0 }
+    }
+
+    fn input(&mut self, input: Input, now: u64) {
+        match input {
+            Input::Button { button, down } if button < BUTTONS => {
+                if down {
+                    self.held_buttons |= 1 << button;
+                } else {
+                    self.held_buttons &= !(1 << button);
+                }
+            }
+            Input::Key { hid, down } => {
+                if down {
+                    self.held_keys.insert(hid);
+                } else {
+                    self.held_keys.remove(&hid);
+                }
+            }
+            _ => {}
+        }
+        match self.cursor {
+            Cursor::Home => {
+                let Input::Move { at, delta } = input else { return };
+                if self.held_buttons != 0 || self.locked {
+                    return;
+                }
+                let (desk, ids) = self.desk();
+                if desk.len() < 2 {
+                    return;
+                }
+                let corner = self.corner_for(Os::here());
+                if let Some(Step::Cross { to, at: arrive }) = layout::push(&desk, 0, at, delta, corner)
+                    && let Some(Some(peer)) = ids.get(to)
+                {
+                    self.enter(*peer, arrive, at, now);
+                }
+            }
+            Cursor::Away { peer, at, left_from } => self.away_input(input, peer, at, left_from, now),
+        }
+    }
+
+    fn away_input(&mut self, input: Input, peer: Id, at: [f64; 2], left_from: [f64; 2], now: u64) {
+        match input {
+            Input::Move { delta, .. } => {
+                let (desk, ids) = self.desk();
+                let Some(on) = ids.iter().position(|id| *id == Some(peer)) else {
+                    return self.go_home(None);
+                };
+                let mine = desk[0].ppu;
+                let theirs = desk[on].ppu;
+                let scaled = [delta[0] / mine * theirs, delta[1] / mine * theirs];
+                let os = self.peers.get(&peer).map_or(Os::Other, |p| p.os);
+                let step = layout::step(&desk, on, at, scaled, self.corner_for(os));
+                let step = match step {
+                    // No dragging across: a held button keeps the cursor where the drag started.
+                    Step::Cross { .. } if self.held_buttons != 0 || self.locked => {
+                        let to = [at[0] + scaled[0], at[1] + scaled[1]];
+                        Step::Stay(desk[on].onto_displays(to))
+                    }
+                    step => step,
+                };
+                match step {
+                    Step::Stay(next) => {
+                        self.cursor = Cursor::Away { peer, at: next, left_from };
+                        if next != at {
+                            // Sent as soon as the pacing allows (see `flush`).
+                            self.pending_motion = Some([next[0] as f32, next[1] as f32]);
+                        }
+                    }
+                    Step::Cross { to, at: arrive } => match ids.get(to).copied().flatten() {
+                        None => self.go_home(Some(arrive)),
+                        Some(next) => {
+                            self.leave_peer(peer);
+                            self.cursor = Cursor::Home;
+                            self.enter(next, arrive, left_from, now);
+                        }
+                    },
+                }
+            }
+            Input::Key { hid, down } => {
+                let ctrl = self.held_keys.contains(&keys::LEFT_CTRL) || self.held_keys.contains(&keys::RIGHT_CTRL);
+                let alt = self.held_keys.contains(&keys::LEFT_ALT) || self.held_keys.contains(&keys::RIGHT_ALT);
+                let shift = self.held_keys.contains(&keys::LEFT_SHIFT) || self.held_keys.contains(&keys::RIGHT_SHIFT);
+                if down && ctrl && alt && shift && hid == keys::H {
+                    return self.go_home(None);
+                }
+                if down && ctrl && alt && shift && hid == keys::L {
+                    self.locked = !self.locked;
+                    return;
+                }
+                let them = self.peers.get(&peer).map_or(Os::Other, |p| p.os);
+                let differ = them != Os::here() && them != Os::Other && Os::here() != Os::Other;
+                let hid = if differ { self.prefs.modifiers.apply(hid) } else { hid };
+                let sent = self.sent_keys.entry(peer).or_default();
+                if down {
+                    sent.insert(hid);
+                } else if !sent.remove(&hid) {
+                    return; // pressed before the cursor came over: it was let go here
+                }
+                self.queue_to(peer, Message::Key { hid, down }, now);
+            }
+            Input::Button { button, down } => self.queue_to(peer, Message::Button { button, down }, now),
+            Input::Wheel { dx, dy } => {
+                let speed = self.scroll_speed(peer);
+                self.queue_to(peer, Message::Wheel { dx: dx * speed, dy: dy * speed }, now);
+            }
+        }
+    }
+
+    /// The scroll multiplier set for a computer on the desk.
+    fn scroll_speed(&self, peer: Id) -> f32 {
+        let id = hex(&peer);
+        self.placements.iter().find(|p| p.id == id).map_or(1.0, |p| p.scroll as f32)
+    }
+
+    fn queue_to(&mut self, peer: Id, message: Message, now: u64) {
+        if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
+            link.queue(message);
+        }
+        self.flush(now, true);
+    }
+
+    fn enter(&mut self, peer: Id, arrive: [f64; 2], left_from: [f64; 2], now: u64) {
+        let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) else { return };
+        link.queue(Message::Enter { at: [arrive[0] as f32, arrive[1] as f32] });
+        let rtt = link.rtt().map_or(-1.0, |us| us / 1000.0);
+        self.note(&format!(
+            "cursor over to {} at ({:.0}, {:.0}) from ({:.0}, {:.0}) (round trip {rtt:.1} ms)",
+            self.who(peer),
+            arrive[0],
+            arrive[1],
+            left_from[0],
+            left_from[1]
+        ));
+        if self.cursor == Cursor::Home {
+            self.platform.capture(true);
+        }
+        self.cursor = Cursor::Away { peer, at: arrive, left_from };
+        self.flush(now, true);
+        if self.prefs.clipboard {
+            self.read_clipboard(Purpose::Entering(peer));
+        }
+    }
+
+    fn leave_peer(&mut self, peer: Id) {
+        self.sent_keys.remove(&peer);
+        if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
+            link.queue(Message::Leave);
+        }
+    }
+
+    /// Brings the cursor back to this computer, at `at` or where it left.
+    fn go_home(&mut self, at: Option<[f64; 2]>) {
+        let Cursor::Away { peer, left_from, at: was } = self.cursor else { return };
+        let home = at.unwrap_or(left_from);
+        self.note(&format!(
+            "cursor home from {} at ({:.0}, {:.0}), back at ({:.0}, {:.0})",
+            self.who(peer),
+            was[0],
+            was[1],
+            home[0],
+            home[1]
+        ));
+        self.leave_peer(peer);
+        self.cursor = Cursor::Home;
+        self.pending_motion = None;
+        self.moving = false;
+        self.platform.warp(home);
+        self.platform.capture(false);
+        let now = self.now();
+        self.flush(now, true);
+    }
+
+    // ---------------------------------------------------------------- the controlled side
+
+    fn leave_here(&mut self) {
+        if !self.here {
+            return;
+        }
+        self.here = false;
+        self.smoother.reset();
+        self.release_played();
+        if self.prefs.clipboard {
+            self.read_clipboard(Purpose::Leaving);
+        }
+    }
+
+    /// Lets go of everything the controller was holding down here.
+    fn release_played(&mut self) {
+        for hid in std::mem::take(&mut self.played_keys) {
+            self.platform.play(Play::Key { hid, down: false });
+        }
+        for button in 0..BUTTONS {
+            if self.played_buttons & (1 << button) != 0 {
+                self.platform.play(Play::Button { button, down: false });
+            }
+        }
+        self.played_buttons = 0;
+    }
+
+    // ---------------------------------------------------------------- the clipboard
+
+    fn read_clipboard(&self, purpose: Purpose) {
+        let events = self.events.clone();
+        let _ = std::thread::Builder::new().name("roam-clipboard".into()).spawn(move || {
+            let copied = input::clipboard().map(|copied| {
+                let digest = copied.digest();
+                (copied, digest)
+            });
+            let _ = events.send(Event::Clipboard(copied, purpose));
+        });
+    }
+
+    fn clipboard_read(&mut self, copied: Option<(Copied, [u8; 32])>, purpose: Purpose) {
+        let Some((copied, digest)) = copied else { return };
+        if self.clip_seen == Some(digest) {
+            return;
+        }
+        let to = match purpose {
+            Purpose::Entering(peer) if matches!(self.cursor, Cursor::Away { peer: on, .. } if on == peer) => Some(peer),
+            Purpose::Leaving => {
+                self.sessions.iter().find(|(_, s)| s.side == Side::Controlled && s.is_live()).map(|(id, _)| *id)
+            }
+            _ => None,
+        };
+        let Some(to) = to else { return };
+        let Some(session) = self.sessions.get_mut(&to) else { return };
+        let addr = session.addr;
+        let session_id = session.id;
+        let Some(link) = session.live() else { return };
+        self.clip_seen = Some(digest);
+        let id = self.clip_next;
+        self.clip_next = self.clip_next.wrapping_add(1);
+        match copied {
+            // Short text goes on the link itself: there's no connection to make.
+            Copied::Text(text) if text.len() <= SHORT_TEXT => {
+                let chunks: Vec<&[u8]> = text.as_bytes().chunks(CLIP_CHUNK).collect();
+                let total = chunks.len() as u16;
+                for (index, chunk) in chunks.into_iter().enumerate() {
+                    link.queue(Message::Clip { id, index: index as u16, total, bytes: chunk.to_vec() });
+                }
+            }
+            copied => {
+                let key = link.bulk_send();
+                let events = self.events.clone();
+                let who = self.who(to);
+                let _ = std::thread::Builder::new().name("roam-send".into()).spawn(move || {
+                    let content = match copied {
+                        Copied::Text(text) => Content::Text(text),
+                        Copied::Image { width, height, rgba } => match input::png(width, height, &rgba) {
+                            Some(png) => Content::Image(png),
+                            None => return,
+                        },
+                        Copied::Files(paths) => Content::Files(paths),
+                    };
+                    let what = match &content {
+                        Content::Text(_) => "text",
+                        Content::Image(_) => "an image",
+                        Content::Files(_) => "files",
+                    };
+                    let started = Instant::now();
+                    let line = match bulk::send(addr, Hello { session: session_id, id }, key, &content) {
+                        Ok(()) => format!("sent {what} to {who} in {} ms", started.elapsed().as_millis()),
+                        Err(err) => format!("couldn't send {what} to {who}: {err}"),
+                    };
+                    let _ = events.send(Event::Note(line));
+                });
+            }
+        }
+    }
+
+    /// Takes big clipboards from the computers in a session with this one, over TCP on the
+    /// same port number as the UDP socket.
+    fn listen_for_bulk(&mut self) {
+        let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, self.port)) {
+            Ok(listener) => listener,
+            Err(err) => return self.note(&format!("images and files can't come in: {err}")),
+        };
+        if listener.set_nonblocking(true).is_err() {
+            return;
+        }
+        let events = self.events.clone();
+        let running = self.running.clone();
+        let inbox = self.data.join("received");
+        let _ = std::thread::Builder::new().name("roam-bulk".into()).spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                let Ok((stream, from)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                };
+                let events = events.clone();
+                let inbox = inbox.clone();
+                let _ = std::thread::Builder::new().name("roam-receive".into()).spawn(move || {
+                    let _ = receive_bulk(stream, from.ip(), &events, &inbox);
+                });
+            }
+        });
+    }
+
+    fn arrived(&mut self, arrived: Arrived) {
+        let copied = match arrived {
+            Arrived::Text(text) => Copied::Text(text),
+            Arrived::Image(png) => match input::unpng(&png) {
+                Some(image) => image,
+                None => return,
+            },
+            Arrived::Files(paths) => Copied::Files(paths),
+        };
+        // Not sent back when the cursor leaves, even before the clipboard is set.
+        self.clip_seen = Some(copied.digest());
+        let events = self.events.clone();
+        let inbox = self.data.join("received");
+        let _ = std::thread::Builder::new().name("roam-paste".into()).spawn(move || {
+            if let Some(digest) = input::set_clipboard(&copied) {
+                let _ = events.send(Event::ClipSet(digest));
+            }
+            bulk::tidy(&inbox, KEEP_RECEIVED);
+        });
+    }
+
+    fn clip(&mut self, message: Message, _side: Side) {
+        let Message::Clip { id, index, total, bytes } = message else { return };
+        if total == 0 || usize::from(total) * CLIP_CHUNK > MOST_CLIPBOARD + CLIP_CHUNK {
+            return;
+        }
+        if self.clip_in.id != id || self.clip_in.total != total {
+            self.clip_in = Clip { id, total, parts: vec![None; usize::from(total)] };
+        }
+        if let Some(part) = self.clip_in.parts.get_mut(usize::from(index)) {
+            *part = Some(bytes);
+        }
+        if self.clip_in.parts.iter().all(Option::is_some) {
+            let bytes: Vec<u8> = std::mem::take(&mut self.clip_in.parts).into_iter().flatten().flatten().collect();
+            self.clip_in = Clip::default();
+            if let Ok(text) = String::from_utf8(bytes) {
+                self.arrived(Arrived::Text(text));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- what the notch shows
+
+    fn control(&mut self, control: Control) {
+        let now = self.now();
+        match control {
+            Control::Prefs(prefs) => {
+                let closed = self.prefs.open && !prefs.open;
+                self.smoother.set_on(prefs.smoothing);
+                let retype = self.prefs.addresses != prefs.addresses || self.prefs.name != prefs.name;
+                self.prefs = prefs;
+                if retype {
+                    self.look_up();
+                }
+                if closed {
+                    let controlled: Vec<Id> =
+                        self.sessions.iter().filter(|(_, s)| s.side == Side::Controlled).map(|(id, _)| *id).collect();
+                    for id in controlled {
+                        self.end_session(id, false);
+                    }
+                }
+                self.beacon(None);
+            }
+            Control::Desk(placements) => {
+                self.placements = placements;
+                let placed = self.placed();
+                let gone: Vec<Id> = self
+                    .sessions
+                    .iter()
+                    .filter(|(id, s)| s.side == Side::Controller && !placed.contains(*id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in gone {
+                    self.end_session(id, false);
+                }
+                self.offer_to_desk(now);
+            }
+            Control::Allow(id) => {
+                if let Some(id) = unhex::<8>(&id) {
+                    self.allowed(id, true, now);
+                }
+            }
+            Control::Decline(id) => {
+                if let Some(id) = unhex::<8>(&id) {
+                    let side = self.sessions.get(&id).map(|s| (s.side, s.id, s.addr));
+                    if let Some((side, session, addr)) = side {
+                        if side == Side::Controlled {
+                            self.send(&Packet::Refuse { session, why: Refusal::Declined }, addr);
+                        }
+                        self.sessions.remove(&id);
+                        if side == Side::Controller
+                            && let Some(peer) = self.peers.get_mut(&id)
+                        {
+                            peer.refused = Some((Refusal::Declined, now));
+                        }
+                    }
+                }
+            }
+            Control::Retry(id) => {
+                if let Some(peer) = unhex::<8>(&id).and_then(|id| self.peers.get_mut(&id)) {
+                    peer.refused = None;
+                }
+                self.offer_to_desk(now);
+            }
+            Control::Forget(id) => {
+                if let Some(id) = unhex::<8>(&id) {
+                    self.end_session(id, false);
+                    if self.paired.remove(&id).is_some() {
+                        self.save();
+                    }
+                }
+            }
+            Control::Home => self.go_home(None),
+            Control::AskPermission => {
+                self.platform.ask_permission();
+                self.listen_at = 0;
+            }
+            #[cfg(test)]
+            Control::Deaf(deaf) => self.deaf = deaf,
+            Control::Release => {
+                let controlled: Vec<Id> =
+                    self.sessions.iter().filter(|(_, s)| s.side == Side::Controlled).map(|(id, _)| *id).collect();
+                for id in controlled {
+                    self.end_session(id, false);
+                }
+            }
+        }
+        self.status_at = 0;
+    }
+
+    fn status(&mut self, now: u64) -> Status {
+        let (displays, ppu) = self.screens.clone();
+        let me = PeerView {
+            id: hex(&self.identity.id),
+            name: self.name(),
+            os: Os::here(),
+            displays,
+            ppu,
+            open: self.prefs.open,
+            nearby: true,
+            paired: true,
+            link: LinkState::None,
+            rtt: None,
+        };
+        let mut peers: Vec<PeerView> = Vec::new();
+        let mut asks = Vec::new();
+        let mut controller = None;
+        let mut ids: Vec<Id> = self.peers.keys().copied().collect();
+        ids.sort_by_key(|id| self.peers.get(id).map(|p| p.name.to_lowercase()));
+        for id in ids {
+            let Some(peer) = self.peers.get(&id) else { continue };
+            let session = self.sessions.get_mut(&id);
+            let (link, rtt) = match session {
+                None => match peer.refused {
+                    Some((Refusal::Declined, _)) => (LinkState::Declined, None),
+                    Some((Refusal::Busy, _)) => (LinkState::Busy, None),
+                    Some((Refusal::Closed, _)) => (LinkState::Closed, None),
+                    None => (LinkState::None, None),
+                },
+                Some(session) => {
+                    let side = session.side;
+                    let state = match &mut session.phase {
+                        Phase::Offered { .. } | Phase::Answered { .. } | Phase::Moving => LinkState::Connecting,
+                        Phase::Pairing { code, mine, .. } => {
+                            if !*mine {
+                                asks.push(Ask {
+                                    id: hex(&id),
+                                    name: peer.name.clone(),
+                                    code: crypto::format_code(*code),
+                                    controlling: side == Side::Controller,
+                                });
+                            }
+                            LinkState::Pairing
+                        }
+                        Phase::Live { .. } => {
+                            if side == Side::Controlled {
+                                controller = Some(peer.name.clone());
+                            }
+                            LinkState::Connected
+                        }
+                    };
+                    let rtt = session.link().and_then(|l| l.rtt()).map(|us| (us / 1000.0) as f32);
+                    (state, rtt)
+                }
+            };
+            let nearby = now.saturating_sub(peer.seen) <= GONE;
+            if !nearby && link == LinkState::None {
+                continue;
+            }
+            peers.push(PeerView {
+                id: hex(&id),
+                name: peer.name.clone(),
+                os: peer.os,
+                displays: peer.displays.clone(),
+                ppu: peer.ppu,
+                open: peer.open && !peer.busy,
+                nearby,
+                paired: self.paired.contains_key(&id),
+                link,
+                rtt,
+            });
+        }
+        let away_on = match self.cursor {
+            Cursor::Away { peer, .. } => self.peers.get(&peer).map(|p| p.name.clone()),
+            Cursor::Home => None,
+        };
+        let problem = self.problem.clone().or_else(|| self.platform.missing_permission()).or_else(|| {
+            self.blocked.then(|| {
+                if cfg!(target_os = "macos") {
+                    "Allow notchbase in Privacy & Security › Local Network so Roam can find your other computers".into()
+                } else {
+                    "Roam can't reach the network. Check that a firewall allows notchbase".into()
+                }
+            })
+        });
+        let addresses =
+            self.networks.iter().map(|(ip, _)| ip.to_string()).filter(|ip| !ip.starts_with("169.254.")).collect();
+        Status {
+            me: Some(me),
+            peers,
+            controller,
+            away_on,
+            here: self.here,
+            locked: self.locked,
+            asks,
+            problem,
+            addresses,
+        }
+    }
+}
+
+/// roam.log in the data folder, started afresh when it grows past a megabyte.
+fn open_log(data: &std::path::Path) -> Option<std::fs::File> {
+    let path = data.join("roam.log");
+    let big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20);
+    if big {
+        let _ = std::fs::rename(&path, data.join("roam.old.log"));
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+fn load(data: &std::path::Path) -> Saved {
+    std::fs::read_to_string(data.join("roam.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// This computer's IPv4 networks: its address on each and that network's broadcast address.
+fn local_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else { return Vec::new() };
+    interfaces
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && v4.netmask != Ipv4Addr::BROADCAST => {
+                let broadcast =
+                    v4.broadcast.unwrap_or_else(|| Ipv4Addr::from(u32::from(v4.ip) | !u32::from(v4.netmask)));
+                Some((v4.ip, broadcast))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a send failed because the system won't let Roam on the network.
+fn blocked(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::HostUnreachable)
+        || matches!(err.raw_os_error(), Some(1 | 13 | 65))
+}
+
+/// One incoming transfer, on its own thread: checks it belongs to a live session with the
+/// computer it comes from, then takes it in.
+fn receive_bulk(
+    mut stream: std::net::TcpStream,
+    from: IpAddr,
+    events: &Sender<Event>,
+    inbox: &std::path::Path,
+) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let hello = Hello::read(&mut stream)?;
+    let (answer, key) = mpsc::channel();
+    events.send(Event::Bulk { session: hello.session, from, answer }).map_err(std::io::Error::other)?;
+    let Ok(Some(key)) = key.recv_timeout(Duration::from_secs(2)) else { return Ok(()) };
+    let started = Instant::now();
+    match bulk::receive(stream, hello, key, inbox) {
+        Ok(arrived) => {
+            let _ = events.send(Event::Note(format!("a clipboard came in, in {} ms", started.elapsed().as_millis())));
+            let _ = events.send(Event::Arrived(arrived));
+        }
+        Err(err) => {
+            let _ = events.send(Event::Note(format!("a clipboard didn't come in whole: {err}")));
+        }
+    }
+    Ok(())
+}
+
+fn open_socket(port: u16) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    // Lets Roam start again straight away after a restart. Windows frees UDP ports at once
+    // and would let another program share the port, so it isn't asked to there.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_broadcast(true)?;
+    // Expedited forwarding: Wi-Fi puts these packets in its voice queue, ahead of downloads.
+    let _ = socket.set_tos_v4(0xB8);
+    let _ = socket.set_recv_buffer_size(1 << 20);
+    socket.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).into())?;
+    let socket: UdpSocket = socket.into();
+    let _ = socket.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED);
+    let _ = socket.set_multicast_loop_v4(false);
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    Ok(socket)
+}
+
+/// The computer's name as people know it: "John's MacBook Pro" rather than
+/// "Johns-MacBook-Pro.local".
+pub fn computer_name() -> String {
+    #[cfg(target_os = "macos")]
+    if let Ok(output) = std::process::Command::new("/usr/sbin/scutil").args(["--get", "ComputerName"]).output()
+        && output.status.success()
+    {
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let host = host.trim_end_matches(".local").trim_end_matches(".lan");
+    let words = host.replace(['-', '_'], " ");
+    if words.trim().is_empty() { "Computer".into() } else { words.trim().to_owned() }
+}
+
+#[cfg(test)]
+mod tests;

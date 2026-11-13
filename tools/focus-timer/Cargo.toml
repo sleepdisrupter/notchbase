@@ -1,0 +1,15 @@
+[package]
+name = "focus-timer"
+version = "0.1.0"
+edition.workspace = true
+description = "A Pomodoro-style focus timer with breaks, a live countdown and a session tally"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+notchbase-sdk.workspace = true

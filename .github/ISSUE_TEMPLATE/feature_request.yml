@@ -1,0 +1,16 @@
+name: Feature request
+description: An idea for something notchbase could do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What you'd like notchbase to do, and when you'd use it.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today
+      description: How you get by without it, if at all.

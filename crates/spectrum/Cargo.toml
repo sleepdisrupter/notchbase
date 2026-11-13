@@ -1,0 +1,10 @@
+[package]
+name = "notchbase-spectrum"
+version = "0.1.0"
+edition.workspace = true
+description = "The music spectrum notchbase and its installer dance to: an FFT and six loudness bands"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false

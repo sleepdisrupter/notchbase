@@ -1,0 +1,115 @@
+# Builds the Windows release and adds it to the GitHub release for this version: the app, the installer, and its
+# entry in the latest.json that installed copies read. Needs the GitHub CLI (gh), logged in.
+param(
+    [string]$Notes = "",
+    [string]$Target = "x86_64-pc-windows-msvc",
+    [switch]$DryRun
+)
+
+$ErrorActionPreference = "Stop"
+$official = "sleepdisrupter/notchbase"
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location $root
+
+function Fail([string]$message) {
+    Write-Host $message -ForegroundColor Red
+    exit 1
+}
+
+$platform = switch ($Target) {
+    "x86_64-pc-windows-msvc" { "windows-x86_64" }
+    "aarch64-pc-windows-msvc" { "windows-aarch64" }
+    default { Fail "This script releases Windows targets only, not $Target." }
+}
+
+$repo = "$env:NOTCHBASE_RELEASES_REPO"
+if (-not $repo) {
+    $origin = git remote get-url origin 2>$null
+    if ($origin -match '^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(\.git)?$') {
+        $repo = $Matches[2]
+    }
+}
+if (-not $repo) { $repo = $official }
+# The app and the installer read their updates from this repository.
+$env:NOTCHBASE_RELEASES_REPO = $repo
+
+$version = (Select-String -Path "Cargo.toml" -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+$tag = "v$version"
+$download = "https://github.com/$repo/releases/download/$tag"
+
+if (-not $DryRun) {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Fail "Install the GitHub CLI (https://cli.github.com) and run gh auth login first."
+    }
+    gh auth status 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "Log in to GitHub first: gh auth login" }
+}
+
+Write-Host "Building notchbase $version for $platform, updating from $repo..." -ForegroundColor Cyan
+rustup target add $Target | Out-Null
+# notchbase dock first: notchbase carries it inside its exe and writes it out when someone turns it on.
+cargo build --release --target $Target -p notchbase-dock
+if ($LASTEXITCODE -ne 0) { Fail "The dock's build failed." }
+$env:NOTCHBASE_BUNDLED_DOCK = Join-Path $root "target\$Target\release\notchbase-dock.exe"
+cargo build --release --target $Target -p notchbase
+$built = $LASTEXITCODE
+Remove-Item Env:NOTCHBASE_BUNDLED_DOCK
+if ($built -ne 0) { Fail "The build failed." }
+cargo build --release --target $Target -p notchbase-setup
+if ($LASTEXITCODE -ne 0) { Fail "The installer's build failed." }
+
+$out = Join-Path $root "target\$Target\release"
+$stage = Join-Path $root "target\github-release\$tag-$platform"
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $stage | Out-Null
+$name = "notchbase-$version-$platform.exe"
+$file = Join-Path $stage $name
+Copy-Item (Join-Path $out "notchbase.exe") $file
+$setup = Join-Path $stage "notchbase-setup.exe"
+Copy-Item (Join-Path $out "notchbase-setup.exe") $setup
+$sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+$size = (Get-Item $file).Length
+
+# A release that already exists (the Mac went first) keeps its other platforms in latest.json.
+$existing = $false
+$manifest = [ordered]@{ version = $version; notes = $Notes; builds = [ordered]@{} }
+if (-not $DryRun) {
+    gh release view $tag --repo $repo 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $existing = $true
+        $previous = Join-Path $stage "previous"
+        gh release download $tag --repo $repo --pattern latest.json --dir $previous 2>$null
+        $old = Join-Path $previous "latest.json"
+        if (Test-Path $old) {
+            $parsed = Get-Content $old -Raw | ConvertFrom-Json
+            if ($parsed.version -eq $version) {
+                foreach ($build in $parsed.builds.PSObject.Properties) { $manifest.builds[$build.Name] = $build.Value }
+                if (-not $Notes) { $manifest.notes = $parsed.notes }
+            }
+        }
+    }
+}
+$manifest.builds[$platform] = [ordered]@{ url = "$download/$name"; sha256 = $sha; size = $size }
+$latest = Join-Path $stage "latest.json"
+[IO.File]::WriteAllText($latest, ($manifest | ConvertTo-Json -Depth 5) + "`n")
+
+Write-Host ""
+Write-Host "  release   $tag on $repo"
+Write-Host "  file      $name ($([math]::Round($size / 1MB, 1)) MB)"
+Write-Host "  sha256    $sha"
+Write-Host "  also      notchbase-setup.exe, latest.json"
+Write-Host ""
+if ($DryRun) {
+    Write-Host "Dry run: nothing was uploaded. The files are in $stage." -ForegroundColor Yellow
+    exit 0
+}
+
+$assets = @($file, $setup, $latest)
+if ($existing) {
+    gh release upload $tag --repo $repo --clobber @assets
+} else {
+    $text = if ($Notes) { $Notes } else { "notchbase $version" }
+    gh release create $tag --repo $repo --title "notchbase $version" --notes $text --latest @assets
+}
+if ($LASTEXITCODE -ne 0) { Fail "Uploading to GitHub failed." }
+Write-Host "Published https://github.com/$repo/releases/tag/$tag" -ForegroundColor Green

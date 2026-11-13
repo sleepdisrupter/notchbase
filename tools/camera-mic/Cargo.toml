@@ -1,0 +1,12 @@
+[package]
+name = "camera-mic"
+version = "0.1.0"
+edition.workspace = true
+description = "Shows when the camera or microphone is in use, with a mute button"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notchbase-sdk.workspace = true

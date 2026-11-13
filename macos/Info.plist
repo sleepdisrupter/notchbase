@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>notchbase</string>
+	<key>CFBundleDisplayName</key>
+	<string>notchbase</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.notchbase</string>
+	<key>CFBundleIconFile</key>
+	<string>notchbase</string>
+	<key>CFBundleExecutable</key>
+	<string>notchbase</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>notchbase adjusts the volume of individual apps and animates the notch to the music.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>notchbase shows when your Bluetooth headphones, keyboards and other devices connect, with their battery level.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>notchbase records your microphone in screen recordings when you turn it on.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>notchbase shows your next meeting in the notch with a button to join it.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>notchbase shows your next meeting in the notch with a button to join it.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>notchbase shows browser downloads in the notch and puts finished files on your Shelf.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>notchbase finds your other computers on this network so Roam can share your keyboard and mouse with them.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>notchbase shows the song playing in Music or Spotify.</string>
+</dict>
+</plist>

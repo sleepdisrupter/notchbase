@@ -1,0 +1,12 @@
+[package]
+name = "focus-status"
+version = "0.1.0"
+edition.workspace = true
+description = "Shows in the notch when a Focus or Do Not Disturb turns on or off"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notchbase-sdk.workspace = true

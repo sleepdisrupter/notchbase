@@ -1,0 +1,12 @@
+[package]
+name = "timer"
+version = "0.1.0"
+edition.workspace = true
+description = "A countdown timer with a physical wheel picker, a draining ring and an alarm"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notchbase-sdk.workspace = true
