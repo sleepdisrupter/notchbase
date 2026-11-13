@@ -94,8 +94,8 @@ done
 
 ./build-installer.sh
 cp dist/notchbase-setup.dmg "$stage/notchbase-setup.dmg"
-./scripts/build-sdk.sh
-./scripts/build-skill.sh
+sh scripts/build-sdk.sh
+sh scripts/build-skill.sh
 cp Distributable/notchbase-sdk.zip Distributable/notchbase-skill.zip "$stage/"
 assets+=("$stage/notchbase-setup.dmg" "$stage/notchbase-sdk.zip" "$stage/notchbase-skill.zip")
 
