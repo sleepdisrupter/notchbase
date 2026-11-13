@@ -23,7 +23,7 @@ use notchbase_sdk::column;
 use notchbase_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use engine::{Ask, Control, Engine, LinkState, PeerView, Placement, Prefs, Status};
+use engine::{Ask, Control, Engine, LinkState, PeerView, Placement, Prefs, Status, Transfer};
 use layout::{Computer, Rect};
 use wire::Os;
 
@@ -43,6 +43,7 @@ const HEIGHT: f32 = 170.0;
 const PAD: f32 = 14.0;
 const SNAP: f32 = 10.0;
 const GLYPH: f32 = 14.0;
+const RING: f32 = 13.0;
 const ASK_FOR: Duration = Duration::from_secs(30);
 const SCROLL_MIN: f32 = 0.25;
 const SCROLL_MAX: f32 = 4.0;
@@ -164,7 +165,7 @@ pub struct Roam<B: Backend = Native> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
-    Status(Status),
+    Status(Box<Status>),
     Configured(Settings),
     Pointer(Pointer),
     Add(String),
@@ -266,7 +267,7 @@ impl<B: Backend> Tool for Roam<B> {
                 Some(engine),
                 Command::spawn(move |emitter| {
                     while let Ok(status) = updates.recv() {
-                        emitter.send(Msg::Status(status));
+                        emitter.send(Msg::Status(Box::new(status)));
                     }
                 }),
             ),
@@ -288,7 +289,7 @@ impl<B: Backend> Tool for Roam<B> {
 
     fn update(&mut self, msg: Msg) -> Command<Msg> {
         match msg {
-            Msg::Status(status) => self.status_changed(status),
+            Msg::Status(status) => self.status_changed(*status),
             Msg::Configured(settings) => {
                 let next = prefs(&settings);
                 if next != self.prefs {
@@ -417,6 +418,9 @@ impl<B: Backend> Tool for Roam<B> {
         for ask in &self.status.asks {
             parts.push(ask_card(ask));
         }
+        if let Some(transfer) = &self.status.transfer {
+            parts.push(transfer_view(transfer));
+        }
         if let Some(name) = &self.status.away_on {
             parts.push(
                 row![
@@ -474,6 +478,17 @@ impl<B: Backend> Tool for Roam<B> {
     }
 
     fn live(&self) -> Option<Live<Msg>> {
+        if let Some(transfer) = &self.status.transfer {
+            let live = Live::new(
+                ring(transfer.share()).size(RING).tone(Tone::Blue),
+                text(format!("{} · {}", transfer.what, percent(transfer))).callout().secondary(),
+            );
+            return Some(if self.status.away_on.is_some() {
+                live.controls(button("").icon(Icon::Xmark).on_press(Msg::Home))
+            } else {
+                live
+            });
+        }
         if let Some(name) = &self.status.away_on {
             let live =
                 Live::new(icon(Icon::Mouse).size(GLYPH).tone(Tone::Blue), text(name.clone()).callout().secondary());
@@ -513,6 +528,46 @@ fn ask_card(ask: &Ask) -> Element<Msg> {
         ]
         .spacing(6.0),
     )
+}
+
+/// A copy on its way, for the page: what it is, who with, and how far along.
+fn transfer_view(transfer: &Transfer) -> Element<Msg> {
+    let title = if transfer.incoming {
+        format!("Getting {} from {}", transfer.what, transfer.with)
+    } else {
+        format!("Sending {} to {}", transfer.what, transfer.with)
+    };
+    card(
+        column![
+            row![
+                icon(Icon::Download).tone(Tone::Blue),
+                text(title).callout().wrap(),
+                spacer(),
+                text(format!("{} of {}", size_words(transfer.done), size_words(transfer.total))).caption().secondary(),
+            ]
+            .spacing(8.0)
+            .align(Align::Center),
+            progress(transfer.share()).tone(Tone::Blue),
+        ]
+        .spacing(6.0),
+    )
+}
+
+fn percent(transfer: &Transfer) -> String {
+    format!("{}%", (transfer.share() * 100.0).floor() as u32)
+}
+
+/// A size the way people read it: 840 KB, 12.4 MB, 3.1 GB.
+fn size_words(bytes: u64) -> String {
+    const KB: f64 = 1000.0;
+    let bytes = bytes as f64;
+    if bytes < KB * KB {
+        format!("{} KB", (bytes / KB).ceil() as u64)
+    } else if bytes < KB * KB * KB {
+        format!("{:.1} MB", bytes / (KB * KB))
+    } else {
+        format!("{:.2} GB", bytes / (KB * KB * KB))
+    }
 }
 
 fn state_words(peer: Option<&PeerView>) -> String {
@@ -558,6 +613,10 @@ impl<B: Backend> Roam<B> {
     }
 
     fn summary(&self) -> String {
+        if let Some(transfer) = &self.status.transfer {
+            let verb = if transfer.incoming { "Getting" } else { "Sending" };
+            return format!("{verb} {} · {}", transfer.what, percent(transfer));
+        }
         if let Some(name) = &self.status.away_on {
             return format!("On {name}");
         }
@@ -589,6 +648,10 @@ impl<B: Backend> Roam<B> {
         let new_asks: Vec<Ask> =
             status.asks.iter().filter(|ask| !ask.controlling && !self.asked.contains(&ask.id)).cloned().collect();
         self.asked = status.asks.iter().map(|a| a.id.clone()).collect();
+        let landed = match (&status.landed, &self.status.landed) {
+            (Some(new), Some(old)) if new.serial == old.serial => None,
+            (new, _) => new.as_ref().map(|l| l.text.clone()),
+        };
         self.status = status;
         let mut changed = !self.desk.is_empty() && self.ensure_me();
         let peers = self.status.peers.clone();
@@ -611,6 +674,9 @@ impl<B: Backend> Roam<B> {
             ]
             .spacing(6.0);
             command = command.and(Command::notice_with_controls(notice, controls));
+        }
+        if let Some(text) = landed {
+            command = command.and(Command::notify(text));
         }
         command
     }

@@ -299,6 +299,14 @@ pub enum Message {
     Allowed,
     /// The session is over.
     Bye,
+    /// The cursor came over with the left button held, dragging files: they follow, to be
+    /// picked up there if the button is still held when they arrive.
+    Drag,
+    /// The cursor is held against the edge on the way back, with the left button down: say
+    /// whether files are being dragged.
+    Edge,
+    /// Files are being dragged here: the cursor may take them back across.
+    Dragging,
 }
 
 const ENTER: u8 = 1;
@@ -310,6 +318,9 @@ const CLIP: u8 = 6;
 const SCREENS: u8 = 7;
 const ALLOWED: u8 = 8;
 const BYE: u8 = 9;
+const DRAG: u8 = 10;
+const EDGE: u8 = 11;
+const DRAGGING: u8 = 12;
 
 /// How much of a clipboard goes in one message.
 pub const CLIP_CHUNK: usize = 900;
@@ -359,6 +370,9 @@ impl Message {
             }
             Message::Allowed => w.u8(ALLOWED),
             Message::Bye => w.u8(BYE),
+            Message::Drag => w.u8(DRAG),
+            Message::Edge => w.u8(EDGE),
+            Message::Dragging => w.u8(DRAGGING),
         }
         *out = w.0;
     }
@@ -391,6 +405,9 @@ impl Message {
             }
             ALLOWED => Message::Allowed,
             BYE => Message::Bye,
+            DRAG => Message::Drag,
+            EDGE => Message::Edge,
+            DRAGGING => Message::Dragging,
             _ => return None,
         })
     }
@@ -589,6 +606,9 @@ mod tests {
                 (10, Message::Leave),
                 (11, Message::Allowed),
                 (12, Message::Bye),
+                (13, Message::Drag),
+                (14, Message::Edge),
+                (15, Message::Dragging),
             ],
         };
         assert_eq!(Body::decode(&body.encode()), Some(body));

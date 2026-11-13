@@ -16,7 +16,9 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 const MAGIC: &[u8; 4] = b"RBK1";
 const FRAME: usize = 64 * 1024;
 /// The most one copy may hold, all its files together.
-pub const MOST: u64 = 4 * 1024 * 1024 * 1024;
+pub const MOST: u64 = 64 * 1024 * 1024 * 1024;
+/// How much is moved between two reports of progress.
+const STEP: usize = 256 * 1024;
 const MOST_ENTRIES: u32 = 50_000;
 const MOST_NAME: usize = 4096;
 /// The most an image or text may take.
@@ -25,6 +27,8 @@ const MOST_BLOB: u64 = 512 * 1024 * 1024;
 const TEXT: u8 = 1;
 const IMAGE: u8 = 2;
 const FILES: u8 = 3;
+/// Files dragged across the edge of the screen: they're picked up on the other side.
+const DRAGGED: u8 = 4;
 const FILE: u8 = 0;
 const FOLDER: u8 = 1;
 
@@ -35,6 +39,8 @@ pub enum Content {
     Image(Vec<u8>),
     /// Files and folders, each with everything in it.
     Files(Vec<PathBuf>),
+    /// The same, dragged across rather than copied.
+    Dragged(Vec<PathBuf>),
 }
 
 /// What came over. Files are already on disk, in a folder of their own.
@@ -43,6 +49,48 @@ pub enum Arrived {
     Text(String),
     Image(Vec<u8>),
     Files(Vec<PathBuf>),
+    /// Files dragged across, to pick up here.
+    Dragged(Vec<PathBuf>),
+}
+
+/// Told how a transfer is going: bytes done, bytes in all, and what is going over (a file's
+/// name, "3 items", "an image"). Answers whether to go on: a newer copy stops an older one.
+pub type Progress<'a> = &'a mut dyn FnMut(u64, u64, &str) -> bool;
+
+/// Moves `size` bytes from `input` to `out`, reporting as it goes.
+fn pump(
+    input: &mut impl Read,
+    out: &mut impl Write,
+    size: u64,
+    done: &mut u64,
+    total: u64,
+    label: &str,
+    progress: Progress,
+) -> io::Result<()> {
+    let mut buffer = vec![0u8; STEP];
+    let mut left = size;
+    while left > 0 {
+        let want = buffer.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let got = input.read(&mut buffer[..want])?;
+        if got == 0 {
+            return Err(invalid("cut short"));
+        }
+        out.write_all(&buffer[..got])?;
+        left -= got as u64;
+        *done += got as u64;
+        if !progress(*done, total, label) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "a newer copy took its place"));
+        }
+    }
+    Ok(())
+}
+
+/// What a list of things copied is called while it goes over.
+pub fn label_of(names: &[&str]) -> String {
+    match names {
+        [one] => (*one).to_owned(),
+        many => format!("{} items", many.len()),
+    }
 }
 
 /// The clear part at the start of a transfer: which session it belongs to, and its number.
@@ -225,27 +273,27 @@ fn walk(paths: &[PathBuf]) -> io::Result<Vec<Entry>> {
 }
 
 /// Sends `content` to `to` (its UDP address: the port number is the same).
-pub fn send(to: SocketAddr, hello: Hello, key: [u8; 32], content: &Content) -> io::Result<()> {
+pub fn send(to: SocketAddr, hello: Hello, key: [u8; 32], content: &Content, progress: Progress) -> io::Result<()> {
     let stream = TcpStream::connect_timeout(&to, Duration::from_secs(3))?;
     let _ = stream.set_nodelay(true);
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut out = BufWriter::with_capacity(FRAME * 2, stream);
     hello.write(&mut out)?;
     let mut sealer = Sealer::new(out, key, hello.id);
-    write_content(&mut sealer, content)?;
+    write_content(&mut sealer, content, progress)?;
     sealer.finish()
 }
 
-fn write_content(out: &mut impl Write, content: &Content) -> io::Result<()> {
+fn write_content(out: &mut impl Write, content: &Content, progress: Progress) -> io::Result<()> {
     match content {
-        Content::Text(text) => write_blob(out, TEXT, text.as_bytes()),
-        Content::Image(png) => write_blob(out, IMAGE, png),
-        Content::Files(paths) => {
+        Content::Text(text) => write_blob(out, TEXT, text.as_bytes(), "text", progress),
+        Content::Image(png) => write_blob(out, IMAGE, png, "an image", progress),
+        Content::Files(paths) | Content::Dragged(paths) => {
             let entries = walk(paths)?;
             if entries.is_empty() {
                 return Err(io::Error::other("nothing to send"));
             }
-            out.write_all(&[FILES])?;
+            out.write_all(&[if matches!(content, Content::Dragged(_)) { DRAGGED } else { FILES }])?;
             out.write_all(&(entries.len() as u32).to_le_bytes())?;
             for entry in &entries {
                 out.write_all(&[if entry.folder { FOLDER } else { FILE }])?;
@@ -253,35 +301,53 @@ fn write_content(out: &mut impl Write, content: &Content) -> io::Result<()> {
                 out.write_all(entry.name.as_bytes())?;
                 out.write_all(&entry.size.to_le_bytes())?;
             }
+            let top: Vec<&str> = entries.iter().filter(|e| !e.name.contains('/')).map(|e| e.name.as_str()).collect();
+            let label = label_of(&top);
+            let total = entries.iter().map(|e| e.size).sum();
+            let mut done = 0;
             for entry in entries.iter().filter(|e| !e.folder) {
-                let copied = io::copy(&mut fs::File::open(&entry.source)?.take(entry.size), out)?;
-                if copied != entry.size {
-                    return Err(io::Error::other("a file changed while it was sent"));
-                }
+                let mut file = fs::File::open(&entry.source)?;
+                pump(&mut file, out, entry.size, &mut done, total, &label, progress).map_err(|err| {
+                    if err.kind() == io::ErrorKind::InvalidData {
+                        io::Error::other("a file changed while it was sent")
+                    } else {
+                        err
+                    }
+                })?;
             }
             Ok(())
         }
     }
 }
 
-fn write_blob(out: &mut impl Write, kind: u8, bytes: &[u8]) -> io::Result<()> {
+fn write_blob(out: &mut impl Write, kind: u8, mut bytes: &[u8], label: &str, progress: Progress) -> io::Result<()> {
     out.write_all(&[kind])?;
-    out.write_all(&(bytes.len() as u64).to_le_bytes())?;
-    out.write_all(bytes)
+    let total = bytes.len() as u64;
+    out.write_all(&total.to_le_bytes())?;
+    pump(&mut bytes, out, total, &mut 0, total, label, progress)
 }
 
 /// Receives a transfer whose `hello` was already read, with the sender's bulk key. Files land in
 /// a new folder in `inbox`.
-pub fn receive(stream: impl Read, hello: Hello, key: [u8; 32], inbox: &Path) -> io::Result<Arrived> {
+pub fn receive(
+    stream: impl Read,
+    hello: Hello,
+    key: [u8; 32],
+    inbox: &Path,
+    progress: Progress,
+) -> io::Result<Arrived> {
     let mut input = Opener::new(BufReader::with_capacity(FRAME * 2, stream), key, hello.id);
     let mut kind = [0u8; 1];
     input.read_exact(&mut kind)?;
     let arrived = match kind[0] {
-        TEXT => Arrived::Text(String::from_utf8(read_blob(&mut input)?).map_err(|_| invalid("text that isn't"))?),
-        IMAGE => Arrived::Image(read_blob(&mut input)?),
-        FILES => {
+        TEXT => Arrived::Text(
+            String::from_utf8(read_blob(&mut input, "text", progress)?).map_err(|_| invalid("text that isn't"))?,
+        ),
+        IMAGE => Arrived::Image(read_blob(&mut input, "an image", progress)?),
+        FILES | DRAGGED => {
             let folder = inbox.join(format!("{:08x}-{}", hello.id, crate::crypto::hex(&crate::crypto::random::<4>())));
-            match read_files(&mut input, &folder) {
+            match read_files(&mut input, &folder, progress) {
+                Ok(paths) if kind[0] == DRAGGED => Arrived::Dragged(paths),
                 Ok(paths) => Arrived::Files(paths),
                 Err(err) => {
                     let _ = fs::remove_dir_all(&folder);
@@ -304,16 +370,13 @@ fn u64_of(input: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_blob(input: &mut impl Read) -> io::Result<Vec<u8>> {
+fn read_blob(input: &mut impl Read, label: &str, progress: Progress) -> io::Result<Vec<u8>> {
     let length = u64_of(input)?;
     if length > MOST_BLOB {
         return Err(invalid("too big"));
     }
     let mut bytes = Vec::with_capacity(length as usize);
-    input.take(length).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != length {
-        return Err(invalid("cut short"));
-    }
+    pump(input, &mut bytes, length, &mut 0, length, label, progress)?;
     Ok(bytes)
 }
 
@@ -336,14 +399,15 @@ fn place(folder: &Path, name: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-fn read_files(input: &mut impl Read, folder: &Path) -> io::Result<Vec<PathBuf>> {
+fn read_files(input: &mut impl Read, folder: &Path, progress: Progress) -> io::Result<Vec<PathBuf>> {
     let mut count = [0u8; 4];
     input.read_exact(&mut count)?;
     let count = u32::from_le_bytes(count);
     if count == 0 || count > MOST_ENTRIES {
         return Err(invalid("too many files"));
     }
-    let mut entries = Vec::with_capacity(count as usize);
+    let mut entries = Vec::with_capacity(count.min(1024) as usize);
+    let mut tops: Vec<String> = Vec::new();
     let mut total = 0u64;
     for _ in 0..count {
         let mut head = [0u8; 3];
@@ -361,28 +425,36 @@ fn read_files(input: &mut impl Read, folder: &Path) -> io::Result<Vec<PathBuf>> 
             return Err(invalid("too big"));
         }
         let path = place(folder, &name).ok_or_else(|| invalid("a name outside the folder"))?;
-        entries.push((path, head[0] == FOLDER, size, !name.contains('/')));
+        if !name.contains('/') {
+            tops.push(name);
+        }
+        entries.push((path, head[0] == FOLDER, size));
     }
     fs::create_dir_all(folder)?;
     let mut top = Vec::new();
-    for (path, is_folder, _, is_top) in &entries {
+    let mut seen = std::collections::HashSet::new();
+    for name in &tops {
+        if let Some(path) = place(folder, name)
+            && seen.insert(path.clone())
+        {
+            top.push(path);
+        }
+    }
+    for (path, is_folder, _) in &entries {
         if *is_folder {
             fs::create_dir_all(path)?;
         }
-        if *is_top && !top.contains(path) {
-            top.push(path.clone());
-        }
     }
-    for (path, _, size, _) in entries.iter().filter(|e| !e.1) {
+    let names: Vec<&str> = tops.iter().map(String::as_str).collect();
+    let label = label_of(&names);
+    let mut done = 0;
+    for (path, _, size) in entries.iter().filter(|e| !e.1) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = BufWriter::new(fs::File::create(path)?);
-        let copied = io::copy(&mut input.take(*size), &mut file)?;
+        let mut file = BufWriter::with_capacity(STEP, fs::File::create(path)?);
+        pump(input, &mut file, *size, &mut done, total, &label, progress)?;
         file.flush()?;
-        if copied != *size {
-            return Err(invalid("cut short"));
-        }
     }
     Ok(top)
 }
@@ -419,11 +491,11 @@ mod tests {
         let to = listener.local_addr().unwrap();
         let key = [7u8; 32];
         let hello = Hello { session: 5, id: 9 };
-        let sender = std::thread::spawn(move || send(to, hello, key, &content));
+        let sender = std::thread::spawn(move || send(to, hello, key, &content, &mut |_, _, _| true));
         let (mut stream, _) = listener.accept().unwrap();
         let heard = Hello::read(&mut stream)?;
         assert_eq!(heard, hello);
-        let arrived = receive(stream, heard, key, inbox);
+        let arrived = receive(stream, heard, key, inbox, &mut |_, _, _| true);
         sender.join().unwrap()?;
         arrived
     }
@@ -461,6 +533,35 @@ mod tests {
     }
 
     #[test]
+    fn progress_is_told_and_a_newer_copy_stops_an_older_one() {
+        let source = folder("progress");
+        fs::write(source.join("movie.mov"), vec![3u8; 3 * STEP + 10]).unwrap();
+        let mut sealed = Vec::new();
+        let mut sealer = Sealer::new(&mut sealed, [1; 32], 2);
+        let mut told = Vec::new();
+        let content = Content::Files(vec![source.join("movie.mov")]);
+        write_content(&mut sealer, &content, &mut |done, total, label| {
+            told.push((done, total, label.to_owned()));
+            true
+        })
+        .unwrap();
+        sealer.finish().unwrap();
+        assert_eq!(told.len(), 4);
+        assert_eq!(told.last().unwrap(), &(3 * STEP as u64 + 10, 3 * STEP as u64 + 10, "movie.mov".to_owned()));
+        let inbox = folder("progress-inbox");
+        let hello = Hello { session: 1, id: 2 };
+        let mut steps = 0;
+        let stopped = receive(&sealed[..], hello, [1; 32], &inbox, &mut |_, _, _| {
+            steps += 1;
+            steps < 2
+        });
+        assert_eq!(stopped.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read_dir(&inbox).unwrap().count(), 0, "the half-copied folder is gone");
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(inbox);
+    }
+
+    #[test]
     fn names_never_reach_outside_the_folder() {
         let folder = Path::new("/inbox/1");
         assert_eq!(place(folder, "a/b.txt"), Some(folder.join("a").join("b.txt")));
@@ -475,17 +576,23 @@ mod tests {
     fn a_wrong_key_or_a_cut_off_transfer_is_refused() {
         let mut sealed = Vec::new();
         let mut sealer = Sealer::new(&mut sealed, [1; 32], 3);
-        write_content(&mut sealer, &Content::Text("secret".into())).unwrap();
+        write_content(&mut sealer, &Content::Text("secret".into()), &mut |_, _, _| true).unwrap();
         sealer.finish().unwrap();
         let inbox = folder("refused");
         let hello = Hello { session: 1, id: 3 };
-        assert_eq!(receive(&sealed[..], hello, [1; 32], &inbox).unwrap(), Arrived::Text("secret".into()));
-        assert!(receive(&sealed[..], hello, [2; 32], &inbox).is_err(), "another key");
-        assert!(receive(&sealed[..], Hello { id: 4, ..hello }, [1; 32], &inbox).is_err(), "another number");
+        assert_eq!(
+            receive(&sealed[..], hello, [1; 32], &inbox, &mut |_, _, _| true).unwrap(),
+            Arrived::Text("secret".into())
+        );
+        assert!(receive(&sealed[..], hello, [2; 32], &inbox, &mut |_, _, _| true).is_err(), "another key");
+        assert!(
+            receive(&sealed[..], Hello { id: 4, ..hello }, [1; 32], &inbox, &mut |_, _, _| true).is_err(),
+            "another number"
+        );
         let mut tampered = sealed.clone();
         tampered[10] ^= 1;
-        assert!(receive(&tampered[..], hello, [1; 32], &inbox).is_err(), "changed on the way");
-        assert!(receive(&sealed[..sealed.len() - 3], hello, [1; 32], &inbox).is_err(), "cut off");
+        assert!(receive(&tampered[..], hello, [1; 32], &inbox, &mut |_, _, _| true).is_err(), "changed on the way");
+        assert!(receive(&sealed[..sealed.len() - 3], hello, [1; 32], &inbox, &mut |_, _, _| true).is_err(), "cut off");
         let _ = fs::remove_dir_all(inbox);
     }
 

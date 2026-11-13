@@ -226,3 +226,65 @@ fn a_mac_swipe_is_the_same_shortcut_on_windows() {
     assert_eq!(right[..3], [(LEFT_CTRL, true), (LEFT_GUI, true), (RIGHT, true)]);
     assert_eq!(super::swipe_keys(Swipe::Up, Os::Mac)[0], (LEFT_CTRL, true));
 }
+
+/// Pairs the two and connects them, the Mac controlling the PC.
+fn connect(a: &mut Machine, b: &mut Machine) {
+    let (a_id, b_id) = (a.id(), b.id());
+    place(a, b);
+    a.until("the code to check", |s| !s.asks.is_empty());
+    b.until("the request to allow", |s| !s.asks.is_empty());
+    a.engine.send(Control::Allow(b_id.clone()));
+    b.engine.send(Control::Allow(a_id.clone()));
+    connected(a, &b_id);
+    connected(b, &a_id);
+    a.wait_for("listening to the mouse", |s| s.sink.is_some());
+}
+
+#[test]
+fn files_dragged_across_the_edge_are_picked_up_on_the_other_side_and_can_come_back() {
+    let (mut a, mut b) = pair();
+    connect(&mut a, &mut b);
+    let there = a.data.join("report.pdf");
+    std::fs::write(&there, b"the report").unwrap();
+
+    // Held against the edge with no files dragged, the cursor stays home.
+    a.fake.input(Input::Button { button: 0, down: true });
+    a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [3.0, 0.0] });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!a.fake.state().captured);
+
+    // Dragging files, it goes across: the drag here ends, and the PC picks them up.
+    a.fake.state().dragging = Some(vec![there]);
+    std::thread::sleep(Duration::from_millis(80));
+    a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [3.0, 0.0] });
+    a.wait_for("capturing", |s| s.captured);
+    assert_eq!(a.fake.state().cancelled, 1);
+    b.wait_for("picking the files up", |s| !s.picked.is_empty());
+    let (paths, played) = b.fake.state().picked[0].clone();
+    assert!(played);
+    assert_eq!(paths.len(), 1);
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"the report");
+    assert_eq!(paths[0].file_name().unwrap(), "report.pdf");
+
+    // Letting go there drops them.
+    a.fake.input(Input::Button { button: 0, down: false });
+    b.wait_for("the drop", |s| s.played.contains(&Play::Button { button: 0, down: false }));
+
+    // A drag on the PC comes back home once the PC says files are being dragged.
+    let back = b.data.join("notes.txt");
+    std::fs::write(&back, b"some notes").unwrap();
+    b.fake.state().dragging = Some(vec![back]);
+    a.fake.input(Input::Button { button: 0, down: true });
+    b.wait_for("the press", |s| s.played.iter().filter(|p| **p == Play::Button { button: 0, down: true }).count() == 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while a.fake.state().captured {
+        assert!(Instant::now() < deadline, "the cursor never came home");
+        a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [-4000.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    b.wait_for("the drag there ending", |s| s.cancelled == 1);
+    a.wait_for("picking the files up at home", |s| !s.picked.is_empty());
+    let (paths, played) = a.fake.state().picked[0].clone();
+    assert!(!played, "held on this computer's own mouse");
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"some notes");
+}

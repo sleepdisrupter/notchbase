@@ -47,7 +47,7 @@ use crate::keys;
 use crate::layout::Rect;
 
 /// Marks the input Roam sends, so nothing mistakes it for the person's own.
-const MARK: usize = 0x526F_616D;
+pub(super) const MARK: usize = 0x526F_616D;
 const COVER: i32 = 64;
 const HWND_TOPMOST: HWND = -1isize as HWND;
 /// Asks the hook thread to put the cover under the parked cursor.
@@ -513,6 +513,27 @@ impl Platform for Windows {
 
     fn still_captured(&mut self) -> bool {
         captured_now()
+    }
+
+    fn left_button(&mut self, down: bool) {
+        super::windows_drag::left_button(down);
+    }
+
+    fn dragged_files(&mut self, at: [f64; 2]) -> Option<Vec<std::path::PathBuf>> {
+        super::windows_drag::dragged_files(at)
+    }
+
+    fn cancel_drag(&mut self) {
+        super::windows_drag::cancel_drag();
+    }
+
+    fn drag_in(&mut self, paths: Vec<std::path::PathBuf>, played: bool) -> bool {
+        let started = super::windows_drag::drag_in(paths);
+        if started && played {
+            // The left button goes down here, and the controller's letting go plays its release.
+            self.buttons |= 1;
+        }
+        started
     }
 
     fn fast(&mut self, on: bool) {

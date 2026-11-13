@@ -8,10 +8,10 @@
 //! you reach the edge, with no round trip. The controlled computer just shows what it's told.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,10 @@ const MOST_CLIPBOARD: usize = 512 * 1024;
 const CORNER: f64 = 12.0;
 /// Text up to this long goes on the link; longer goes over TCP, as images and files do.
 const SHORT_TEXT: usize = 16 * 1024;
+/// How often a drag held against the edge is checked for files.
+const DRAG_CHECK_EVERY: u64 = 60 * MS;
+/// Marks the number of a transfer of dragged files, which a newer clipboard doesn't stop.
+const DRAG_ID: u32 = 1 << 31;
 /// How many received copies of files are kept, newest first.
 const KEEP_RECEIVED: usize = 4;
 
@@ -127,16 +131,30 @@ enum Event {
     Control(Control),
     /// The clipboard as read for `Purpose`, with its digest.
     Clipboard(Option<(Copied, [u8; 32])>, Purpose),
-    /// A big clipboard is coming in over TCP for `session`, from `from`: the answer is the key.
+    /// A big clipboard is coming in over TCP for `session`: the answer is the key, and the name
+    /// of the computer it comes from.
     Bulk {
         session: u32,
-        from: IpAddr,
-        answer: Sender<Option<[u8; 32]>>,
+        answer: Sender<Option<([u8; 32], String)>>,
     },
-    /// A big clipboard came in.
-    Arrived(Arrived),
-    /// The clipboard now holds what came over, which has this digest.
-    ClipSet([u8; 32]),
+    /// How a big clipboard going over is getting on: `None` once it's over, one way or another.
+    Moving {
+        incoming: bool,
+        id: u32,
+        transfer: Option<Transfer>,
+    },
+    /// A big clipboard came in, from the computer named. `slow` when it took long enough that
+    /// it's worth saying it's here.
+    Arrived {
+        arrived: Arrived,
+        from: String,
+        slow: bool,
+    },
+    /// The clipboard now holds what came over, which has this digest, with what to tell.
+    ClipSet {
+        digest: [u8; 32],
+        notice: Option<String>,
+    },
     /// A line for the log, from another thread.
     Note(String),
     /// Slow lookups, done on their own thread: the computer's name, the typed addresses and
@@ -193,6 +211,33 @@ pub struct Ask {
     pub controlling: bool,
 }
 
+/// A copy on its way between this computer and another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Transfer {
+    /// Coming here, rather than going from here.
+    pub incoming: bool,
+    /// The other computer's name.
+    pub with: String,
+    /// What is going over: a file's name, "3 items", "an image".
+    pub what: String,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl Transfer {
+    pub fn share(&self) -> f32 {
+        if self.total == 0 { 1.0 } else { (self.done as f64 / self.total as f64).clamp(0.0, 1.0) as f32 }
+    }
+}
+
+/// Something that came over and is now on the clipboard, worth a notice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Landed {
+    /// Counts up, so each one is told once.
+    pub serial: u32,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Status {
     pub me: Option<PeerView>,
@@ -208,6 +253,10 @@ pub struct Status {
     pub problem: Option<String>,
     /// This computer's addresses, for typing into the other one.
     pub addresses: Vec<String>,
+    /// The newest big copy on its way, if it's taking a moment.
+    pub transfer: Option<Transfer>,
+    /// The last big copy that came in.
+    pub landed: Option<Landed>,
 }
 
 /// A running engine. Dropping it stops everything and gives the mouse and keyboard back.
@@ -441,6 +490,27 @@ struct Core {
     clip_in: Clip,
     clip_seen: Option<[u8; 32]>,
     clip_next: u32,
+    /// The newest copy sent from here, and the newest coming in: older ones still on their
+    /// way stop.
+    sending: Arc<AtomicU32>,
+    receiving: Arc<AtomicU32>,
+    transfer: Option<(bool, u32, Transfer)>,
+    landed: Option<Landed>,
+    // Dragging files across. The controller's side:
+    /// The computer the cursor is on said files are being dragged there.
+    peer_dragging: Option<Id>,
+    /// Files dragged home from another computer are on their way, to pick up here.
+    drag_home: bool,
+    /// When this computer's own drag was last checked for files, and the computer the cursor
+    /// is on was last asked.
+    drag_checked_at: u64,
+    // The controlled side:
+    /// The controller's left button is held while files it dragged here are on their way.
+    drag_held: bool,
+    /// Files being dragged here, to take across if the cursor goes back.
+    drag_out: Option<Vec<std::path::PathBuf>>,
+    /// Where the cursor was last played.
+    played_at: [f64; 2],
     fast: bool,
     steady: bool,
     steady_at: u64,
@@ -511,6 +581,16 @@ impl Core {
             clip_in: Clip::default(),
             clip_seen: None,
             clip_next: 1,
+            sending: Arc::new(AtomicU32::new(0)),
+            receiving: Arc::new(AtomicU32::new(0)),
+            transfer: None,
+            landed: None,
+            peer_dragging: None,
+            drag_home: false,
+            drag_checked_at: 0,
+            drag_held: false,
+            drag_out: None,
+            played_at: [0.0, 0.0],
             fast: false,
             steady: false,
             steady_at: 0,
@@ -650,17 +730,28 @@ impl Core {
             Event::Input(input, at) => self.input(input, at),
             Event::Control(control) => self.control(control),
             Event::Clipboard(copied, purpose) => self.clipboard_read(copied, purpose),
-            Event::Bulk { session, from, answer } => {
-                let key = self
-                    .sessions
-                    .values_mut()
-                    .find(|s| s.id == session && s.addr.ip() == from)
-                    .and_then(Session::live)
-                    .map(|link| link.bulk_receive());
-                let _ = answer.send(key);
+            // Only the session's key opens it, so it may come from any of that computer's addresses.
+            Event::Bulk { session, answer } => {
+                let found = self.sessions.iter_mut().find(|(_, s)| s.id == session).map(|(id, s)| (*id, s));
+                let key = found.and_then(|(peer, s)| Some((peer, s.live()?.bulk_receive())));
+                let _ = answer.send(key.map(|(peer, key)| (key, self.who(peer))));
             }
-            Event::Arrived(arrived) => self.arrived(arrived),
-            Event::ClipSet(digest) => self.clip_seen = Some(digest),
+            Event::Moving { incoming, id, transfer } => match transfer {
+                Some(transfer) => self.transfer = Some((incoming, id, transfer)),
+                None => {
+                    if matches!(self.transfer, Some((i, n, _)) if i == incoming && n == id) {
+                        self.transfer = None;
+                    }
+                }
+            },
+            Event::Arrived { arrived, from, slow } => self.arrived(arrived, Some((from, slow))),
+            Event::ClipSet { digest, notice } => {
+                self.clip_seen = Some(digest);
+                if let Some(text) = notice {
+                    let serial = self.landed.as_ref().map_or(1, |l| l.serial.wrapping_add(1));
+                    self.landed = Some(Landed { serial, text });
+                }
+            }
             Event::Note(text) => self.note(&text),
             Event::Looked { name, addresses, networks } => {
                 self.host_name = name;
@@ -1285,7 +1376,8 @@ impl Core {
     }
 
     fn play_move(&mut self, at: [f32; 2]) {
-        self.platform.play(Play::Move([f64::from(at[0]), f64::from(at[1])]));
+        self.played_at = [f64::from(at[0]), f64::from(at[1])];
+        self.platform.play(Play::Move(self.played_at));
     }
 
     /// Another computer's cursor arrives here.
@@ -1312,22 +1404,53 @@ impl Core {
             }
             _ if !live => {}
             // From here on: the controlled side, hearing its controller.
-            _ if side != Side::Controlled => {
-                if let Message::Clip { .. } = message {
-                    self.clip(message, side);
+            _ if side != Side::Controlled => match message {
+                Message::Clip { .. } => self.clip(message, side),
+                Message::Dragging
+                    if matches!(self.cursor, Cursor::Away { peer, .. } if peer == id) && self.held_buttons & 1 != 0 =>
+                {
+                    self.peer_dragging = Some(id);
                 }
-            }
+                _ => {}
+            },
             Message::Enter { at } => {
                 self.note(&format!("{}'s cursor arrived", self.who(id)));
                 self.stalled = false;
+                self.drag_held = false;
+                self.drag_out = None;
                 self.arrive();
                 self.play_move(at);
             }
             Message::Leave => {
                 self.note(&format!("{}'s cursor left", self.who(id)));
                 self.stalled = false;
+                // Files dragged here go back with the cursor: the drag here ends without a drop.
+                let dragged = self.drag_out.take().filter(|_| self.played_buttons & 1 != 0);
+                if dragged.is_some() {
+                    self.platform.cancel_drag();
+                }
+                self.drag_held = false;
                 self.leave_here();
                 self.platform.depart();
+                if let Some(paths) = dragged {
+                    self.note(&format!("taking {} dragged item(s) back to {}", paths.len(), self.who(id)));
+                    self.send_bulk(id, true, move || Some(Content::Dragged(paths)));
+                }
+            }
+            Message::Drag => self.drag_held = true,
+            Message::Edge => {
+                if self.here
+                    && self.played_buttons & 1 != 0
+                    && let Some(paths) = self.platform.dragged_files(self.played_at)
+                {
+                    if self.drag_out.is_none() {
+                        self.note(&format!("{} item(s) are being dragged here", paths.len()));
+                    }
+                    self.drag_out = Some(paths);
+                    if let Some(link) = self.sessions.get_mut(&id).and_then(Session::live) {
+                        link.queue(Message::Dragging);
+                    }
+                }
             }
             Message::Key { hid, down } => {
                 if down {
@@ -1338,8 +1461,18 @@ impl Core {
                 self.platform.play(Play::Key { hid, down });
             }
             Message::Button { button, down } if button < BUTTONS => {
+                if button == 0 {
+                    if !down {
+                        self.drag_held = false;
+                        self.drag_out = None;
+                    }
+                    self.platform.left_button(down);
+                }
                 if down {
                     self.played_buttons |= 1 << button;
+                } else if self.played_buttons & (1 << button) == 0 {
+                    // Pressed before the cursor came over: it was never pressed here.
+                    return;
                 } else {
                     self.played_buttons &= !(1 << button);
                 }
@@ -1490,6 +1623,15 @@ impl Core {
                 } else {
                     self.held_buttons &= !(1 << button);
                 }
+                if button == 0 {
+                    if !down {
+                        self.peer_dragging = None;
+                        self.drag_home = false;
+                    }
+                    if self.cursor == Cursor::Home {
+                        self.platform.left_button(down);
+                    }
+                }
             }
             Input::Key { hid, down } => {
                 if down {
@@ -1503,7 +1645,9 @@ impl Core {
         match self.cursor {
             Cursor::Home => {
                 let Input::Move { at, delta } = input else { return };
-                if self.held_buttons != 0 || self.locked {
+                // Only the left button may be held across, and only while dragging files.
+                let dragging = self.held_buttons == 1;
+                if (self.held_buttons != 0 && !dragging) || self.locked {
                     return;
                 }
                 let (desk, ids) = self.desk();
@@ -1512,9 +1656,24 @@ impl Core {
                 }
                 let corner = self.corner_for(Os::here());
                 if let Some(Step::Cross { to, at: arrive }) = layout::push(&desk, 0, at, delta, corner)
-                    && let Some(Some(peer)) = ids.get(to)
+                    && let Some(&Some(peer)) = ids.get(to)
                 {
-                    self.enter(*peer, arrive, at, now);
+                    if !dragging {
+                        return self.enter(peer, arrive, at, now);
+                    }
+                    if now < self.drag_checked_at + DRAG_CHECK_EVERY {
+                        return;
+                    }
+                    self.drag_checked_at = now;
+                    let Some(paths) = self.platform.dragged_files(at) else { return };
+                    // The files go across instead of landing here.
+                    self.platform.cancel_drag();
+                    self.enter(peer, arrive, at, now);
+                    self.note(&format!("dragging {} item(s) over to {}", paths.len(), self.who(peer)));
+                    if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
+                        link.queue(Message::Drag);
+                    }
+                    self.send_bulk(peer, true, move || Some(Content::Dragged(paths)));
                 }
             }
             Cursor::Away { peer, at, left_from } => self.away_input(input, peer, at, left_from, now),
@@ -1534,8 +1693,32 @@ impl Core {
                 let os = self.peers.get(&peer).map_or(Os::Other, |p| p.os);
                 let step = layout::step(&desk, on, at, scaled, self.corner_for(os));
                 let step = match step {
-                    // No dragging across: a held button keeps the cursor where the drag started.
-                    Step::Cross { .. } if self.held_buttons != 0 || self.locked => {
+                    // Files dragged there may come back home with the cursor.
+                    Step::Cross { to, .. }
+                        if self.held_buttons == 1
+                            && !self.locked
+                            && self.peer_dragging == Some(peer)
+                            && ids.get(to).copied().flatten().is_none() =>
+                    {
+                        self.drag_home = true;
+                        step
+                    }
+                    // No dragging across otherwise: a held button keeps the cursor where the drag
+                    // started.
+                    Step::Cross { to, .. } if self.held_buttons != 0 || self.locked => {
+                        let home = ids.get(to).copied().flatten().is_none();
+                        if home
+                            && self.held_buttons == 1
+                            && !self.locked
+                            && now >= self.drag_checked_at + DRAG_CHECK_EVERY
+                        {
+                            // Ask whether it's files being dragged there.
+                            self.drag_checked_at = now;
+                            if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
+                                link.queue(Message::Edge);
+                            }
+                            self.flush(now, true);
+                        }
                         let to = [at[0] + scaled[0], at[1] + scaled[1]];
                         Step::Stay(desk[on].onto_displays(to))
                     }
@@ -1713,49 +1896,71 @@ impl Core {
             _ => None,
         };
         let Some(to) = to else { return };
-        let Some(session) = self.sessions.get_mut(&to) else { return };
-        let addr = session.addr;
-        let session_id = session.id;
-        let Some(link) = session.live() else { return };
+        if !self.sessions.get(&to).is_some_and(Session::is_live) {
+            return;
+        }
         self.clip_seen = Some(digest);
-        let id = self.clip_next;
-        self.clip_next = self.clip_next.wrapping_add(1);
         match copied {
             // Short text goes on the link itself: there's no connection to make.
             Copied::Text(text) if text.len() <= SHORT_TEXT => {
+                let id = self.next_copy(false);
+                let Some(link) = self.sessions.get_mut(&to).and_then(Session::live) else { return };
                 let chunks: Vec<&[u8]> = text.as_bytes().chunks(CLIP_CHUNK).collect();
                 let total = chunks.len() as u16;
                 for (index, chunk) in chunks.into_iter().enumerate() {
                     link.queue(Message::Clip { id, index: index as u16, total, bytes: chunk.to_vec() });
                 }
             }
-            copied => {
-                let key = link.bulk_send();
-                let events = self.events.clone();
-                let who = self.who(to);
-                let _ = std::thread::Builder::new().name("roam-send".into()).spawn(move || {
-                    let content = match copied {
-                        Copied::Text(text) => Content::Text(text),
-                        Copied::Image { width, height, rgba } => match input::png(width, height, &rgba) {
-                            Some(png) => Content::Image(png),
-                            None => return,
-                        },
-                        Copied::Files(paths) => Content::Files(paths),
-                    };
-                    let what = match &content {
-                        Content::Text(_) => "text",
-                        Content::Image(_) => "an image",
-                        Content::Files(_) => "files",
-                    };
-                    let started = Instant::now();
-                    let line = match bulk::send(addr, Hello { session: session_id, id }, key, &content) {
-                        Ok(()) => format!("sent {what} to {who} in {} ms", started.elapsed().as_millis()),
-                        Err(err) => format!("couldn't send {what} to {who}: {err}"),
-                    };
-                    let _ = events.send(Event::Note(line));
-                });
-            }
+            copied => self.send_bulk(to, false, move || {
+                Some(match copied {
+                    Copied::Text(text) => Content::Text(text),
+                    Copied::Image { width, height, rgba } => Content::Image(input::png(width, height, &rgba)?),
+                    Copied::Files(paths) => Content::Files(paths),
+                })
+            }),
         }
+    }
+
+    /// Numbers a new copy going out. A clipboard stops an older one that's still going over; a
+    /// drag is marked as one, so no clipboard stops it.
+    fn next_copy(&mut self, drag: bool) -> u32 {
+        let id = (self.clip_next & !DRAG_ID) | if drag { DRAG_ID } else { 0 };
+        self.clip_next = self.clip_next.wrapping_add(1);
+        if !drag {
+            self.sending.store(id, Ordering::Relaxed);
+        }
+        id
+    }
+
+    /// Sends what `make` makes to a computer in a live session, over TCP on a thread of its own.
+    fn send_bulk(&mut self, to: Id, drag: bool, make: impl FnOnce() -> Option<Content> + Send + 'static) {
+        let id = self.next_copy(drag);
+        let newest = if drag { Arc::new(AtomicU32::new(id)) } else { self.sending.clone() };
+        let who = self.who(to);
+        let Some(session) = self.sessions.get_mut(&to) else { return };
+        let addr = session.addr;
+        let session_id = session.id;
+        let Some(link) = session.live() else { return };
+        let key = link.bulk_send();
+        let events = self.events.clone();
+        let _ = std::thread::Builder::new().name("roam-send".into()).spawn(move || {
+            let Some(content) = make() else { return };
+            let what = match &content {
+                Content::Text(_) => "text",
+                Content::Image(_) => "an image",
+                Content::Files(_) => "files",
+                Content::Dragged(_) => "dragged files",
+            };
+            let started = Instant::now();
+            let mut progress = reporter(&events, false, id, who.clone(), &newest);
+            let sent = bulk::send(addr, Hello { session: session_id, id }, key, &content, &mut progress);
+            let line = match sent {
+                Ok(()) => format!("sent {what} to {who} in {} ms", started.elapsed().as_millis()),
+                Err(err) => format!("couldn't send {what} to {who}: {err}"),
+            };
+            let _ = events.send(Event::Moving { incoming: false, id, transfer: None });
+            let _ = events.send(Event::Note(line));
+        });
     }
 
     /// Takes big clipboards from the computers in a session with this one, over TCP on the
@@ -1770,30 +1975,74 @@ impl Core {
         }
         let events = self.events.clone();
         let running = self.running.clone();
+        let newest = self.receiving.clone();
         let inbox = self.data.join("received");
         let _ = std::thread::Builder::new().name("roam-bulk".into()).spawn(move || {
             while running.load(Ordering::Relaxed) {
-                let Ok((stream, from)) = listener.accept() else {
+                let Ok((stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 };
                 let events = events.clone();
                 let inbox = inbox.clone();
+                let newest = newest.clone();
                 let _ = std::thread::Builder::new().name("roam-receive".into()).spawn(move || {
-                    let _ = receive_bulk(stream, from.ip(), &events, &inbox);
+                    let _ = receive_bulk(stream, &events, &inbox, &newest);
                 });
             }
         });
     }
 
-    fn arrived(&mut self, arrived: Arrived) {
+    /// Puts what came over on the clipboard, or picks up files dragged across while the button is
+    /// still held. `told` names the computer it came from over TCP, and whether it took long
+    /// enough to say it's here.
+    fn arrived(&mut self, arrived: Arrived, told: Option<(String, bool)>) {
+        let arrived = match arrived {
+            Arrived::Dragged(paths) => {
+                let held = if self.here {
+                    self.drag_held && self.played_buttons & 1 == 0
+                } else {
+                    self.cursor == Cursor::Home && self.drag_home && self.held_buttons & 1 != 0
+                };
+                let played = self.here;
+                self.drag_held = false;
+                self.drag_home = false;
+                if held && self.platform.drag_in(paths.clone(), played) {
+                    if played {
+                        self.played_buttons |= 1;
+                    }
+                    self.note(&format!("picked up {} dragged item(s)", paths.len()));
+                    // Their copy is still there to paste if the drop goes wrong.
+                    return;
+                }
+                // The button was let go before they arrived: they're ready to paste instead.
+                Arrived::Files(paths)
+            }
+            arrived => arrived,
+        };
+        let what = match &arrived {
+            Arrived::Text(_) => "Text".to_owned(),
+            Arrived::Image(_) => "An image".to_owned(),
+            Arrived::Files(paths) | Arrived::Dragged(paths) => {
+                let names: Vec<String> =
+                    paths.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                bulk::label_of(&names)
+            }
+        };
+        let notice = match (&arrived, told) {
+            (Arrived::Files(_), Some((from, _))) | (_, Some((from, true))) => {
+                Some(format!("{what} from {from} is ready to paste"))
+            }
+            _ => None,
+        };
         let copied = match arrived {
             Arrived::Text(text) => Copied::Text(text),
             Arrived::Image(png) => match input::unpng(&png) {
                 Some(image) => image,
                 None => return,
             },
-            Arrived::Files(paths) => Copied::Files(paths),
+            Arrived::Files(paths) | Arrived::Dragged(paths) => Copied::Files(paths),
         };
         // Not sent back when the cursor leaves, even before the clipboard is set.
         self.clip_seen = Some(copied.digest());
@@ -1801,7 +2050,7 @@ impl Core {
         let inbox = self.data.join("received");
         let _ = std::thread::Builder::new().name("roam-paste".into()).spawn(move || {
             if let Some(digest) = input::set_clipboard(&copied) {
-                let _ = events.send(Event::ClipSet(digest));
+                let _ = events.send(Event::ClipSet { digest, notice });
             }
             bulk::tidy(&inbox, KEEP_RECEIVED);
         });
@@ -1821,8 +2070,10 @@ impl Core {
         if self.clip_in.parts.iter().all(Option::is_some) {
             let bytes: Vec<u8> = std::mem::take(&mut self.clip_in.parts).into_iter().flatten().flatten().collect();
             self.clip_in = Clip::default();
+            // Newer than any big copy still coming in, which stops.
+            self.receiving.store(id, Ordering::Relaxed);
             if let Ok(text) = String::from_utf8(bytes) {
-                self.arrived(Arrived::Text(text));
+                self.arrived(Arrived::Text(text), None);
             }
         }
     }
@@ -2013,6 +2264,8 @@ impl Core {
             asks,
             problem,
             addresses,
+            transfer: self.transfer.as_ref().map(|(_, _, t)| t.clone()),
+            landed: self.landed.clone(),
         }
     }
 }
@@ -2076,26 +2329,66 @@ fn swipe_keys(swipe: Swipe, os: Os) -> Vec<(u16, bool)> {
     held.iter().map(|&hid| (hid, true)).chain(held.iter().rev().map(|&hid| (hid, false))).collect()
 }
 
-/// One incoming transfer, on its own thread: checks it belongs to a live session with the
-/// computer it comes from, then takes it in.
+/// Copies quicker than this aren't shown going over.
+const SHOW_AFTER: Duration = Duration::from_millis(400);
+/// How often the engine hears how a copy is going.
+const REPORT_EVERY: Duration = Duration::from_millis(100);
+
+/// Tells the engine how a copy is going, now and then, and stops it once a newer one has
+/// started (`newest` is no longer `id`).
+fn reporter<'a>(
+    events: &'a Sender<Event>,
+    incoming: bool,
+    id: u32,
+    with: String,
+    newest: &'a AtomicU32,
+) -> impl FnMut(u64, u64, &str) -> bool + 'a {
+    let started = Instant::now();
+    let mut told: Option<Instant> = None;
+    move |done, total, what| {
+        let due = match told {
+            Some(at) => at.elapsed() >= REPORT_EVERY,
+            None => started.elapsed() >= SHOW_AFTER,
+        };
+        if due {
+            told = Some(Instant::now());
+            let transfer = Transfer { incoming, with: with.clone(), what: what.to_owned(), done, total };
+            let _ = events.send(Event::Moving { incoming, id, transfer: Some(transfer) });
+        }
+        newest.load(Ordering::Relaxed) == id
+    }
+}
+
+/// One incoming transfer, on its own thread: checks it belongs to a live session, then takes
+/// it in.
 fn receive_bulk(
     mut stream: std::net::TcpStream,
-    from: IpAddr,
     events: &Sender<Event>,
     inbox: &std::path::Path,
+    newest: &AtomicU32,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let hello = Hello::read(&mut stream)?;
     let (answer, key) = mpsc::channel();
-    events.send(Event::Bulk { session: hello.session, from, answer }).map_err(std::io::Error::other)?;
-    let Ok(Some(key)) = key.recv_timeout(Duration::from_secs(2)) else { return Ok(()) };
+    events.send(Event::Bulk { session: hello.session, answer }).map_err(std::io::Error::other)?;
+    let Ok(Some((key, from))) = key.recv_timeout(Duration::from_secs(2)) else { return Ok(()) };
+    // The newest copy wins: an older one still coming in stops. Dragged files aren't a copy.
+    let drag = hello.id & DRAG_ID != 0;
+    let own = AtomicU32::new(hello.id);
+    let newest = if drag { &own } else { newest };
+    newest.store(hello.id, Ordering::Relaxed);
     let started = Instant::now();
-    match bulk::receive(stream, hello, key, inbox) {
-        Ok(arrived) => {
-            let _ = events.send(Event::Note(format!("a clipboard came in, in {} ms", started.elapsed().as_millis())));
-            let _ = events.send(Event::Arrived(arrived));
+    let mut progress = reporter(events, true, hello.id, from.clone(), newest);
+    let received = bulk::receive(stream, hello, key, inbox, &mut progress);
+    let _ = events.send(Event::Moving { incoming: true, id: hello.id, transfer: None });
+    match received {
+        Ok(arrived) if newest.load(Ordering::Relaxed) == hello.id => {
+            let took = started.elapsed();
+            let _ = events.send(Event::Note(format!("a clipboard came in from {from}, in {} ms", took.as_millis())));
+            let _ = events.send(Event::Arrived { arrived, from, slow: took >= Duration::from_secs(1) });
         }
+        Ok(_) => {}
         Err(err) => {
             let _ = events.send(Event::Note(format!("a clipboard didn't come in whole: {err}")));
         }

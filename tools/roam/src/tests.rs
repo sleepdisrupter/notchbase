@@ -1,3 +1,5 @@
+use engine::Landed;
+use notchbase_sdk::protocol::Request;
 use notchbase_sdk::testing::Harness;
 
 use super::*;
@@ -41,7 +43,7 @@ fn desk(harness: &Harness<Tool>) -> Vec<Spot> {
 #[test]
 fn nearby_computers_can_be_added_to_the_desk() {
     let mut harness = Harness::<Tool>::start();
-    harness.send(Msg::Status(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::None)])));
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::None)]))));
     assert!(harness.shows("Desk PC"));
     assert!(!harness.shows("No other computers yet. Open notchbase on another Mac or PC on this network."));
     harness.click("Add");
@@ -55,7 +57,7 @@ fn nearby_computers_can_be_added_to_the_desk() {
 #[test]
 fn dragging_a_screen_snaps_it_next_to_another() {
     let mut harness = Harness::<Tool>::start();
-    harness.send(Msg::Status(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)])));
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]))));
     harness.click("Add");
     let view = View::fit(&harness.model().desk);
     // Grab the PC by its middle and drop it a little below and away from the Mac's right edge.
@@ -75,12 +77,12 @@ fn a_request_to_be_controlled_pops_up_with_allow() {
     let mut harness = Harness::<Tool>::start();
     let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Pairing)]);
     update.asks = vec![Ask { id: "pc".into(), name: "Desk PC".into(), code: "123 456".into(), controlling: false }];
-    harness.send(Msg::Status(update.clone()));
+    harness.send(Msg::Status(Box::new(update.clone())));
     assert!(harness.noticed().iter().any(|n| n.contains("123 456")), "{:?}", harness.noticed());
     assert!(harness.shows("123 456"));
     assert!(harness.shows("Allow"));
     // The same request doesn't pop up twice.
-    harness.send(Msg::Status(update));
+    harness.send(Msg::Status(Box::new(update)));
     assert!(harness.noticed().is_empty());
 }
 
@@ -89,7 +91,7 @@ fn the_controller_checks_the_code() {
     let mut harness = Harness::<Tool>::start();
     let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Pairing)]);
     update.asks = vec![Ask { id: "pc".into(), name: "Desk PC".into(), code: "042 007".into(), controlling: true }];
-    harness.send(Msg::Status(update));
+    harness.send(Msg::Status(Box::new(update)));
     assert!(harness.shows("Check that Desk PC shows this code"));
     assert!(harness.shows("It matches"));
     assert!(harness.noticed().is_empty(), "no pop-up on the computer you're using");
@@ -100,7 +102,7 @@ fn the_cursor_away_shows_in_the_notch_and_comes_back() {
     let mut harness = Harness::<Tool>::start();
     let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]);
     update.away_on = Some("Desk PC".into());
-    harness.send(Msg::Status(update));
+    harness.send(Msg::Status(Box::new(update)));
     assert!(harness.live().is_some());
     assert!(harness.shows("On Desk PC"));
     harness.click("Bring back");
@@ -109,7 +111,7 @@ fn the_cursor_away_shows_in_the_notch_and_comes_back() {
 #[test]
 fn connected_computers_show_their_latency() {
     let mut harness = Harness::<Tool>::start();
-    harness.send(Msg::Status(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)])));
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]))));
     harness.click("Add");
     harness.send(Msg::Select(Some("pc".into())));
     assert!(harness.shows("Connected · 2 ms"));
@@ -130,7 +132,7 @@ fn an_address_can_be_typed_in() {
     let mut harness = Harness::<Tool>::start();
     let mut update = status(vec![]);
     update.addresses = vec!["192.168.50.61".into()];
-    harness.send(Msg::Status(update));
+    harness.send(Msg::Status(Box::new(update)));
     assert!(harness.shows("This computer is 192.168.50.61"));
     harness.type_text("Other computer's IP address", "192.168.50.70");
     harness.click("Connect");
@@ -143,7 +145,7 @@ fn an_address_can_be_typed_in() {
 #[test]
 fn each_computer_has_its_own_scroll_speed() {
     let mut harness = Harness::<Tool>::start();
-    harness.send(Msg::Status(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)])));
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]))));
     harness.click("Add");
     harness.send(Msg::Select(Some("pc".into())));
     assert!(harness.shows("Scroll speed"));
@@ -162,4 +164,38 @@ fn a_desk_saved_before_scroll_speeds_reads_as_one() {
     assert_eq!(spot.scroll, 1.0);
     assert_eq!(times(0.25), "0.25×");
     assert_eq!(times(4.0), "4×");
+}
+
+#[test]
+fn a_big_copy_shows_how_far_along_it_is_and_says_when_it_is_ready() {
+    let mut harness = Harness::<Tool>::start();
+    let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]);
+    update.transfer = Some(Transfer {
+        incoming: true,
+        with: "Desk PC".into(),
+        what: "holiday.mov".into(),
+        done: 1_250_000_000,
+        total: 5_000_000_000,
+    });
+    harness.send(Msg::Status(Box::new(update.clone())));
+    assert!(harness.shows("Getting holiday.mov from Desk PC"));
+    assert!(harness.shows("1.25 GB of 5.00 GB"));
+    assert_eq!(harness.model().summary(), "Getting holiday.mov · 25%");
+    assert!(harness.live().is_some());
+    let told = |harness: &Harness<Tool>| {
+        harness
+            .requests()
+            .iter()
+            .filter(|r| matches!(r, Request::Notify { text } if text.contains("ready to paste")))
+            .count()
+    };
+    update.transfer = None;
+    update.landed = Some(Landed { serial: 1, text: "holiday.mov from Desk PC is ready to paste".into() });
+    harness.send(Msg::Status(Box::new(update.clone())));
+    assert_eq!(told(&harness), 1);
+    assert!(!harness.shows("Getting holiday.mov from Desk PC"));
+    harness.send(Msg::Status(Box::new(update)));
+    assert_eq!(told(&harness), 0, "told once");
+    assert_eq!(size_words(840_000), "840 KB");
+    assert_eq!(size_words(12_400_000), "12.4 MB");
 }

@@ -214,6 +214,7 @@ const CAPS_LOCK: u16 = 0x39;
 /// One wheel notch (120) scrolls this many pixels.
 const PIXELS_PER_NOTCH: f32 = 40.0;
 const DOUBLE_CLICK: f64 = 0.5;
+const ESCAPE: u16 = 53;
 
 static WATCHDOG: Watchdog = Watchdog::new();
 
@@ -315,6 +316,8 @@ pub struct Mac {
     /// Fast Wi-Fi: the helper was offered this run, and the flag is being kept fresh.
     wifi_offered: bool,
     wifi_on: bool,
+    /// The drag pasteboard's count when the left button went down: a drag since then moved it.
+    drag_mark: Option<isize>,
 }
 
 struct Activity(Retained<ProtocolObject<dyn NSObjectProtocol>>);
@@ -347,6 +350,7 @@ impl Mac {
             departed: None,
             wifi_offered: false,
             wifi_on: false,
+            drag_mark: None,
         }
     }
 
@@ -940,6 +944,50 @@ impl Platform for Mac {
 
     fn alive(&mut self) {
         WATCHDOG.pet();
+    }
+
+    fn left_button(&mut self, down: bool) {
+        self.drag_mark = down.then(super::mac_drag::drag_count);
+    }
+
+    fn dragged_files(&mut self, _at: [f64; 2]) -> Option<Vec<std::path::PathBuf>> {
+        super::mac_drag::dragged_files(self.drag_mark?)
+    }
+
+    fn cancel_drag(&mut self) {
+        // Escape ends a drag where it started, as it would by hand.
+        for down in [true, false] {
+            // SAFETY: a new event, posted and released by `post`.
+            let event = unsafe { CGEventCreateKeyboardEvent(self.source(), ESCAPE, down) };
+            self.post(event);
+        }
+        self.drag_mark = None;
+    }
+
+    fn drag_in(&mut self, paths: Vec<std::path::PathBuf>, played: bool) -> bool {
+        // Its own drag counts too, so the files can be dragged on, or back.
+        self.drag_mark = Some(super::mac_drag::drag_count());
+        if played {
+            // The left button goes down here, and the controller's letting go plays its release.
+            self.buttons |= 1;
+            self.last_click = None;
+        }
+        let source = self.source;
+        super::mac_drag::drag_in(paths, move || {
+            let Some(at) = cursor_now() else { return };
+            // SAFETY: a new event, marked as Roam's, posted and released.
+            unsafe {
+                let event = CGEventCreateMouseEvent(source as Ref, LEFT_DOWN, at, 0);
+                if event.is_null() {
+                    return;
+                }
+                CGEventSetIntegerValueField(event, CLICK_STATE, 1);
+                CGEventSetIntegerValueField(event, USER_DATA, MARK);
+                CGEventPost(HID_TAP, event);
+                CFRelease(event);
+            }
+        });
+        true
     }
 
     fn depart(&mut self) {

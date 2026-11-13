@@ -10,8 +10,12 @@ use crate::layout::Rect;
 
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(target_os = "macos")]
+mod mac_drag;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_drag;
 
 /// Something the person did on this computer's own mouse or keyboard.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -103,6 +107,22 @@ pub trait Platform: Send {
     fn reveal(&mut self) {}
     /// Called often: a hidden cursor comes back when this computer's own mouse moves.
     fn tick(&mut self) {}
+    /// The left button went down or up here, pressed by the person or played: a drag may start.
+    fn left_button(&mut self, _down: bool) {}
+    /// The files being dragged here now, while the left button is held and the cursor is held
+    /// against the edge of the screen at `at`. Windows only learns them by putting a window
+    /// under the cursor for the drag to pass over, so the first asks may answer `None`.
+    fn dragged_files(&mut self, _at: [f64; 2]) -> Option<Vec<PathBuf>> {
+        None
+    }
+    /// Ends the drag here without dropping anything: the files went across instead.
+    fn cancel_drag(&mut self) {}
+    /// Picks `paths` up under the cursor, as if they were dragged from there: the left button
+    /// goes down here, and letting it go drops them. `played` when the button is played by
+    /// another computer, rather than held on this one's own mouse.
+    fn drag_in(&mut self, _paths: Vec<PathBuf>, _played: bool) -> bool {
+        false
+    }
 }
 
 /// Lets a captured mouse and keyboard go by themselves when Roam stops checking in.
@@ -316,6 +336,11 @@ pub mod fake {
         pub captured: bool,
         pub warped: Vec<[f64; 2]>,
         pub played: Vec<Play>,
+        /// What a drag under way here carries.
+        pub dragging: Option<Vec<PathBuf>>,
+        pub cancelled: u32,
+        /// Files picked up here, and whether the button was played.
+        pub picked: Vec<(Vec<PathBuf>, bool)>,
     }
 
     #[derive(Clone, Default)]
@@ -363,6 +388,18 @@ pub mod fake {
         }
         fn play(&mut self, play: Play) {
             self.state().played.push(play);
+        }
+        fn dragged_files(&mut self, _at: [f64; 2]) -> Option<Vec<PathBuf>> {
+            self.state().dragging.clone()
+        }
+        fn cancel_drag(&mut self) {
+            let mut state = self.state();
+            state.cancelled += 1;
+            state.dragging = None;
+        }
+        fn drag_in(&mut self, paths: Vec<PathBuf>, played: bool) -> bool {
+            self.state().picked.push((paths, played));
+            true
         }
     }
 }
