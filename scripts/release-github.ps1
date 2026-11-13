@@ -16,6 +16,14 @@ function Fail([string]$message) {
     exit 1
 }
 
+# Runs a program for its exit code and output alone. Windows PowerShell turns anything a program writes to stderr
+# into an error, which would stop the script, so stderr is dropped with errors allowed.
+function Quietly([scriptblock]$run) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $run 2>$null } finally { $ErrorActionPreference = $saved }
+}
+
 $platform = switch ($Target) {
     "x86_64-pc-windows-msvc" { "windows-x86_64" }
     "aarch64-pc-windows-msvc" { "windows-aarch64" }
@@ -24,7 +32,7 @@ $platform = switch ($Target) {
 
 $repo = "$env:NOTCHBASE_RELEASES_REPO"
 if (-not $repo) {
-    $origin = git remote get-url origin 2>$null
+    $origin = Quietly { git remote get-url origin }
     if ($origin -match '^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(\.git)?$') {
         $repo = $Matches[2]
     }
@@ -41,7 +49,7 @@ if (-not $DryRun) {
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
         Fail "Install the GitHub CLI (https://cli.github.com) and run gh auth login first."
     }
-    gh auth status 2>$null | Out-Null
+    Quietly { gh auth status } | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "Log in to GitHub first: gh auth login" }
 }
 
@@ -74,11 +82,11 @@ $size = (Get-Item $file).Length
 $existing = $false
 $manifest = [ordered]@{ version = $version; notes = $Notes; builds = [ordered]@{} }
 if (-not $DryRun) {
-    gh release view $tag --repo $repo 2>$null | Out-Null
+    Quietly { gh release view $tag --repo $repo } | Out-Null
     if ($LASTEXITCODE -eq 0) {
         $existing = $true
         $previous = Join-Path $stage "previous"
-        gh release download $tag --repo $repo --pattern latest.json --dir $previous 2>$null
+        Quietly { gh release download $tag --repo $repo --pattern latest.json --dir $previous } | Out-Null
         $old = Join-Path $previous "latest.json"
         if (Test-Path $old) {
             $parsed = Get-Content $old -Raw | ConvertFrom-Json
