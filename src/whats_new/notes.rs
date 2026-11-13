@@ -34,10 +34,21 @@ const BAR: &str = "It completes the top hit as you type";
 #[cfg(target_os = "macos")]
 const EVERY_APP: &str = "Every app Spotlight knows is in Find too";
 
+const GITHUB: &str = "New versions now arrive from GitHub releases";
+const OPEN: &str = "Read or fork it at github.com/sleepdisrupter/notchbase";
+
 const PIN: &str = "Right-click anything in Find to pin it";
 const PINNED: &str = "Drag one to put them in your order";
 
 pub(super) static NOTES: &[Release] = &[
+    Release {
+        version: "0.24.0",
+        picture: None,
+        changes: &[
+            Change { glyph: Glyph::Download, title: "Updates come from GitHub", caption: GITHUB },
+            Change { glyph: Glyph::Link, title: "notchbase is open source", caption: OPEN },
+        ],
+    },
     Release {
         version: "0.19.0",
         picture: None,
