@@ -112,6 +112,8 @@ pub struct Pick {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum How {
     Open,
+    /// Opened as administrator, behind the UAC prompt. Only Windows asks for it, and only for apps.
+    AsAdmin,
     Reveal,
     Drag,
     Shelve,

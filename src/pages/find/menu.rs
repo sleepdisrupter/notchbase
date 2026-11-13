@@ -7,6 +7,9 @@ use crate::ui::menu::Item;
 const PIN: &str = "Pin";
 const UNPIN: &str = "Unpin";
 const FULL: &str = "Four are pinned";
+const AS_ADMIN: &str = "Run as administrator";
+// Windows runs an app as administrator from its menu, and the Mac has no such thing.
+const OFFERS_ADMIN: bool = cfg!(windows);
 #[cfg(target_os = "macos")]
 const REVEAL: &str = "Show in Finder";
 #[cfg(not(target_os = "macos"))]
@@ -16,6 +19,7 @@ const REVEAL: &str = "Show in Explorer";
 pub(super) enum Chose {
     Pin,
     Unpin,
+    AsAdmin,
     Reveal,
 }
 
@@ -25,8 +29,12 @@ pub(super) fn items(row: &FindRow, pinned: bool, full: bool) -> Vec<Item<Chose>>
         (false, true) => Item { words: FULL, glyph: Glyph::Pin, choice: None },
         (false, false) => Item { words: PIN, glyph: Glyph::Pin, choice: Some(Chose::Pin) },
     };
+    let admin = Item { words: AS_ADMIN, glyph: Glyph::Shield, choice: Some(Chose::AsAdmin) };
     let reveal = Item { words: REVEAL, glyph: Glyph::Folder, choice: Some(Chose::Reveal) };
-    std::iter::once(pin).chain((!row.pane()).then_some(reveal)).collect()
+    std::iter::once(pin)
+        .chain((OFFERS_ADMIN && row.app && !row.pane()).then_some(admin))
+        .chain((!row.pane()).then_some(reveal))
+        .collect()
 }
 
 #[cfg(test)]
@@ -69,5 +77,17 @@ mod tests {
         assert_eq!(offered(&pane, false, false), [Some(Chose::Pin)], "a settings pane has no file to show");
         let marks = |pinned| items(&file, pinned, false).into_iter().map(|item| item.glyph).collect::<Vec<_>>();
         assert_eq!((marks(false), marks(true)), (vec![Glyph::Pin, Glyph::Folder], vec![Glyph::Unpin, Glyph::Folder]));
+    }
+
+    #[test]
+    fn windows_apps_offer_run_as_admin() {
+        let offered = |row: &FindRow| items(row, false, false).into_iter().map(|item| item.choice).collect::<Vec<_>>();
+        let app = row("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Notepad++.lnk", true);
+        let expected: &[Option<Chose>] = match cfg!(windows) {
+            true => &[Some(Chose::Pin), Some(Chose::AsAdmin), Some(Chose::Reveal)],
+            false => &[Some(Chose::Pin), Some(Chose::Reveal)],
+        };
+        assert_eq!(offered(&app), expected);
+        assert_eq!(offered(&row("/a.txt", false)), [Some(Chose::Pin), Some(Chose::Reveal)], "a file is only opened");
     }
 }

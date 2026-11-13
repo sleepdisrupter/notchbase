@@ -20,7 +20,7 @@ impl Model {
     pub(super) fn picked(&mut self, pick: &Pick, kind: Kind, context: &Context) {
         let (now, key) = (context.now, key_of(&pick.path));
         let weight = match pick.how {
-            How::Open => PICK_OPEN,
+            How::Open | How::AsAdmin => PICK_OPEN,
             How::Drag => PICK_DRAG,
             How::Shelve => PICK_SHELVE,
             How::Reveal => PICK_REVEAL,

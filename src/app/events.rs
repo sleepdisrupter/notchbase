@@ -15,6 +15,9 @@ pub(super) enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     Wake,
     ScreenshotNotCopied(String),
+    // Only Windows runs an app as administrator, on a thread that waits for the UAC prompt.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    NotRunAsAdmin(String),
     FolderPicked(ToolSlot, String, PathBuf),
     // Only a Mac can be kept awake with the lid closed.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

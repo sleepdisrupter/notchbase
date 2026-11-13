@@ -83,6 +83,7 @@ impl App {
                 self.wake(event_loop);
             }
             UserEvent::ScreenshotNotCopied(err) => self.screenshot_not_copied(&err),
+            UserEvent::NotRunAsAdmin(err) => self.not_run_as_admin(&err),
             UserEvent::FolderPicked(slot, key, path) => {
                 self.set_tool_setting(slot, key, Value::String(path.to_string_lossy().into_owned()));
             }

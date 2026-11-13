@@ -1,4 +1,5 @@
 //! One result row: the icon, the name with its matched letters lit, where it lives, and buttons when it is selected.
+//! On Windows an app row has one more button, to run it as administrator.
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align2, Color32, Id, Pos2, Rect, Sense, Shape, Vec2, pos2};
@@ -31,6 +32,7 @@ const AT_REST: f32 = 0.86;
 const QUIET: f32 = 0.68;
 const HINT_GAP: f32 = 8.0;
 const ROW_ID: &str = "notchbase.find.row";
+const OFFERS_ADMIN: bool = cfg!(windows);
 
 pub(super) struct Face<'a> {
     pub(super) row: &'a FindRow,
@@ -48,6 +50,7 @@ pub(super) struct Face<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Hit {
     Open,
+    AsAdmin,
     Reveal,
     Shelve,
     Drag,
@@ -63,8 +66,13 @@ pub(super) fn id_of(key: u64) -> Id {
     Id::new((ROW_ID, key))
 }
 
-pub(super) fn text_room(rect: Rect) -> f32 {
-    rect.width() - 2.0 * INSET - WELL - 2.0 * TEXT_GAP - TRAILING_W
+pub(super) fn text_room(rect: Rect, row: &FindRow) -> f32 {
+    let trailing = if runs_as_admin(row) { TRAILING_W + BUTTON + BUTTON_GAP } else { TRAILING_W };
+    rect.width() - 2.0 * INSET - WELL - 2.0 * TEXT_GAP - trailing
+}
+
+fn runs_as_admin(row: &FindRow) -> bool {
+    OFFERS_ADMIN && row.app && !row.pane()
 }
 
 pub(super) fn paint(ctx: &mut PageCtx<'_>, rect: Rect, face: &Face<'_>, icons: &mut Icons) -> Out {
@@ -79,7 +87,7 @@ pub(super) fn paint(ctx: &mut PageCtx<'_>, rect: Rect, face: &Face<'_>, icons: &
     let right = rect.right() - INSET;
     let pressed = trailing(ctx, pos2(right, rect.center().y), id, face, trail);
     let left = rect.left() + INSET + WELL + TEXT_GAP;
-    let room = text_room(rect);
+    let room = text_room(rect, face.row);
     let named = title(ctx, pos2(left, rect.center().y - LINE * focus), face, room);
     if focus < 1.0 && !face.hint.is_empty() {
         let at = pos2(left + named + HINT_GAP, rect.center().y - LINE * focus);
@@ -142,12 +150,14 @@ fn trailing(ctx: &mut PageCtx<'_>, at: Pos2, id: Id, face: &Face<'_>, trail: f32
     let live = face.live && trail >= BUTTONS_LIVE;
     let shelf = Rect::from_center_size(pos2(at.x - BUTTON * 0.5, at.y), Vec2::splat(BUTTON));
     let reveal = shelf.translate(egui::vec2(-(BUTTON + BUTTON_GAP), 0.0));
+    let admin = reveal.translate(egui::vec2(-(BUTTON + BUTTON_GAP), 0.0));
     let mark = ctx.canvas.mark();
+    let ran = runs_as_admin(face.row) && button(ctx, admin, id.with("admin"), Glyph::Shield, live);
     let revealed = button(ctx, reveal, id.with("reveal"), Glyph::Folder, live);
     let tray = if face.shelved { Glyph::Checkmark } else { Glyph::Tray };
     let shelved = button(ctx, shelf, id.with("shelve"), tray, live && !face.shelved);
     ctx.canvas.since(mark).iter_mut().for_each(|shape| fade(shape, trail));
-    revealed.then_some(Hit::Reveal).or(shelved.then_some(Hit::Shelve))
+    ran.then_some(Hit::AsAdmin).or(revealed.then_some(Hit::Reveal)).or(shelved.then_some(Hit::Shelve))
 }
 
 fn button(ctx: &mut PageCtx<'_>, rect: Rect, id: Id, glyph: Glyph, live: bool) -> bool {
@@ -268,8 +278,12 @@ mod tests {
 
     #[test]
     fn text_gets_leftover_width() {
-        assert_eq!(text_room(RECT), 340.0 - 2.0 * INSET - WELL - 2.0 * TEXT_GAP - TRAILING_W);
-        assert_eq!(text_room(RECT), 204.0);
+        let file = found("notes.txt", Vec::new());
+        assert_eq!(text_room(RECT, &file), 340.0 - 2.0 * INSET - WELL - 2.0 * TEXT_GAP - TRAILING_W);
+        assert_eq!(text_room(RECT, &file), 204.0);
+        let app = FindRow { app: true, ..found("Notepad++.lnk", Vec::new()) };
+        let room = if cfg!(windows) { 204.0 - BUTTON - BUTTON_GAP } else { 204.0 };
+        assert_eq!(text_room(RECT, &app), room, "the administrator button takes its own room");
     }
 
     #[test]
@@ -338,6 +352,26 @@ mod tests {
         assert_eq!(texts(&shapes), ["notes.txt", PATH], "its own line says where, so the hint is not needed");
         assert!(harness.drawn(id_of(row.key).with("reveal")));
         assert!(harness.drawn(id_of(row.key).with("shelve")));
+        assert!(!harness.drawn(id_of(row.key).with("admin")), "a file is not run as administrator");
+    }
+
+    #[test]
+    fn windows_app_row_runs_as_admin() {
+        let row = FindRow { app: true, ..found("Notepad++.lnk", Vec::new()) };
+        let face = Face { selected: true, ..face(&row) };
+        let mut harness = Harness::new();
+        painted(&mut harness, &face, RECT);
+        let admin = id_of(row.key).with("admin");
+        assert_eq!(harness.drawn(admin), cfg!(windows));
+        if cfg!(windows) {
+            for _ in 0..30 {
+                painted(&mut harness, &face, RECT);
+            }
+            let at = harness.rect_of(admin).center();
+            harness.frame(press(at), |ctx| paint(ctx, RECT, &face, &mut Icons::default()));
+            let out = harness.frame(release(at), |ctx| paint(ctx, RECT, &face, &mut Icons::default()));
+            assert_eq!(out.hit, Some(Hit::AsAdmin));
+        }
     }
 
     #[test]

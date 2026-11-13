@@ -1,4 +1,4 @@
-//! Opening, revealing, dragging or shelving what was picked in Find.
+//! Opening, revealing, dragging or shelving what was picked in Find, and on Windows running an app as administrator.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -10,6 +10,7 @@ use crate::{filedrag, platform};
 
 const NOT_THERE: &str = "is no longer there";
 const NOT_OPENED: &str = "Couldn't open it";
+const NOT_RUN_AS_ADMIN: &str = "Couldn't run it as administrator";
 const LIFT: Duration = Duration::from_millis(240);
 const PANE_ENDING: &str = "appex";
 
@@ -34,7 +35,7 @@ fn way(path: &Path, how: How) -> Option<How> {
     let pane = path.extension().is_some_and(|ending| ending.eq_ignore_ascii_case(PANE_ENDING));
     match (pane, how) {
         (false, how) => Some(how),
-        (true, How::Open | How::Reveal) => Some(How::Open),
+        (true, How::Open | How::AsAdmin | How::Reveal) => Some(How::Open),
         (true, How::Drag | How::Shelve) => None,
     }
 }
@@ -51,7 +52,11 @@ impl App {
         }
         let Some(how) = way(&pick.path, pick.how) else { return };
         let done = match how {
-            How::Open => self.open_found(&pick.path),
+            How::Open => self.open_found(&pick.path, open_with_the_system),
+            How::AsAdmin => {
+                let run = self.as_admin();
+                self.open_found(&pick.path, run)
+            }
             How::Reveal => self.reveal_found(&pick.path),
             How::Drag => {
                 self.drag_paths(std::slice::from_ref(&pick.path));
@@ -67,8 +72,26 @@ impl App {
         }
     }
 
-    fn open_found(&mut self, path: &Path) -> bool {
-        match open_existing(path, open_with_the_system) {
+    #[cfg(windows)]
+    fn as_admin(&self) -> impl FnOnce(&Path) -> Result<(), String> + use<> {
+        let proxy = self.proxy.clone();
+        move |path: &Path| {
+            let failed = move |err| drop(proxy.send_event(crate::app::events::UserEvent::NotRunAsAdmin(err)));
+            platform::run_as_admin(&path.to_string_lossy(), failed)
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn as_admin(&self) -> impl FnOnce(&Path) -> Result<(), String> + use<> {
+        open_with_the_system
+    }
+
+    pub(in crate::app) fn not_run_as_admin(&mut self, err: &str) {
+        self.report(NOT_RUN_AS_ADMIN, err);
+    }
+
+    fn open_found(&mut self, path: &Path, open: impl FnOnce(&Path) -> Result<(), String>) -> bool {
+        match open_existing(path, open) {
             Opened::Done => {
                 let shown = self.panel.find.rows.iter().chain(self.panel.find.pins.iter());
                 let lifted = shown.into_iter().any(|row| row.app && *row.path == *path);
@@ -145,7 +168,8 @@ mod tests {
         let pane = Path::new("/System/Library/ExtensionKit/Extensions/Bluetooth.appex");
         assert_eq!((way(pane, How::Open), way(pane, How::Reveal)), (Some(How::Open), Some(How::Open)));
         assert_eq!((way(pane, How::Drag), way(pane, How::Shelve)), (None, None), "there is no file to hand over");
-        for how in [How::Open, How::Reveal, How::Drag, How::Shelve] {
+        assert_eq!(way(pane, How::AsAdmin), Some(How::Open), "a settings pane opens as it always does");
+        for how in [How::Open, How::AsAdmin, How::Reveal, How::Drag, How::Shelve] {
             assert_eq!(way(Path::new("/Applications/Maps.app"), how), Some(how));
         }
     }

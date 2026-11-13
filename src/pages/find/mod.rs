@@ -319,13 +319,14 @@ impl FindPage {
         match chose {
             menu::Chose::Pin => actions.push(Action::FindPin(Pinned::of(row))),
             menu::Chose::Unpin => actions.push(Action::FindUnpin(row.path.to_path_buf())),
-            menu::Chose::Reveal => {
+            menu::Chose::Reveal | menu::Chose::AsAdmin => {
                 haptic(Feel::Snap);
+                let how = if chose == menu::Chose::Reveal { How::Reveal } else { How::AsAdmin };
                 let pick = Pick {
                     path: row.path.to_path_buf(),
                     typed: self.draft.clone(),
                     rank: u8::MAX,
-                    how: How::Reveal,
+                    how,
                     predicted: false,
                 };
                 actions.push(Action::FindPick(pick));
@@ -481,15 +482,17 @@ impl FindPage {
 
     fn pick(&mut self, how: How, index: usize, now: Instant) -> Option<Action> {
         let row = self.shown.rows.get(index)?;
+        // Only an app runs as administrator: for a file it is the same as opening it.
+        let how = if how == How::AsAdmin && !row.app { How::Open } else { how };
         match how {
-            How::Open | How::Reveal => haptic(Feel::Snap),
+            How::Open | How::AsAdmin | How::Reveal => haptic(Feel::Snap),
             How::Drag => haptic(Feel::Tick),
             How::Shelve => {
                 haptic(Feel::Tick);
                 self.shelved.insert(row.key, now + SHELVED_FOR);
             }
         }
-        if how == How::Open && row.app {
+        if matches!(how, How::Open | How::AsAdmin) && row.app {
             self.launch = Some(Launch::of(row.key, now));
         }
         let rank = u8::try_from(index).unwrap_or(u8::MAX);

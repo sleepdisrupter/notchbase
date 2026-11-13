@@ -47,7 +47,7 @@ pub use self::imp::{
     configure_overlay_window, dim_window_attributes, keep_on_top, overlay_window_attributes, raise_window,
 };
 #[cfg(windows)]
-pub use self::imp::{local_time, shell_process, windowed_processes};
+pub use self::imp::{local_time, run_as_admin, shell_process, windowed_processes};
 #[cfg(all(test, any(windows, target_os = "macos")))]
 pub use self::instance::claim_instance_in;
 pub use self::instance::{InstanceLock, claim_instance};

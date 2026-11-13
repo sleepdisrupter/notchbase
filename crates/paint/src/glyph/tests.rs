@@ -2,7 +2,7 @@ use egui::{LayerId, Painter, Rect, Shape, pos2};
 
 use super::*;
 
-const ALL: [Glyph; 75] = [
+const ALL: [Glyph; 76] = [
     Glyph::Speaker,
     Glyph::SpeakerMuted,
     Glyph::Sun,
@@ -78,11 +78,12 @@ const ALL: [Glyph; 75] = [
     Glyph::Text,
     Glyph::Pin,
     Glyph::Unpin,
+    Glyph::Shield,
 ];
 
 // Shape count, point count and bounds of every glyph at size 20 around (50, 50).
 // When you change a glyph on purpose, update its row here.
-const DRAWN: [(Glyph, usize, usize, [f32; 4]); 75] = [
+const DRAWN: [(Glyph, usize, usize, [f32; 4]); 76] = [
     (Glyph::Speaker, 3, 47, [40.30, 40.86, 59.70, 59.14]),
     (Glyph::SpeakerMuted, 3, 17, [40.30, 40.86, 60.10, 59.14]),
     (Glyph::Sun, 9, 17, [39.90, 39.90, 60.10, 60.10]),
@@ -158,6 +159,7 @@ const DRAWN: [(Glyph, usize, usize, [f32; 4]); 75] = [
     (Glyph::Text, 3, 8, [43.10, 42.50, 56.90, 57.50]),
     (Glyph::Pin, 4, 36, [42.56, 40.30, 57.44, 60.50]),
     (Glyph::Unpin, 6, 47, [40.70, 40.30, 59.30, 60.50]),
+    (Glyph::Shield, 2, 29, [42.30, 40.70, 57.70, 59.70]),
 ];
 
 fn drawn(g: Glyph) -> Vec<Shape> {

@@ -98,6 +98,7 @@ pub enum Glyph {
     Text,
     Pin,
     Unpin,
+    Shield,
 }
 
 pub fn chevron_turning(canvas: &mut Canvas, center: Pos2, size: f32, color: Color32, up: f32) {
@@ -149,7 +150,8 @@ pub fn paint(canvas: &mut Canvas, g: Glyph, center: Pos2, size: f32, color: Colo
         | Glyph::Download
         | Glyph::Cup
         | Glyph::Moon
-        | Glyph::Search => system::paint(canvas, g, &pen),
+        | Glyph::Search
+        | Glyph::Shield => system::paint(canvas, g, &pen),
         Glyph::Photo
         | Glyph::Camera
         | Glyph::Globe

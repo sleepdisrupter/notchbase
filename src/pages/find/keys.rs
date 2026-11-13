@@ -1,6 +1,7 @@
-//! Keys on the Find page: arrows, Enter, ⌘Enter and Escape, and telling a real edit from a stray space.
+//! Keys on the Find page: arrows, Enter, ⌘Enter, Ctrl+Shift+Enter on Windows and Escape, and telling a real edit from
+//! a stray space.
 
-use egui::{Event, Key};
+use egui::{Event, Key, Modifiers};
 
 use super::FindPage;
 use crate::bridge::{Action, How};
@@ -8,34 +9,40 @@ use crate::pages::PageCtx;
 use crate::ui::field::Edit;
 
 const STALE_FRAMES: u8 = 2;
+// Ctrl+Shift+Enter runs an app as administrator, as it does in the Start menu. A Mac has no such thing.
+const ADMIN_KEYS: bool = cfg!(windows);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Nav {
     Up,
     Down,
     Open,
+    AsAdmin,
     Reveal,
     Clear,
     Close,
 }
 
 pub(super) fn navs(ui: &egui::Ui, edits: &[Edit], empty: bool, holding: bool) -> Vec<Nav> {
-    let held = ui.input(|input| input.modifiers.command);
+    let held = ui.input(|input| input.modifiers);
     let mut from_field = from_edits(edits, empty, holding).into_iter();
     let mut navs = Vec::new();
     for event in ui.input(|input| input.events.clone()) {
         if let Some(nav) = arrow(&event) {
             navs.push(nav);
         } else if ends_an_edit(&event) {
-            navs.extend(from_field.next().map(|nav| revealing(&event, held, nav)));
+            navs.extend(from_field.next().map(|nav| with_modifiers(&event, held, nav)));
         }
     }
     navs
 }
 
-fn revealing(event: &Event, held: bool, nav: Nav) -> Nav {
-    match event {
-        Event::Key { modifiers, .. } if nav == Nav::Open && (held || modifiers.command) => Nav::Reveal,
+fn with_modifiers(event: &Event, held: Modifiers, nav: Nav) -> Nav {
+    let Event::Key { modifiers, .. } = event else { return nav };
+    let down = held | *modifiers;
+    match nav {
+        Nav::Open if ADMIN_KEYS && down.command && down.shift => Nav::AsAdmin,
+        Nav::Open if down.command => Nav::Reveal,
         _ => nav,
     }
 }
@@ -114,7 +121,7 @@ impl FindPage {
         }
         for nav in navs(ctx.ui, edits, empty, holding) {
             let count = self.shown.rows.len();
-            if self.resting() && matches!(nav, Nav::Down | Nav::Open | Nav::Reveal) {
+            if self.resting() && matches!(nav, Nav::Down | Nav::Open | Nav::AsAdmin | Nav::Reveal) {
                 self.browsing = true;
                 continue;
             }
@@ -123,8 +130,12 @@ impl FindPage {
                     self.select.step(if nav == Nav::Up { -1 } else { 1 }, &self.shown.rows);
                     self.list.follow(self.select.index, count, self.list.height);
                 }
-                Nav::Open | Nav::Reveal => {
-                    let how = if nav == Nav::Open { How::Open } else { How::Reveal };
+                Nav::Open | Nav::AsAdmin | Nav::Reveal => {
+                    let how = match nav {
+                        Nav::AsAdmin => How::AsAdmin,
+                        Nav::Reveal => How::Reveal,
+                        _ => How::Open,
+                    };
                     match self.shown.answers(&self.draft) {
                         true => actions.extend(self.pick(how, self.select.index, ctx.now)),
                         false => self.hold.hold(how, ctx.now),
@@ -204,10 +215,23 @@ mod tests {
         assert_eq!(from_edits(&enter, false, false), [Nav::Open]);
         let press =
             |modifiers| Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers };
-        assert_eq!(revealing(&press(egui::Modifiers::NONE), false, Nav::Open), Nav::Open);
-        assert_eq!(revealing(&press(egui::Modifiers::COMMAND), false, Nav::Open), Nav::Reveal);
-        assert_eq!(revealing(&press(egui::Modifiers::NONE), true, Nav::Open), Nav::Reveal);
-        assert_eq!(revealing(&press(egui::Modifiers::COMMAND), true, Nav::Close), Nav::Close);
+        let (none, command) = (Modifiers::NONE, Modifiers::COMMAND);
+        assert_eq!(with_modifiers(&press(none), none, Nav::Open), Nav::Open);
+        assert_eq!(with_modifiers(&press(command), none, Nav::Open), Nav::Reveal);
+        assert_eq!(with_modifiers(&press(none), command, Nav::Open), Nav::Reveal);
+        assert_eq!(with_modifiers(&press(command), command, Nav::Close), Nav::Close);
+        assert_eq!(with_modifiers(&press(Modifiers::SHIFT), none, Nav::Open), Nav::Open, "Shift alone just opens");
+    }
+
+    #[test]
+    fn ctrl_shift_enter_runs_as_admin_on_windows() {
+        let press =
+            |modifiers| Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers };
+        let (none, both) = (Modifiers::NONE, Modifiers::COMMAND | Modifiers::SHIFT);
+        let expected = if cfg!(windows) { Nav::AsAdmin } else { Nav::Reveal };
+        assert_eq!(with_modifiers(&press(both), none, Nav::Open), expected);
+        assert_eq!(with_modifiers(&press(Modifiers::SHIFT), Modifiers::COMMAND, Nav::Open), expected);
+        assert_eq!(with_modifiers(&press(both), none, Nav::Close), Nav::Close);
     }
 
     #[test]

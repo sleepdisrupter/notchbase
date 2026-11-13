@@ -160,7 +160,7 @@ impl FindPage {
                 row,
                 detail: &detail,
                 hint: if shared { words::beside(row, &self.shown.rows) } else { "" },
-                cut: self.list.cut(ctx, row, row::text_room(rect)),
+                cut: self.list.cut(ctx, row, row::text_room(rect, row)),
                 two_tone: !suggesting,
                 place_first: !suggesting || row.why.is_none(),
                 selected: index == self.select.index,
@@ -178,6 +178,7 @@ impl FindPage {
         for (hit, index) in hits {
             let how = match hit {
                 Hit::Open => How::Open,
+                Hit::AsAdmin => How::AsAdmin,
                 Hit::Reveal => How::Reveal,
                 Hit::Shelve => How::Shelve,
                 Hit::Drag => How::Drag,

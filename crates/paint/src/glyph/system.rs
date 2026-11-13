@@ -1,4 +1,4 @@
-//! System glyphs: battery, bolt, lock, download, cup, moon and search.
+//! System glyphs: battery, bolt, lock, download, cup, moon, search and the administrator's shield.
 
 use std::f32::consts::{FRAC_1_SQRT_2, PI, TAU};
 
@@ -22,6 +22,11 @@ const MOON_STEPS: usize = 24;
 const LENS_AT: f32 = -0.07;
 const LENS: f32 = 0.27;
 const HANDLE_TO: f32 = 0.4;
+const SHIELD_TOP: f32 = -0.42;
+const SHIELD_SHOULDER: (f32, f32) = (0.34, -0.3);
+const SHIELD_WAIST: f32 = 0.04;
+const SHIELD_TIP: f32 = 0.44;
+const SHIELD_CURVE: usize = 8;
 
 pub(super) fn paint(canvas: &mut Canvas, g: Glyph, pen: &Pen) {
     let Pen { center, color, size: s, stroke, .. } = *pen;
@@ -62,6 +67,7 @@ pub(super) fn paint(canvas: &mut Canvas, g: Glyph, pen: &Pen) {
             let rim = LENS_AT + LENS * FRAC_1_SQRT_2;
             canvas.add(Shape::line_segment([p(rim, rim), p(HANDLE_TO, HANDLE_TO)], stroke));
         }
+        Glyph::Shield => shield(canvas, pen),
         _ => {}
     }
 }
@@ -78,6 +84,24 @@ fn lock(canvas: &mut Canvas, pen: &Pen, shackle: f32, left_leg: f32) {
     }));
     bow.push(p(SHACKLE_REACH, LOCK_TOP));
     canvas.add(Shape::line(bow, stroke));
+}
+
+/// The shield Windows puts on whatever runs as administrator: flat shoulders, straight sides, curving to a point.
+fn shield(canvas: &mut Canvas, pen: &Pen) {
+    let (width, shoulder) = SHIELD_SHOULDER;
+    let side: Vec<(f32, f32)> = std::iter::once((width, shoulder))
+        .chain((0..=SHIELD_CURVE).map(|step| {
+            let t = step as f32 / SHIELD_CURVE as f32;
+            let x = width * (1.0 - t * t);
+            (x, SHIELD_WAIST + (SHIELD_TIP - SHIELD_WAIST) * t)
+        }))
+        .collect();
+    let mut outline = vec![pen.p(0.0, SHIELD_TOP)];
+    outline.extend(side.iter().map(|&(x, y)| pen.p(x, y)));
+    outline.extend(side.iter().rev().skip(1).map(|&(x, y)| pen.p(-x, y)));
+    canvas.add(Shape::closed_line(outline, pen.stroke));
+    let half = [pen.p(0.0, SHIELD_TOP), pen.p(-width, shoulder), pen.p(-width, SHIELD_WAIST), pen.p(0.0, SHIELD_WAIST)];
+    pen.fill(canvas, &half, pen.p(-width * 0.5, (SHIELD_TOP + SHIELD_WAIST) * 0.5));
 }
 
 fn moon(canvas: &mut Canvas, pen: &Pen) {
