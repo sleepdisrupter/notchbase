@@ -511,12 +511,22 @@ mod tests {
     }
 
     #[test]
+    fn names_windows_cannot_have_are_made_safe_and_kept_inside() {
+        let inbox = Path::new("inbox");
+        assert_eq!(place(inbox, "photos/a:b?.txt"), Some(inbox.join("photos").join("a_b_.txt")));
+        assert_eq!(place(inbox, "../escape"), None);
+        assert_eq!(place(inbox, "a//b"), None);
+    }
+
+    #[test]
     fn files_and_folders_arrive_with_everything_in_them() {
         let source = folder("source");
         fs::write(source.join("notes.txt"), b"one").unwrap();
         fs::create_dir_all(source.join("photos/2026")).unwrap();
         let big: Vec<u8> = (0..200_000u32).map(|i| (i % 13) as u8).collect();
         fs::write(source.join("photos/2026/big.raw"), &big).unwrap();
+        // A Mac file name Windows can't have (there a colon names a hidden stream instead).
+        #[cfg(not(windows))]
         fs::write(source.join("photos/a:b.txt"), b"odd name").unwrap();
         fs::create_dir_all(source.join("photos/empty")).unwrap();
         let inbox = folder("inbox");
@@ -526,6 +536,7 @@ mod tests {
         assert_eq!(fs::read(&top[0]).unwrap(), b"one");
         assert!(top[0].ends_with("notes.txt"));
         assert_eq!(fs::read(top[1].join("2026/big.raw")).unwrap(), big);
+        #[cfg(not(windows))]
         assert_eq!(fs::read(top[1].join("a_b.txt")).unwrap(), b"odd name");
         assert!(top[1].join("empty").is_dir());
         let _ = fs::remove_dir_all(source);
