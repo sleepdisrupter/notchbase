@@ -185,6 +185,19 @@ pub fn step(desk: &[Computer], on: usize, from: [f64; 2], delta: [f64; 2], corne
 /// cursor is clamped by the system, where `at` never leaves the screen.
 pub fn push(desk: &[Computer], on: usize, at: [f64; 2], delta: [f64; 2], corner: f64) -> Option<Step> {
     let computer = desk.get(on)?;
+    let (at, edges) = pushed(computer, at, delta);
+    edges.into_iter().find_map(|edge| beyond(desk, on, at, edge, corner))
+}
+
+/// Whether a cursor resting at `at` and moving by `delta` is pushing out against the outer
+/// edge of this computer's screens, whatever is beyond.
+pub fn pushing(computer: &Computer, at: [f64; 2], delta: [f64; 2]) -> bool {
+    delta != [0.0, 0.0] && !pushed(computer, at, delta).1.is_empty()
+}
+
+/// The outer edges a cursor at `at` moving by `delta` pushes against, most pushed first, and
+/// where it rests.
+fn pushed(computer: &Computer, at: [f64; 2], delta: [f64; 2]) -> ([f64; 2], Vec<Edge>) {
     let display = computer.displays.iter().find(|d| d.contains(at)).copied().unwrap_or_else(|| {
         let onto = computer.onto_displays(at);
         computer.displays.iter().find(|d| d.contains(onto)).copied().unwrap_or(bounds(&computer.displays))
@@ -205,13 +218,16 @@ pub fn push(desk: &[Computer], on: usize, at: [f64; 2], delta: [f64; 2], corner:
     }
     // Moving along an edge (no push into it) only counts when nothing else is pushed.
     edges.sort_by(|a, b| b.1.total_cmp(&a.1));
-    edges.into_iter().find_map(|(edge, _)| {
-        let [sx, sy] = edge.step();
-        if computer.on_display([at[0] + sx, at[1] + sy]) {
-            return None; // another of its own displays is there
-        }
-        beyond(desk, on, at, edge, corner)
-    })
+    let edges = edges
+        .into_iter()
+        .map(|(edge, _)| edge)
+        .filter(|edge| {
+            let [sx, sy] = edge.step();
+            // Another of its own displays is there.
+            !computer.on_display([at[0] + sx, at[1] + sy])
+        })
+        .collect();
+    (at, edges)
 }
 
 /// Which edge of the display holding `from` the move to `to` went through.

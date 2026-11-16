@@ -59,6 +59,10 @@ const CORNER: f64 = 12.0;
 const SHORT_TEXT: usize = 16 * 1024;
 /// How often a drag held against the edge is checked for files.
 const DRAG_CHECK_EVERY: u64 = 60 * MS;
+/// How often a held button is checked against the mouse itself.
+const BUTTONS_CHECK_EVERY: u64 = 500 * MS;
+/// How often the log may say why the edge didn't cross.
+const EDGE_TOLD_EVERY: u64 = 5 * SECOND;
 /// Marks the number of a transfer of dragged files, which a newer clipboard doesn't stop.
 const DRAG_ID: u32 = 1 << 31;
 /// How many received copies of files are kept, newest first.
@@ -511,6 +515,10 @@ struct Core {
     drag_out: Option<Vec<std::path::PathBuf>>,
     /// Where the cursor was last played.
     played_at: [f64; 2],
+    /// When the held buttons were last checked against the mouse itself.
+    buttons_checked_at: u64,
+    /// When the log last said why a push against the edge didn't cross.
+    edge_told_at: Option<u64>,
     fast: bool,
     steady: bool,
     steady_at: u64,
@@ -591,6 +599,8 @@ impl Core {
             drag_held: false,
             drag_out: None,
             played_at: [0.0, 0.0],
+            buttons_checked_at: 0,
+            edge_told_at: None,
             fast: false,
             steady: false,
             steady_at: 0,
@@ -827,6 +837,7 @@ impl Core {
             let screens = self.platform.screens();
             if screens != self.screens {
                 self.screens = screens;
+                self.note(&format!("this computer's screens: {}", screens_words(&self.screens.0, self.screens.1)));
                 let (displays, ppu) = self.screens.clone();
                 for session in self.sessions.values_mut() {
                     if session.side == Side::Controlled
@@ -886,6 +897,7 @@ impl Core {
         }
         self.platform.tick();
         self.listen_if_needed();
+        self.check_buttons(now);
         if now >= self.status_at {
             self.status_at = now + STATUS_EVERY;
             let status = self.status(now);
@@ -1397,9 +1409,14 @@ impl Core {
                 self.end_session(id, true);
             }
             Message::Screens { ppu, displays } if side == Side::Controller => {
+                let words = screens_words(&displays, f64::from(ppu));
                 if let Some(peer) = self.peers.get_mut(&id) {
+                    let changed = peer.displays != displays;
                     peer.ppu = f64::from(ppu).clamp(0.25, 8.0);
                     peer.displays = displays;
+                    if changed {
+                        self.note(&format!("{}'s screens: {words}", self.who(id)));
+                    }
                 }
             }
             _ if !live => {}
@@ -1569,8 +1586,12 @@ impl Core {
                 let _ = events.send(Event::Input(input, now));
             });
             match self.platform.listen(sink) {
-                Ok(()) => self.listening = true,
+                Ok(()) => {
+                    self.listening = true;
+                    self.note("listening to this computer's mouse and keyboard");
+                }
                 Err(err) => {
+                    self.note(&format!("can't listen to the mouse and keyboard: {err}"));
                     self.problem = Some(err);
                     // Try again in a while, in case the permission was given.
                     self.listen_at = now + 2 * SECOND;
@@ -1581,6 +1602,8 @@ impl Core {
             self.go_home(None);
             self.platform.stop_listening();
             self.listening = false;
+            self.held_buttons = 0;
+            self.note("stopped listening to the mouse and keyboard");
         }
         self.problem = None;
     }
@@ -1609,6 +1632,47 @@ impl Core {
             ids.push(Some(id));
         }
         (desk, ids)
+    }
+
+    /// Says in the log, now and then, why pushing against the edge of the screen at home went
+    /// nowhere.
+    fn edge_unused(&mut self, at: [f64; 2], delta: [f64; 2], why: &str, now: u64) {
+        if self.edge_told_at.is_some_and(|at| now < at + EDGE_TOLD_EVERY) {
+            return;
+        }
+        let (displays, ppu) = self.screens.clone();
+        if !layout::pushing(&Computer::new("me", displays, ppu, [0.0, 0.0]), at, delta) {
+            return;
+        }
+        self.edge_told_at = Some(now);
+        self.note(&format!("pushed against the edge at ({:.0}, {:.0}), but {why}", at[0], at[1]));
+    }
+
+    /// Lets go of buttons the mouse itself no longer holds: their release went somewhere Roam
+    /// couldn't hear it, such as an app running as administrator.
+    fn check_buttons(&mut self, now: u64) {
+        // Files dragged home are held by a press made while the cursor was away, which the
+        // system never saw.
+        if self.held_buttons == 0
+            || self.drag_home
+            || !self.listening
+            || self.cursor != Cursor::Home
+            || now < self.buttons_checked_at + BUTTONS_CHECK_EVERY
+        {
+            return;
+        }
+        self.buttons_checked_at = now;
+        let Some(real) = self.platform.buttons_held() else { return };
+        let stale = self.held_buttons & !real;
+        if stale != 0 {
+            self.note(&format!("buttons {stale:05b} were let go without Roam hearing it: no longer held"));
+            self.held_buttons &= real;
+            if stale & 1 != 0 {
+                self.peer_dragging = None;
+                self.drag_home = false;
+                self.platform.left_button(false);
+            }
+        }
     }
 
     fn corner_for(&self, os: Os) -> f64 {
@@ -1648,14 +1712,26 @@ impl Core {
                 // Only the left button may be held across, and only while dragging files.
                 let dragging = self.held_buttons == 1;
                 if (self.held_buttons != 0 && !dragging) || self.locked {
-                    return;
+                    let why = if self.locked {
+                        "the cursor is locked here".to_owned()
+                    } else {
+                        format!("a mouse button is held (buttons {:05b})", self.held_buttons)
+                    };
+                    return self.edge_unused(at, delta, &why, now);
                 }
                 let (desk, ids) = self.desk();
                 if desk.len() < 2 {
-                    return;
+                    let placed = self.placed().len();
+                    let why = format!("no connected computer on the desk ({placed} other computer(s) placed)");
+                    return self.edge_unused(at, delta, &why, now);
                 }
                 let corner = self.corner_for(Os::here());
-                if let Some(Step::Cross { to, at: arrive }) = layout::push(&desk, 0, at, delta, corner)
+                let step = layout::push(&desk, 0, at, delta, corner);
+                if step.is_none() && !dragging {
+                    let why = "no other computer's screen is across from it on the desk";
+                    self.edge_unused(at, delta, why, now);
+                }
+                if let Some(Step::Cross { to, at: arrive }) = step
                     && let Some(&Some(peer)) = ids.get(to)
                 {
                     if !dragging {
@@ -2101,6 +2177,20 @@ impl Core {
                 self.beacon(None);
             }
             Control::Desk(placements) => {
+                if placements != self.placements {
+                    let spots: Vec<String> = placements
+                        .iter()
+                        .map(|p| {
+                            let who = match unhex::<8>(&p.id) {
+                                Some(id) if id == self.identity.id => "this computer".to_owned(),
+                                Some(id) => self.who(id),
+                                None => p.id.clone(),
+                            };
+                            format!("{who} at ({:.0}, {:.0})", p.at[0], p.at[1])
+                        })
+                        .collect();
+                    self.note(&format!("the desk: {}", spots.join(", ")));
+                }
                 self.placements = placements;
                 let placed = self.placed();
                 let gone: Vec<Id> = self
@@ -2327,6 +2417,13 @@ fn swipe_keys(swipe: Swipe, os: Os) -> Vec<(u16, bool)> {
         (_, Swipe::Right) => &[LEFT_CTRL, RIGHT],
     };
     held.iter().map(|&hid| (hid, true)).chain(held.iter().rev().map(|&hid| (hid, false))).collect()
+}
+
+/// Screens for the log: each one's place and size, and the units per point.
+fn screens_words(displays: &[Rect], ppu: f64) -> String {
+    let each: Vec<String> =
+        displays.iter().map(|d| format!("{:.0}x{:.0} at ({:.0}, {:.0})", d.w, d.h, d.x, d.y)).collect();
+    format!("{} at {ppu}x", if each.is_empty() { "none".to_owned() } else { each.join(", ") })
 }
 
 /// Copies quicker than this aren't shown going over.

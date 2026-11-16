@@ -63,6 +63,7 @@ unsafe extern "C" {
     fn CGEventCreateScrollWheelEvent2(source: Ref, units: u32, count: u32, one: i32, two: i32, three: i32) -> Ref;
     fn CGEventPost(tap: u32, event: Ref);
     fn CGEventSourceCreate(state: i32) -> Ref;
+    fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
     fn CGEventSourceSetLocalEventsSuppressionInterval(source: Ref, seconds: f64);
     fn CGWarpMouseCursorPosition(at: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
@@ -215,6 +216,8 @@ const CAPS_LOCK: u16 = 0x39;
 const PIXELS_PER_NOTCH: f32 = 40.0;
 const DOUBLE_CLICK: f64 = 0.5;
 const ESCAPE: u16 = 53;
+/// The state of the hardware itself, for CGEventSource queries.
+const HID_STATE: i32 = 1;
 
 static WATCHDOG: Watchdog = Watchdog::new();
 
@@ -944,6 +947,17 @@ impl Platform for Mac {
 
     fn alive(&mut self) {
         WATCHDOG.pet();
+    }
+
+    fn buttons_held(&mut self) -> Option<u8> {
+        let mut held = 0u8;
+        for button in 0..5u32 {
+            // SAFETY: plain query of the hardware's button state.
+            if unsafe { CGEventSourceButtonState(HID_STATE, button) } {
+                held |= 1 << button;
+            }
+        }
+        Some(held)
     }
 
     fn left_button(&mut self, down: bool) {

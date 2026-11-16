@@ -107,6 +107,12 @@ pub trait Platform: Send {
     fn reveal(&mut self) {}
     /// Called often: a hidden cursor comes back when this computer's own mouse moves.
     fn tick(&mut self) {}
+    /// The mouse buttons this computer's own mouse holds down now, one bit each (left is 1), if
+    /// the system can tell. A release Roam never heard (an app running as administrator takes
+    /// it on Windows) would otherwise leave a button held for good.
+    fn buttons_held(&mut self) -> Option<u8> {
+        None
+    }
     /// The left button went down or up here, pressed by the person or played: a drag may start.
     fn left_button(&mut self, _down: bool) {}
     /// The files being dragged here now, while the left button is held and the cursor is held
@@ -341,6 +347,8 @@ pub mod fake {
         pub cancelled: u32,
         /// Files picked up here, and whether the button was played.
         pub picked: Vec<(Vec<PathBuf>, bool)>,
+        /// The buttons the mouse itself holds, when known.
+        pub held: Option<u8>,
     }
 
     #[derive(Clone, Default)]
@@ -388,6 +396,9 @@ pub mod fake {
         }
         fn play(&mut self, play: Play) {
             self.state().played.push(play);
+        }
+        fn buttons_held(&mut self) -> Option<u8> {
+            self.state().held
         }
         fn dragged_files(&mut self, _at: [f64; 2]) -> Option<Vec<PathBuf>> {
             self.state().dragging.clone()

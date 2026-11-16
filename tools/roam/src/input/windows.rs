@@ -515,6 +515,21 @@ impl Platform for Windows {
         captured_now()
     }
 
+    fn buttons_held(&mut self) -> Option<u8> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+        };
+        let keys = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2];
+        let mut held = 0u8;
+        for (bit, key) in keys.into_iter().enumerate() {
+            // SAFETY: plain query of the physical button.
+            if unsafe { GetAsyncKeyState(i32::from(key)) } as u16 & 0x8000 != 0 {
+                held |= 1 << bit;
+            }
+        }
+        Some(held)
+    }
+
     fn left_button(&mut self, down: bool) {
         super::windows_drag::left_button(down);
     }

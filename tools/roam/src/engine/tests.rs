@@ -288,3 +288,26 @@ fn files_dragged_across_the_edge_are_picked_up_on_the_other_side_and_can_come_ba
     assert!(!played, "held on this computer's own mouse");
     assert_eq!(std::fs::read(&paths[0]).unwrap(), b"some notes");
 }
+
+#[test]
+fn a_button_let_go_where_roam_could_not_hear_it_stops_holding_the_cursor_home() {
+    let (mut a, mut b) = pair();
+    connect(&mut a, &mut b);
+    // The right button went down, and its release went to an app Roam can't hear.
+    a.fake.input(Input::Button { button: 1, down: true });
+    a.fake.state().held = Some(0b10);
+    std::thread::sleep(Duration::from_millis(700));
+    a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [3.0, 0.0] });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!a.fake.state().captured, "still held: stays home");
+    a.fake.state().held = Some(0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !a.fake.state().captured {
+        assert!(Instant::now() < deadline, "the cursor never crossed");
+        a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [3.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = std::fs::read_to_string(a.data.join("roam.log")).unwrap();
+    assert!(log.contains("but a mouse button is held (buttons 00010)"), "{log}");
+    assert!(log.contains("were let go without Roam hearing it"), "{log}");
+}
