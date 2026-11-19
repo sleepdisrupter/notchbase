@@ -507,14 +507,18 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
         s.me.as_ref().is_some_and(|m| m.displays == vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)])
     });
 
-    // Pushing right from the virtual display reaches nothing: the Mac's built-in screen is to the
-    // left of it on the desk, under the PC's own screen's edge... so check the desk itself.
+    // The Mac's built-in screen stays where it is on the desk, between the PC's own screen and
+    // the virtual display: pushing right from the PC's screen still reaches it, even though the
+    // PC's screens now reach past it.
     a.wait_for("listening", |s| s.sink.is_some());
-    // From the PC's own screen, the right edge now leads onto the virtual display (the system's
-    // business), and further right there is no Mac screen left: the cursor stays home.
     assert!(a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [5.0, 0.0] }));
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(!a.fake.state().captured, "the Mac's built-in screen isn't across the PC's edge any more");
+    a.wait_for("the cursor over on the Mac's built-in screen", |s| s.captured);
+    b.wait_for("the cursor arriving on the Mac's built-in screen", |s| {
+        s.played.iter().any(|p| matches!(p, Play::Move([x, _]) if *x < 1512.0))
+    });
+    // And straight back the way it came.
+    a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [-10.0, 0.0] });
+    a.wait_for("coming home", |s| !s.captured);
 
     // The Mac's own mouse over the lent screen works the PC's cursor there.
     displays::remote(&viewer.seen, Remote::Move([0.5, 0.5]));

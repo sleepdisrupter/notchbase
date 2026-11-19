@@ -46,7 +46,7 @@ impl Rect {
         (point[0] - cx).hypot(point[1] - cy)
     }
 
-    fn overlaps(&self, other: &Rect) -> bool {
+    pub fn overlaps(&self, other: &Rect) -> bool {
         self.x < other.right() && other.x < self.right() && self.y < other.bottom() && other.y < self.bottom()
     }
 }
@@ -254,7 +254,13 @@ fn beyond(desk: &[Computer], on: usize, at: [f64; 2], edge: Edge, corner: f64) -
         return None;
     }
     let point = computer.to_desk(at);
-    let from = computer.rect();
+    // Measured from the screen the cursor is on, not the whole computer: a computer showing
+    // another's screen as an extended display reaches round that computer's other screens.
+    let from = computer
+        .desk_displays()
+        .into_iter()
+        .min_by(|a, b| a.distance(point).total_cmp(&b.distance(point)))
+        .unwrap_or_else(|| computer.rect());
     let along = if edge.horizontal() { point[1] } else { point[0] };
     let span = |d: &Rect| if edge.horizontal() { (d.y, d.bottom()) } else { (d.x, d.right()) };
     let covers = |d: &Rect| {
@@ -266,22 +272,23 @@ fn beyond(desk: &[Computer], on: usize, at: [f64; 2], edge: Edge, corner: f64) -
     // has a way straight back to the same spot.
     let mut best: Option<(usize, f64)> = None;
     for (index, other) in desk.iter().enumerate() {
-        if index == on || !other.desk_displays().iter().any(covers) {
+        if index == on {
             continue;
         }
-        let rect = other.rect();
-        let gap = match edge {
-            Edge::Right => rect.x - from.right(),
-            Edge::Left => from.x - rect.right(),
-            Edge::Bottom => rect.y - from.bottom(),
-            Edge::Top => from.y - rect.bottom(),
-        };
-        // Allow a small overlap, from hand-placed rectangles.
-        if gap < -1.0 {
-            continue;
-        }
-        if best.is_none_or(|(_, nearest)| gap < nearest) {
-            best = Some((index, gap));
+        for rect in other.desk_displays().iter().filter(|d| covers(d)) {
+            let gap = match edge {
+                Edge::Right => rect.x - from.right(),
+                Edge::Left => from.x - rect.right(),
+                Edge::Bottom => rect.y - from.bottom(),
+                Edge::Top => from.y - rect.bottom(),
+            };
+            // Allow a small overlap, from hand-placed rectangles.
+            if gap < -1.0 {
+                continue;
+            }
+            if best.is_none_or(|(_, nearest)| gap < nearest) {
+                best = Some((index, gap));
+            }
         }
     }
     let (to, _) = best?;
@@ -392,6 +399,24 @@ mod tests {
         assert_eq!(to, 1);
         assert_eq!(at[0], 3.0, "2 points in from the edge is 3 pixels at 150%");
         assert!((at[1] - 720.0).abs() < 0.01, "480 points down is 720 pixels at 150%: {at:?}");
+    }
+
+    #[test]
+    fn a_screen_below_one_display_is_reached_even_when_another_reaches_further_down() {
+        // A PC showing a Mac's external screen as its left display, its own screen lower and to
+        // the right; the MacBook's screen sits under the left display. The PC as a whole reaches
+        // below the MacBook's top, but the display the cursor is on doesn't.
+        let pc = Computer::new(
+            "pc",
+            vec![Rect::new(0.0, 0.0, 1920.0, 1080.0), Rect::new(1920.0, 300.0, 1920.0, 1080.0)],
+            1.0,
+            [0.0, 0.0],
+        );
+        let macbook = Computer::new("macbook", vec![Rect::new(0.0, 0.0, 1512.0, 982.0)], 1.0, [100.0, 1080.0]);
+        let desk = [pc, macbook];
+        let Some(Step::Cross { to, at }) = push(&desk, 0, [500.0, 1079.0], [0.0, 5.0], 0.0) else { panic!() };
+        assert_eq!(to, 1);
+        assert_eq!(at, [400.0, 2.0]);
     }
 
     #[test]

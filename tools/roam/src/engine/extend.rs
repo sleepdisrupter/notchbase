@@ -152,8 +152,14 @@ impl Core {
         let [vx, vy] = me.to_desk([rect.x, rect.y]);
         let virtual_on_desk = Rect::new(vx, vy, rect.w / me.ppu, rect.h / me.ppu);
         let [dx, dy] = follow(lent_on_desk, rest, virtual_on_desk);
+        let moved = Rect::new(rest.x + dx, rest.y + dy, rest.w, rest.h);
+        // The system puts the virtual display against this computer's others, which can land
+        // the rest where this computer's screens are: then they go beside it instead.
+        let beside = rest.right() <= lent_on_desk.x + 0.5 || rest.x >= lent_on_desk.right() - 0.5;
+        let clear = clear_of(moved, virtual_on_desk, &me.desk_displays(), beside);
         let shift = shift(&left, &displays, ppu);
-        Some(Computer::new(name, left, ppu, [at[0] + shift[0] + dx, at[1] + shift[1] + dy]))
+        let [cx, cy] = [clear[0] - moved.x, clear[1] - moved.y];
+        Some(Computer::new(name, left, ppu, [at[0] + shift[0] + dx + cx, at[1] + shift[1] + dy + cy]))
     }
 
     /// Where the virtual display for `display` of `peer` goes: its top left where that screen
@@ -503,6 +509,35 @@ fn follow(lent: Rect, rest: Rect, virtual_on_desk: Rect) -> [f64; 2] {
     [dx, dy]
 }
 
+/// Where `rest` (a lending computer's other screens, on the desk) goes so it covers none of
+/// the host's screens (`mine`, the virtual display among them): where it is if it covers none,
+/// else the nearest spot against a side of the virtual display, so the cursor can cross to it:
+/// its left or right if it was `beside` the lent screen, above or below if not.
+fn clear_of(rest: Rect, virtual_on_desk: Rect, mine: &[Rect], beside: bool) -> [f64; 2] {
+    let free = |x: f64, y: f64| {
+        let spot = Rect::new(x + 0.5, y + 0.5, rest.w - 1.0, rest.h - 1.0);
+        !mine.iter().any(|d| d.overlaps(&spot))
+    };
+    if free(rest.x, rest.y) {
+        return [rest.x, rest.y];
+    }
+    let v = virtual_on_desk;
+    // Facing the virtual display as fully as it can along the side it goes on.
+    let along = |at: f64, size: f64, start: f64, length: f64| {
+        if size <= length { at.clamp(start, start + length - size) } else { start }
+    };
+    let y = along(rest.y, rest.h, v.y, v.h);
+    let x = along(rest.x, rest.w, v.x, v.w);
+    let sides = [[v.right(), y], [v.x - rest.w, y]];
+    let ends = [[x, v.bottom()], [x, v.y - rest.h]];
+    let (first, then) = if beside { (sides, ends) } else { (ends, sides) };
+    let far = |[sx, sy]: [f64; 2]| (sx - rest.x).hypot(sy - rest.y);
+    let nearest = |spots: [[f64; 2]; 2]| {
+        spots.into_iter().filter(|[sx, sy]| free(*sx, *sy)).min_by(|a, b| far(*a).total_cmp(&far(*b)))
+    };
+    nearest(first).or_else(|| nearest(then)).unwrap_or([rest.x, rest.y])
+}
+
 /// How far, in points, the top left of `part`'s bounds is from the top left of `all`'s.
 fn shift(part: &[Rect], all: &[Rect], ppu: f64) -> [f64; 2] {
     let (part, all) = (layout::bounds(part), layout::bounds(all));
@@ -675,4 +710,25 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
     drop(showing);
     let _ = events.send(Event::Extend(ExtendEvent::LendEnded { serial: grant.serial, why }));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screens_left_on_the_lending_computer_never_sit_on_the_hosts() {
+        // PC | MacBook | external, and the external lent: Windows puts the virtual display
+        // against the PC's screen, where the MacBook was. The MacBook goes past it instead.
+        let pc = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let virtual_on_desk = Rect::new(1920.0, 0.0, 1920.0, 1080.0);
+        let macbook = Rect::new(1512.0, 100.0, 1512.0, 982.0);
+        assert_eq!(clear_of(macbook, virtual_on_desk, &[pc, virtual_on_desk], true), [3840.0, 98.0]);
+        // Already clear: it stays.
+        let below = Rect::new(2000.0, 1080.0, 1512.0, 982.0);
+        assert_eq!(clear_of(below, virtual_on_desk, &[pc, virtual_on_desk], false), [2000.0, 1080.0]);
+        // Under both: it goes under the virtual display, still facing it.
+        let under = Rect::new(0.0, 900.0, 1512.0, 982.0);
+        assert_eq!(clear_of(under, virtual_on_desk, &[pc, virtual_on_desk], false), [1920.0, 1080.0]);
+    }
 }
