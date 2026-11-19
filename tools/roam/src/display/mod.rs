@@ -19,7 +19,6 @@ mod cursor;
 pub mod h264;
 #[cfg(any(windows, test))]
 mod nv12;
-pub mod settings;
 pub mod stream;
 
 #[cfg(target_os = "macos")]
@@ -255,9 +254,35 @@ pub fn picture_size(panel: Panel) -> [u32; 2] {
     [w, h].map(|side| ((f64::from(side) * fit) as u32) & !1)
 }
 
+/// Of the sizes a display offers, the one to show a `want`-sized screen at: the same shape as
+/// near as there is, then the nearest in size. Only even sizes up to 4K, which the encoders take.
+pub fn closest_size(offered: &[[u32; 2]], want: [u32; 2]) -> Option<[u32; 2]> {
+    let shape = |[w, h]: [u32; 2]| (f64::from(w) / f64::from(h.max(1))).ln();
+    let area = |[w, h]: [u32; 2]| (f64::from(w) * f64::from(h)).max(1.0).ln();
+    let fits = |&&[w, h]: &&[u32; 2]| w > 0 && h > 0 && w % 2 == 0 && h % 2 == 0 && w <= 3840 && h <= 2160;
+    offered.iter().filter(fits).copied().min_by_key(|&size| {
+        // Shapes within about 2% count as the same.
+        let off_shape = ((shape(size) - shape(want)).abs() * 50.0).round() as u64;
+        let off_size = ((area(size) - area(want)).abs() * 1000.0).round() as u64;
+        (off_shape, off_size)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_screen_takes_the_nearest_size_of_the_same_shape() {
+        let offered = [[1920, 1080], [2560, 1440], [3840, 2160], [1280, 800], [1920, 1200]];
+        assert_eq!(closest_size(&offered, [2560, 1440]), Some([2560, 1440]), "an exact size");
+        assert_eq!(closest_size(&offered, [2940, 1912]), Some([1920, 1200]), "a MacBook's shape, 16:10");
+        assert_eq!(closest_size(&offered, [3024, 1964]), Some([1920, 1200]));
+        assert_eq!(closest_size(&offered, [3440, 1440]), Some([2560, 1440]), "the widest shape there is, nearest size");
+        assert_eq!(closest_size(&offered, [2048, 1152]), Some([1920, 1080]));
+        assert_eq!(closest_size(&[[1365, 767], [5120, 2880]], [1366, 768]), None, "odd and too big are out");
+        assert_eq!(closest_size(&[], [1920, 1080]), None);
+    }
 
     #[test]
     fn pictures_stay_within_4k_and_even() {

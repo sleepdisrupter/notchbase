@@ -30,8 +30,6 @@ use crate::layout::Rect;
 
 /// Virtual displays run at this rate: what every screen shows, and what encoders keep up with.
 const HZ: u32 = 60;
-/// How long the driver may take to offer a new size after reading its settings again.
-const MODE_WAIT: Duration = Duration::from_secs(10);
 /// How long Windows may take to give a display just turned on to desktop duplication.
 const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// A still screen still sends a picture this often, so the other side knows it's alive.
@@ -60,8 +58,7 @@ impl Displays for Windows {
     }
 
     fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
-        let size = super::picture_size(want.panel);
-        let source = ready_source(size)?;
+        let (source, size) = ready_source(super::picture_size(want.panel))?;
         monitor::attach(&source, size, HZ, want.at)?;
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(Mutex::new(None));
@@ -104,40 +101,26 @@ impl Displays for Windows {
     }
 }
 
-/// A driver monitor that offers `size`: one that's off if there is one, so a monitor the
-/// person turned on for something else stays theirs.
-fn ready_source(size: [u32; 2]) -> Result<monitor::Source, String> {
-    let offers = |source: &monitor::Source| monitor::modes(source).iter().any(|m| [m[0], m[1]] == size);
-    let pick = || {
-        let sources = monitor::virtual_sources();
-        let off = sources.iter().find(|s| !s.attached && offers(s)).copied();
-        off.or_else(|| sources.iter().find(|s| offers(s)).copied())
-    };
-    if let Some(source) = pick() {
-        return Ok(source);
-    }
-    if monitor::virtual_sources().is_empty() {
-        return Err("The display driver isn't running. Restart the PC and try again".into());
-    }
-    // Already in the driver's list: nothing to wait for. Settings it can't change (kept
-    // somewhere else, or not writable) still leave the sizes Windows makes up for it to try.
-    let added = vdd::offer(size, HZ).unwrap_or(false);
-    let started = Instant::now();
-    while added && started.elapsed() < MODE_WAIT {
-        std::thread::sleep(Duration::from_millis(250));
-        if let Some(source) = pick() {
-            return Ok(source);
+/// A driver monitor, and the size to show a `want`-sized screen at: the nearest the driver
+/// offers, since asking it for new sizes can knock it over. One that's off goes first, so a
+/// monitor the person turned on for something else stays theirs.
+fn ready_source(want: [u32; 2]) -> Result<(monitor::Source, [u32; 2]), String> {
+    let sources = monitor::virtual_sources();
+    let off = sources.iter().filter(|s| !s.attached);
+    let on = sources.iter().filter(|s| s.attached);
+    let ordered: Vec<monitor::Source> = off.chain(on).copied().collect();
+    for source in &ordered {
+        let sizes: Vec<[u32; 2]> = monitor::modes(source).iter().map(|m| [m[0], m[1]]).collect();
+        if let Some(size) = super::closest_size(&sizes, want) {
+            return Ok((*source, size));
         }
     }
-    // Windows may not list the sizes of a monitor that's off: try one anyway, and let turning
-    // it on say whether the size works.
-    let sources = monitor::virtual_sources();
-    sources
-        .iter()
-        .find(|s| !s.attached)
-        .or_else(|| sources.first())
-        .copied()
-        .ok_or_else(|| format!("The display driver doesn't offer {}x{} pixels", size[0], size[1]))
+    // Windows may not list the sizes of a monitor that's off: try the size wanted, and let
+    // turning it on say whether it works.
+    ordered
+        .first()
+        .map(|source| (*source, want))
+        .ok_or_else(|| "The display driver hasn't made its screen. Try again, and Roam reinstalls it".to_owned())
 }
 
 /// Captures the display and encodes it into `feed` until stopped. Answers the picture size
