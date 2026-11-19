@@ -12,8 +12,9 @@ use windows::core::PCWSTR;
 
 use crate::layout::Rect;
 
-/// What the driver's adapter is called in the list of displays.
-const ADAPTER: &str = "Virtual Display Driver";
+/// What the driver's adapter may be called in the list of displays: its own name, and the
+/// names of the sample driver it grew from, which some versions still show.
+const ADAPTERS: [&str; 3] = ["Virtual Display Driver", "IddSampleDriver", "MttVDD"];
 
 /// One of Windows' display sources, `\\.\DISPLAY3` and the like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +43,8 @@ pub fn virtual_sources() -> Vec<Source> {
         if !unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) }.as_bool() {
             break;
         }
-        if text(&device.DeviceString).contains(ADAPTER) {
+        let name = text(&device.DeviceString);
+        if ADAPTERS.iter().any(|adapter| name.contains(adapter)) {
             found.push(Source {
                 name: device.DeviceName,
                 attached: device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != Default::default(),

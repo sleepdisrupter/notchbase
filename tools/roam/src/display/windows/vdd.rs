@@ -3,6 +3,7 @@
 //! offers the sizes listed in its settings file and takes commands on a named pipe that anyone
 //! may open. Installing it is the one step that asks for administrator rights, through winget.
 
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,14 @@ const PACKAGE: &str = "VirtualDrivers.Virtual-Display-Driver";
 const DEFAULT_FOLDER: &str = r"C:\VirtualDisplayDriver";
 /// How long the driver may take to show up after installing.
 const INSTALL_WAIT: Duration = Duration::from_secs(90);
+/// How long winget may take, permission prompt and download included.
+const WINGET_WAIT: Duration = Duration::from_secs(5 * 60);
+/// A console window of its own, even when started from an app without one.
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+/// winget's answers for a package that's already there: no applicable upgrade, already
+/// installed, and no newer version.
+const ALREADY: [u32; 3] = [0x8A15_002B, 0x8A15_0061, 0x8A15_0060];
+const NOT_RUNNING: &str = "The display driver is installed, but Windows isn't running it. Restart the PC and try again. If it still doesn't work, look for Virtual Display Driver under Display adapters in Device Manager";
 
 /// Whether the driver is there: its adapter is among Windows' displays.
 pub fn installed() -> bool {
@@ -28,37 +37,50 @@ pub fn installed() -> bool {
 }
 
 /// Installs the driver with winget, which asks the person for administrator rights, and waits
-/// for it to show up.
+/// for it to show up. winget runs in a window of its own, so its progress and Windows'
+/// permission prompt are in front of the person rather than hidden behind a background app.
 pub fn install() -> Result<(), String> {
-    let status =
-        hidden(std::process::Command::new("winget").args(["install", "--id", PACKAGE, "-e", "--silent"]).args([
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--disable-interactivity",
-        ]))
-        .status()
+    let mut winget = std::process::Command::new("winget")
+        .args(["install", "--id", PACKAGE, "-e", "--silent"])
+        .args(["--accept-package-agreements", "--accept-source-agreements"])
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
         .map_err(|err| format!("Couldn't run winget to install the display driver: {err}"))?;
     let started = Instant::now();
-    while started.elapsed() < INSTALL_WAIT {
+    let status = loop {
+        match winget.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < WINGET_WAIT => std::thread::sleep(Duration::from_millis(250)),
+            Ok(None) => {
+                let _ = winget.kill();
+                return Err(format!(
+                    "The display driver install didn't finish in {} minutes. Run \"winget install --id {PACKAGE} -e\" in a terminal to see why",
+                    WINGET_WAIT.as_secs() / 60
+                ));
+            }
+            Err(err) => return Err(format!("Lost track of the display driver install: {err}")),
+        }
+    };
+    let code = status.code().map(|c| c as u32);
+    // Nothing was installed, so there's nothing to wait for.
+    let wait = if code.is_some_and(|c| ALREADY.contains(&c)) { Duration::from_secs(2) } else { INSTALL_WAIT };
+    let started = Instant::now();
+    while started.elapsed() < wait {
         if installed() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    if status.success() {
-        Err("The display driver installed, but Windows hasn't started it yet. Restart the PC and try again".into())
-    } else {
-        Err(format!(
-            "The display driver didn't install (winget code {}). Install \"Virtual Display Driver\" from github.com/VirtualDrivers/Virtual-Display-Driver",
-            status.code().unwrap_or(-1)
-        ))
+    match code {
+        Some(0) => Err(NOT_RUNNING.into()),
+        // Already installed, with nothing newer: the files are there but the driver isn't.
+        Some(code) if ALREADY.contains(&code) => Err(NOT_RUNNING.into()),
+        // winget's codes are HRESULTs, which read best in hex.
+        code => Err(format!(
+            "The display driver didn't install (winget said {}). Run \"winget install --id {PACKAGE} -e\" in a terminal to see why",
+            code.map_or_else(|| "nothing".to_owned(), |c| format!("0x{c:08X}"))
+        )),
     }
-}
-
-fn hidden(command: &mut std::process::Command) -> &mut std::process::Command {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW)
 }
 
 /// Sends one command to the driver. It answers some on the same pipe, but nothing here needs

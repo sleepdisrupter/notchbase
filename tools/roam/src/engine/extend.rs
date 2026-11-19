@@ -264,7 +264,8 @@ impl Core {
             entry.state = State::Failed("Couldn't start the display".into());
             return;
         }
-        let words = if install { "Installing the display driver" } else { "Starting the display" };
+        let words =
+            if install { "Installing the display driver. Say Yes when Windows asks" } else { "Starting the display" };
         entry.state = State::Working(words.into());
         entry.feed = Some(feed);
         entry.place = Some(place);
