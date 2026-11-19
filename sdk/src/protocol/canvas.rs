@@ -17,6 +17,10 @@ pub struct CanvasNode {
     pub on_pointer: Option<HandlerId>,
     #[serde(default)]
     pub on_scroll: Option<HandlerId>,
+    /// A right click (or a two-finger click), sent as a `Press` where it happened. Only canvases
+    /// that ask for it get it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_menu: Option<HandlerId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

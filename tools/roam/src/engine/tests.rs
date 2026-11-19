@@ -311,3 +311,219 @@ fn a_button_let_go_where_roam_could_not_hear_it_stops_holding_the_cursor_home() 
     assert!(log.contains("but a mouse button is held (buttons 00010)"), "{log}");
     assert!(log.contains("were let go without Roam hearing it"), "{log}");
 }
+
+/// Virtual displays and lent screens that only pretend: a host's display is a rectangle added to
+/// its pretend screens, sending numbered pictures; a lent screen keeps what it's shown.
+mod displays {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::display::{Feed, Hosted, Panel, Picture, Remote, RemoteSink, Showing, Want};
+
+    #[derive(Default)]
+    pub struct Seen {
+        pub wants: Vec<Want>,
+        pub shown: Vec<(Rect, [u32; 2])>,
+        pub pictures: Vec<Picture>,
+        pub gone: bool,
+        pub remote: Option<RemoteSink>,
+    }
+
+    #[derive(Clone)]
+    pub struct Pretend {
+        pub fake: Fake,
+        pub seen: Arc<Mutex<Seen>>,
+    }
+
+    impl Pretend {
+        pub fn new(fake: Fake) -> Self {
+            Self { fake, seen: Arc::default() }
+        }
+    }
+
+    struct PretendHosted {
+        fake: Fake,
+        rect: Rect,
+        feed: Feed,
+    }
+
+    impl Hosted for PretendHosted {
+        fn rect(&mut self) -> Option<Rect> {
+            Some(self.rect)
+        }
+
+        fn place(&mut self, at: [i32; 2]) {
+            let mut state = self.fake.state();
+            state.screens.retain(|s| *s != self.rect);
+            self.rect.x = f64::from(at[0]);
+            self.rect.y = f64::from(at[1]);
+            state.screens.push(self.rect);
+        }
+
+        fn size(&self) -> [u32; 2] {
+            [self.rect.w as u32, self.rect.h as u32]
+        }
+    }
+
+    impl Drop for PretendHosted {
+        fn drop(&mut self) {
+            self.feed.stop();
+            self.fake.state().screens.retain(|s| *s != self.rect);
+        }
+    }
+
+    struct PretendShowing(Arc<Mutex<Seen>>);
+
+    impl Showing for PretendShowing {
+        fn picture(&mut self, picture: &Picture) -> Result<(), String> {
+            self.0.lock().unwrap().pictures.push(picture.clone());
+            Ok(())
+        }
+    }
+
+    impl Drop for PretendShowing {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().gone = true;
+        }
+    }
+
+    impl Displays for Pretend {
+        fn ability(&self) -> Ability {
+            Ability::Ready
+        }
+
+        fn lends(&self) -> bool {
+            true
+        }
+
+        fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
+            self.seen.lock().unwrap().wants.push(want.clone());
+            let rect = Rect::new(
+                f64::from(want.at[0]),
+                f64::from(want.at[1]),
+                f64::from(want.panel.pixels[0]),
+                f64::from(want.panel.pixels[1]),
+            );
+            self.fake.state().screens.push(rect);
+            let sending = feed.clone();
+            std::thread::spawn(move || {
+                let mut n = 0u8;
+                while !sending.stopped() {
+                    if !sending.busy() {
+                        let key = sending.key_wanted();
+                        sending.push(Picture { key, data: vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, n] });
+                        n = n.wrapping_add(1);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            Ok(Box::new(PretendHosted { fake: self.fake.clone(), rect, feed }))
+        }
+
+        fn panel(&self, rect: Rect) -> Option<Panel> {
+            Some(Panel { pixels: [rect.w as u32 * 2, rect.h as u32 * 2], hz: 60, scale: 2.0 })
+        }
+
+        fn show(&self, rect: Rect, size: [u32; 2], remote: RemoteSink) -> Result<Box<dyn Showing>, String> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.shown.push((rect, size));
+            seen.remote = Some(remote);
+            Ok(Box::new(PretendShowing(self.seen.clone())))
+        }
+    }
+
+    pub fn start(data: PathBuf, fake: Fake, port: u16, other: u16) -> (Machine, Pretend) {
+        let pretend = Pretend::new(fake.clone());
+        let (engine, status) = Engine::start_with(
+            data.clone(),
+            Box::new(fake.clone()),
+            Arc::new(pretend.clone()),
+            prefs(other),
+            Vec::new(),
+            port,
+        );
+        (Machine { engine, status, fake, last: Status::default(), port, data }, pretend)
+    }
+
+    pub fn wait(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn remote(seen: &Arc<Mutex<Seen>>, remote: Remote) {
+        if let Some(sink) = &seen.lock().unwrap().remote {
+            sink(remote);
+        }
+    }
+}
+
+#[test]
+fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
+    use crate::display::Remote;
+
+    let a_port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
+    let b_port = a_port + 1;
+    // The PC hosts; the Mac lends the second of its screens, an external one to its right.
+    let pc = Fake::new(vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], 1.0);
+    let mac = Fake::new(vec![Rect::new(0.0, 0.0, 1512.0, 982.0), Rect::new(1512.0, 0.0, 1280.0, 720.0)], 1.0);
+    let (mut a, host) = displays::start(folder(), pc, a_port, b_port);
+    let (mut b, viewer) = displays::start(folder(), mac, b_port, a_port);
+    let (a_id, b_id) = (a.id(), b.id());
+    a.until("seeing the Mac", |s| s.peers.iter().any(|p| p.id == b_id && p.displays.len() == 2 && p.lends));
+    // The Mac sits to the right of the PC, its external screen further right.
+    a.engine.send(Control::Desk(vec![
+        Placement { id: a_id.clone(), at: [0.0, 0.0], scroll: 1.0 },
+        Placement { id: b_id.clone(), at: [1920.0, 0.0], scroll: 1.0 },
+    ]));
+    a.until("the code to check", |s| !s.asks.is_empty());
+    b.until("the request to allow", |s| !s.asks.is_empty());
+    a.engine.send(Control::Allow(b_id.clone()));
+    b.engine.send(Control::Allow(a_id.clone()));
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+
+    a.engine.send(Control::Extend { id: b_id.clone(), display: 1 });
+    a.until("the extended display up", |s| s.extended.iter().any(|e| e.id == b_id && e.running));
+    b.until("lending the screen", |s| s.lending.as_ref().is_some_and(|l| l.display == 1));
+    {
+        let wants = &host.seen.lock().unwrap().wants;
+        assert_eq!(wants.len(), 1);
+        assert_eq!(wants[0].panel.pixels, [2560, 1440], "the lent screen's own pixels");
+        assert_eq!(wants[0].at, [1920 + 1512, 0], "where that screen sits on the desk");
+    }
+    displays::wait("pictures shown on the Mac", || viewer.seen.lock().unwrap().pictures.len() >= 3);
+    {
+        let seen = viewer.seen.lock().unwrap();
+        assert_eq!(seen.shown, vec![(Rect::new(1512.0, 0.0, 1280.0, 720.0), [2560, 1440])]);
+        assert!(seen.pictures[0].key, "it starts from a key picture");
+    }
+
+    // The PC's own screens, as other computers see them, leave the virtual one out.
+    a.until("the PC's screens without the virtual one", |s| {
+        s.me.as_ref().is_some_and(|m| m.displays == vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)])
+    });
+
+    // Pushing right from the virtual display reaches nothing: the Mac's built-in screen is to the
+    // left of it on the desk, under the PC's own screen's edge... so check the desk itself.
+    a.wait_for("listening", |s| s.sink.is_some());
+    // From the PC's own screen, the right edge now leads onto the virtual display (the system's
+    // business), and further right there is no Mac screen left: the cursor stays home.
+    assert!(a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [5.0, 0.0] }));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!a.fake.state().captured, "the Mac's built-in screen isn't across the PC's edge any more");
+
+    // The Mac's own mouse over the lent screen works the PC's cursor there.
+    displays::remote(&viewer.seen, Remote::Move([0.5, 0.5]));
+    a.wait_for("the cursor put on the virtual display", |s| s.warped.contains(&[3432.0 + 1280.0, 720.0]));
+
+    // Disconnecting gives the screen back.
+    a.engine.send(Control::Unextend(b_id.clone()));
+    a.until("the extended display gone", |s| s.extended.is_empty());
+    b.until("no longer lending", |s| s.lending.is_none());
+    displays::wait("the picture closed on the Mac", || viewer.seen.lock().unwrap().gone);
+    assert!(!a.fake.state().screens.iter().any(|s| s.x > 3000.0), "the virtual display is gone");
+}

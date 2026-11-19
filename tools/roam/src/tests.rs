@@ -22,6 +22,7 @@ fn view(id: &str, name: &str, os: Os, link: LinkState) -> PeerView {
         displays: vec![Rect::new(0.0, 0.0, 2560.0, 1440.0)],
         ppu: 1.5,
         open: true,
+        lends: true,
         nearby: true,
         paired: false,
         link,
@@ -198,4 +199,57 @@ fn a_big_copy_shows_how_far_along_it_is_and_says_when_it_is_ready() {
     assert_eq!(told(&harness), 0, "told once");
     assert_eq!(size_words(840_000), "840 KB");
     assert_eq!(size_words(12_400_000), "12.4 MB");
+}
+
+#[test]
+fn right_clicking_another_screen_offers_to_make_it_a_display() {
+    let mut harness = Harness::<Tool>::start();
+    let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]);
+    update.ability = Ability::Ready;
+    harness.send(Msg::Status(Box::new(update.clone())));
+    harness.click("Add");
+    let view = View::fit(&harness.model().desk);
+    let pc = harness.model().desk[1].computer().rect();
+    let [x, y] = view.to_canvas([pc.x + pc.w / 2.0, pc.y + pc.h / 2.0]);
+    harness.right_click(0, x, y);
+    assert_eq!(harness.model().menu, Some(("pc".to_owned(), 0)));
+    assert!(harness.shows("Desk PC's screen"));
+    harness.click("Turn into extended display");
+    assert_eq!(harness.model().menu, None, "the menu closes once chosen");
+
+    // While it's a display, the same screen offers to disconnect it.
+    update.extended = vec![ExtendedView {
+        id: "pc".into(),
+        name: "Desk PC".into(),
+        display: 0,
+        working: None,
+        running: true,
+        failed: None,
+    }];
+    harness.send(Msg::Status(Box::new(update)));
+    assert!(harness.shows("Desk PC's screen is a display of this computer"));
+    harness.right_click(0, x, y);
+    assert!(harness.shows("Disconnect display"));
+
+    // This computer's own screen has no menu.
+    let mac = harness.model().desk[0].computer().rect();
+    let [x, y] = view.to_canvas([mac.x + mac.w / 2.0, mac.y + mac.h / 2.0]);
+    harness.right_click(0, x, y);
+    assert_eq!(harness.model().menu, None);
+}
+
+#[test]
+fn a_computer_that_cant_lend_its_screen_says_why() {
+    let mut harness = Harness::<Tool>::start();
+    let mut pc = view("pc", "Desk PC", Os::Windows, LinkState::Connected);
+    pc.lends = false;
+    let mut update = status(vec![pc]);
+    update.ability = Ability::Ready;
+    harness.send(Msg::Status(Box::new(update)));
+    harness.click("Add");
+    let view = View::fit(&harness.model().desk);
+    let rect = harness.model().desk[1].computer().rect();
+    let [x, y] = view.to_canvas([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+    harness.right_click(0, x, y);
+    assert!(harness.shows("Update notchbase on Desk PC first"));
 }

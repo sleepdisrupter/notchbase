@@ -69,6 +69,8 @@ pub struct Beacon {
     pub open: bool,
     /// Already controlled by another computer.
     pub busy: bool,
+    /// Can lend its screens to another computer as extended displays.
+    pub lends: bool,
     pub ppu: f32,
     pub displays: Vec<Rect>,
     pub name: String,
@@ -151,7 +153,7 @@ impl Packet {
                 out.bytes(&beacon.key);
                 out.u16(beacon.port);
                 out.u8(beacon.os.code());
-                out.u8(u8::from(beacon.open) | (u8::from(beacon.busy) << 1));
+                out.u8(u8::from(beacon.open) | (u8::from(beacon.busy) << 1) | (u8::from(beacon.lends) << 2));
                 out.f32(beacon.ppu);
                 let displays = &beacon.displays[..beacon.displays.len().min(16)];
                 out.u8(displays.len() as u8);
@@ -226,6 +228,7 @@ impl Packet {
                     os,
                     open: flags & 1 != 0,
                     busy: flags & 2 != 0,
+                    lends: flags & 4 != 0,
                     ppu,
                     displays,
                     name,
@@ -307,6 +310,24 @@ pub enum Message {
     Edge,
     /// Files are being dragged here: the cursor may take them back across.
     Dragging,
+    /// From the controller: show its picture on this display of yours, as its extended display.
+    /// Only sent to computers whose beacon says they lend their screens.
+    Lend {
+        display: u8,
+    },
+    /// The display will show it: its size in pixels, how often it refreshes, and its pixels
+    /// per point.
+    Lent {
+        display: u8,
+        pixels: [u16; 2],
+        hz: u8,
+        scale: f32,
+    },
+    /// Either side: the display is no longer lent, with why, in a few words.
+    Unlend {
+        display: u8,
+        why: String,
+    },
 }
 
 const ENTER: u8 = 1;
@@ -321,6 +342,9 @@ const BYE: u8 = 9;
 const DRAG: u8 = 10;
 const EDGE: u8 = 11;
 const DRAGGING: u8 = 12;
+const LEND: u8 = 13;
+const LENT: u8 = 14;
+const UNLEND: u8 = 15;
 
 /// How much of a clipboard goes in one message.
 pub const CLIP_CHUNK: usize = 900;
@@ -373,6 +397,23 @@ impl Message {
             Message::Drag => w.u8(DRAG),
             Message::Edge => w.u8(EDGE),
             Message::Dragging => w.u8(DRAGGING),
+            Message::Lend { display } => {
+                w.u8(LEND);
+                w.u8(*display);
+            }
+            Message::Lent { display, pixels, hz, scale } => {
+                w.u8(LENT);
+                w.u8(*display);
+                w.u16(pixels[0]);
+                w.u16(pixels[1]);
+                w.u8(*hz);
+                w.f32(*scale);
+            }
+            Message::Unlend { display, why } => {
+                w.u8(UNLEND);
+                w.u8(*display);
+                w.text(why, 160);
+            }
         }
         *out = w.0;
     }
@@ -408,6 +449,14 @@ impl Message {
             DRAG => Message::Drag,
             EDGE => Message::Edge,
             DRAGGING => Message::Dragging,
+            LEND => Message::Lend { display: input.u8()? },
+            LENT => Message::Lent {
+                display: input.u8()?,
+                pixels: [input.u16()?, input.u16()?],
+                hz: input.u8()?,
+                scale: input.f32()?,
+            },
+            UNLEND => Message::Unlend { display: input.u8()?, why: input.text()? },
             _ => return None,
         })
     }
@@ -572,6 +621,7 @@ mod tests {
                 os: Os::Windows,
                 open: true,
                 busy: false,
+                lends: true,
                 ppu: 1.5,
                 displays: vec![Rect::new(-1920.0, 0.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
                 name: "Desk PC".into(),
@@ -609,6 +659,9 @@ mod tests {
                 (13, Message::Drag),
                 (14, Message::Edge),
                 (15, Message::Dragging),
+                (16, Message::Lend { display: 1 }),
+                (17, Message::Lent { display: 1, pixels: [2560, 1440], hz: 60, scale: 1.0 }),
+                (18, Message::Unlend { display: 1, why: "Stopped on the Mac".into() }),
             ],
         };
         assert_eq!(Body::decode(&body.encode()), Some(body));
@@ -631,6 +684,7 @@ mod tests {
             os: Os::Mac,
             open: false,
             busy: true,
+            lends: false,
             ppu: 1.0,
             displays: vec![],
             name: "é".repeat(40),

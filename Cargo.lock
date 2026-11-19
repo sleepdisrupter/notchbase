@@ -2464,6 +2464,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-core-media",
  "objc2-foundation 0.3.2",
+ "objc2-quartz-core 0.3.2",
 ]
 
 [[package]]
@@ -2811,6 +2812,18 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-core-location",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-video-toolbox"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05bf9a3c14831a7d9641b0d81d87dd913ee238a012b2fde27db5a84b56f5df3e"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
 ]
 
 [[package]]
@@ -3206,15 +3219,23 @@ name = "roam"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "block2 0.6.2",
  "chacha20poly1305",
+ "dispatch2",
  "gethostname",
  "getrandom 0.3.4",
  "if-addrs",
  "notchbase-sdk",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-av-foundation",
  "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
  "objc2-foundation 0.3.2",
+ "objc2-quartz-core 0.3.2",
+ "objc2-screen-capture-kit",
+ "objc2-video-toolbox",
  "png",
  "serde",
  "serde_json",

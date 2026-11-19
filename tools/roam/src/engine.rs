@@ -17,8 +17,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+mod extend;
+
+use extend::{ExtendEvent, Extended, Lending};
+pub use extend::{ExtendedView, LendingView};
+
 use crate::bulk::{self, Arrived, Content, Hello};
 use crate::crypto::{self, Ephemeral, Handshake, Identity, commit, hex, unhex};
+use crate::display::{self, Ability, Displays};
 use crate::input::{self, Copied, Input, Platform, Play, Swipe};
 use crate::keys;
 use crate::layout::{self, Computer, Rect, Step};
@@ -67,6 +73,8 @@ const EDGE_TOLD_EVERY: u64 = 5 * SECOND;
 const DRAG_ID: u32 = 1 << 31;
 /// How many received copies of files are kept, newest first.
 const KEEP_RECEIVED: usize = 4;
+/// How often the computer checks whether it can make virtual displays.
+const ABILITY_EVERY: u64 = 5 * SECOND;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
@@ -124,6 +132,16 @@ pub enum Control {
     Release,
     /// Ask the system for the permission Roam is missing.
     AskPermission,
+    /// Show this display (by its place in the computer's list) of a computer we control as an
+    /// extended display of this one.
+    Extend {
+        id: String,
+        display: u8,
+    },
+    /// Stop showing that computer's screen here, or forget why it couldn't be.
+    Unextend(String),
+    /// Stop lending this computer's screen to the computer controlling it.
+    StopLending,
     /// Tests: stop hearing the network, as if Wi-Fi dropped out.
     #[cfg(test)]
     Deaf(bool),
@@ -161,6 +179,8 @@ enum Event {
     },
     /// A line for the log, from another thread.
     Note(String),
+    /// Word from the threads carrying extended displays.
+    Extend(ExtendEvent),
     /// Slow lookups, done on their own thread: the computer's name, the typed addresses and
     /// the networks it's on.
     Looked {
@@ -199,6 +219,8 @@ pub struct PeerView {
     pub displays: Vec<Rect>,
     pub ppu: f64,
     pub open: bool,
+    /// Can lend its screens as extended displays.
+    pub lends: bool,
     pub nearby: bool,
     pub paired: bool,
     pub link: LinkState,
@@ -261,6 +283,12 @@ pub struct Status {
     pub transfer: Option<Transfer>,
     /// The last big copy that came in.
     pub landed: Option<Landed>,
+    /// Whether this computer can make virtual displays for other computers' screens.
+    pub ability: Ability,
+    /// Other computers' screens shown here as extended displays.
+    pub extended: Vec<ExtendedView>,
+    /// This computer's screen, lent to another computer as its extended display.
+    pub lending: Option<LendingView>,
 }
 
 /// A running engine. Dropping it stops everything and gives the mouse and keyboard back.
@@ -276,11 +304,23 @@ impl Engine {
         desk: Vec<Placement>,
         port: u16,
     ) -> (Engine, Receiver<Status>) {
+        Self::start_with(data, platform, display::native(), prefs, desk, port)
+    }
+
+    /// Starts with `displays` making and lending extended displays.
+    pub fn start_with(
+        data: PathBuf,
+        platform: Box<dyn Platform>,
+        displays: Arc<dyn Displays>,
+        prefs: Prefs,
+        desk: Vec<Placement>,
+        port: u16,
+    ) -> (Engine, Receiver<Status>) {
         let (events, inbox) = mpsc::channel();
         let (status_out, status) = mpsc::channel();
         let sender = events.clone();
         let spawned = std::thread::Builder::new().name("roam".into()).spawn(move || {
-            let mut core = Core::new(data, platform, prefs, desk, port, sender, status_out);
+            let mut core = Core::new(data, platform, displays, prefs, desk, port, sender, status_out);
             core.run(inbox);
         });
         if let Err(err) = spawned {
@@ -307,6 +347,7 @@ struct Peer {
     addr: SocketAddr,
     open: bool,
     busy: bool,
+    lends: bool,
     displays: Vec<Rect>,
     ppu: f64,
     seen: u64,
@@ -524,14 +565,25 @@ struct Core {
     steady_at: u64,
     log: Option<std::fs::File>,
     gaps: Gaps,
+    // Extended displays.
+    displays: Arc<dyn Displays>,
+    ability: Ability,
+    ability_at: u64,
+    /// Other computers' screens this computer shows as extended displays.
+    extended: HashMap<Id, Extended>,
+    /// This computer's screen, lent to the computer controlling it.
+    lending: Option<Lending>,
+    extend_serial: u32,
     #[cfg(test)]
     deaf: bool,
 }
 
 impl Core {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         data: PathBuf,
         platform: Box<dyn Platform>,
+        displays: Arc<dyn Displays>,
         prefs: Prefs,
         placements: Vec<Placement>,
         port: u16,
@@ -606,6 +658,12 @@ impl Core {
             steady_at: 0,
             log: None,
             gaps: Gaps::default(),
+            ability: displays.ability(),
+            displays,
+            ability_at: 0,
+            extended: HashMap::new(),
+            lending: None,
+            extend_serial: 0,
             #[cfg(test)]
             deaf: false,
         };
@@ -712,6 +770,7 @@ impl Core {
     }
 
     fn shut_down(&mut self) {
+        self.shut_down_displays();
         self.go_home(None);
         self.release_played();
         for (id, session) in &mut self.sessions {
@@ -763,6 +822,7 @@ impl Core {
                 }
             }
             Event::Note(text) => self.note(&text),
+            Event::Extend(event) => self.extend_event(event),
             Event::Looked { name, addresses, networks } => {
                 self.host_name = name;
                 self.typed = addresses;
@@ -838,7 +898,7 @@ impl Core {
             if screens != self.screens {
                 self.screens = screens;
                 self.note(&format!("this computer's screens: {}", screens_words(&self.screens.0, self.screens.1)));
-                let (displays, ppu) = self.screens.clone();
+                let (displays, ppu) = self.real_screens();
                 for session in self.sessions.values_mut() {
                     if session.side == Side::Controlled
                         && let Some(link) = session.live()
@@ -863,6 +923,11 @@ impl Core {
             self.lookup_at = now + LOOKUP_EVERY;
             self.look_up();
         }
+        if now >= self.ability_at {
+            self.ability_at = now + ABILITY_EVERY;
+            self.ability = self.displays.ability();
+        }
+        self.check_extended(now);
         if matches!(self.cursor, Cursor::Away { .. }) {
             // Tell the mouse and keyboard Roam is still here, and notice if they let go.
             self.platform.alive();
@@ -1004,7 +1069,7 @@ impl Core {
 
     fn beacon(&mut self, to: Option<SocketAddr>) {
         let Some(socket) = self.socket.clone() else { return };
-        let (displays, ppu) = self.screens.clone();
+        let (displays, ppu) = self.real_screens();
         let busy = self.sessions.values().any(|s| s.side == Side::Controlled && s.is_live());
         let beacon = Packet::Beacon(Beacon {
             id: self.identity.id,
@@ -1013,6 +1078,7 @@ impl Core {
             os: Os::here(),
             open: self.prefs.open,
             busy,
+            lends: self.displays.lends(),
             ppu: ppu as f32,
             displays,
             name: self.name(),
@@ -1073,6 +1139,7 @@ impl Core {
             addr,
             open: beacon.open,
             busy: beacon.busy,
+            lends: beacon.lends,
             displays: beacon.displays,
             ppu: f64::from(beacon.ppu),
             seen: now,
@@ -1318,6 +1385,7 @@ impl Core {
                     addr: from,
                     open: false,
                     busy: false,
+                    lends: false,
                     displays: Vec::new(),
                     ppu: 1.0,
                     seen: now,
@@ -1407,6 +1475,33 @@ impl Core {
             Message::Bye => {
                 self.note(&format!("{} said goodbye", self.who(id)));
                 self.end_session(id, true);
+            }
+            Message::Lent { display, pixels, hz, scale } if side == Side::Controller && live => {
+                self.lent(id, display, pixels, hz, scale);
+            }
+            Message::Unlend { display, why } if side == Side::Controller => {
+                if self.extended.get(&id).is_some_and(|e| e.display == display) {
+                    let failed = self.extended.get(&id).is_some_and(|e| e.state != extend::State::Running);
+                    self.note(&format!("{} stopped lending its display {display}: {why}", self.who(id)));
+                    if let Some(entry) = self.extended.remove(&id) {
+                        if let Some(feed) = &entry.feed {
+                            feed.stop();
+                        }
+                        if failed {
+                            self.extended.insert(
+                                id,
+                                Extended { state: extend::State::Failed(why), feed: None, place: None, ..entry },
+                            );
+                        }
+                    }
+                }
+            }
+            Message::Lend { display } if side == Side::Controlled && live => self.lend(id, display),
+            Message::Unlend { display, why } if side == Side::Controlled => {
+                if self.lending.as_ref().is_some_and(|l| l.to == id && l.display == display) {
+                    self.note(&format!("{} no longer shows its picture here: {why}", self.who(id)));
+                    self.stop_lending(None);
+                }
             }
             Message::Screens { ppu, displays } if side == Side::Controller => {
                 let words = screens_words(&displays, f64::from(ppu));
@@ -1537,7 +1632,7 @@ impl Core {
             peer.refused = None;
         }
         if side == Side::Controlled {
-            let (displays, ppu) = self.screens.clone();
+            let (displays, ppu) = self.real_screens();
             if let Some(link) = self.sessions.get_mut(&id).and_then(Session::live) {
                 link.queue(Message::Screens { ppu: ppu as f32, displays });
             }
@@ -1551,6 +1646,7 @@ impl Core {
         {
             self.go_home(None);
         }
+        self.session_ended_displays(id);
         let Some(mut session) = self.sessions.remove(&id) else { return };
         if session.side == Side::Controlled {
             self.stalled = false;
@@ -1612,10 +1708,10 @@ impl Core {
     fn desk(&self) -> (Vec<Computer>, Vec<Option<Id>>) {
         let mut desk = Vec::new();
         let mut ids = Vec::new();
-        let (displays, ppu) = self.screens.clone();
         let mine = hex(&self.identity.id);
         let my_spot = self.placements.iter().find(|p| p.id == mine).map_or([0.0, 0.0], |p| p.at);
-        desk.push(Computer::new("me", displays, ppu, my_spot));
+        let me = self.me_on_desk(my_spot);
+        desk.push(me.clone());
         ids.push(None);
         for placement in &self.placements {
             let Some(id) = unhex::<8>(&placement.id) else { continue };
@@ -1628,7 +1724,12 @@ impl Core {
             if peer.displays.is_empty() {
                 continue;
             }
-            desk.push(Computer::new(placement.id.clone(), peer.displays.clone(), peer.ppu, placement.at));
+            let Some(computer) =
+                self.peer_on_desk(id, placement.id.clone(), peer.displays.clone(), peer.ppu, placement.at, &me)
+            else {
+                continue;
+            };
+            desk.push(computer);
             ids.push(Some(id));
         }
         (desk, ids)
@@ -2192,6 +2293,7 @@ impl Core {
                     self.note(&format!("the desk: {}", spots.join(", ")));
                 }
                 self.placements = placements;
+                self.place_extended();
                 let placed = self.placed();
                 let gone: Vec<Id> = self
                     .sessions
@@ -2240,6 +2342,21 @@ impl Core {
                 }
             }
             Control::Home => self.go_home(None),
+            Control::Extend { id, display } => {
+                if let Some(id) = unhex::<8>(&id) {
+                    self.extend(id, display);
+                }
+            }
+            Control::Unextend(id) => {
+                if let Some(id) = unhex::<8>(&id) {
+                    let why = format!("Disconnected on {}", self.name());
+                    self.unextend(id, &why);
+                }
+            }
+            Control::StopLending => {
+                let why = format!("Stopped on {}", self.name());
+                self.stop_lending(Some(&why));
+            }
             Control::AskPermission => {
                 self.platform.ask_permission();
                 self.listen_at = 0;
@@ -2258,7 +2375,7 @@ impl Core {
     }
 
     fn status(&mut self, now: u64) -> Status {
-        let (displays, ppu) = self.screens.clone();
+        let (displays, ppu) = self.real_screens();
         let me = PeerView {
             id: hex(&self.identity.id),
             name: self.name(),
@@ -2266,6 +2383,7 @@ impl Core {
             displays,
             ppu,
             open: self.prefs.open,
+            lends: self.displays.lends(),
             nearby: true,
             paired: true,
             link: LinkState::None,
@@ -2323,6 +2441,7 @@ impl Core {
                 displays: peer.displays.clone(),
                 ppu: peer.ppu,
                 open: peer.open && !peer.busy,
+                lends: peer.lends,
                 nearby,
                 paired: self.paired.contains_key(&id),
                 link,
@@ -2356,6 +2475,9 @@ impl Core {
             addresses,
             transfer: self.transfer.as_ref().map(|(_, _, t)| t.clone()),
             landed: self.landed.clone(),
+            ability: self.ability.clone(),
+            extended: self.extended_views(),
+            lending: self.lending_view(),
         }
     }
 }
@@ -2464,9 +2586,15 @@ fn receive_bulk(
     inbox: &std::path::Path,
     newest: &AtomicU32,
 ) -> std::io::Result<()> {
+    use std::io::Read as _;
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let hello = Hello::read(&mut stream)?;
+    let mut header = [0u8; 12];
+    stream.read_exact(&mut header)?;
+    if let Some(hello) = display::stream::Hello::parse(&header) {
+        return extend::view(stream, hello, events);
+    }
+    let hello = Hello::parse(&header)?;
     let (answer, key) = mpsc::channel();
     events.send(Event::Bulk { session: hello.session, answer }).map_err(std::io::Error::other)?;
     let Ok(Some((key, from))) = key.recv_timeout(Duration::from_secs(2)) else { return Ok(()) };

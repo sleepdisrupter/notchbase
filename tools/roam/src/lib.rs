@@ -7,6 +7,7 @@
 
 pub mod bulk;
 pub mod crypto;
+pub mod display;
 pub mod engine;
 pub mod input;
 pub mod keys;
@@ -23,7 +24,8 @@ use notchbase_sdk::column;
 use notchbase_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use engine::{Ask, Control, Engine, LinkState, PeerView, Placement, Prefs, Status, Transfer};
+use display::Ability;
+use engine::{Ask, Control, Engine, ExtendedView, LinkState, PeerView, Placement, Prefs, Status, Transfer};
 use layout::{Computer, Rect};
 use wire::Os;
 
@@ -160,6 +162,8 @@ pub struct Roam<B: Backend = Native> {
     selected: Option<String>,
     asked: Vec<String>,
     draft: String,
+    /// The screen right-clicked on the desk: whose, and which of its displays.
+    menu: Option<(String, u8)>,
     backend: PhantomData<B>,
 }
 
@@ -183,6 +187,15 @@ pub enum Msg {
     Connect,
     Unlist(String),
     Scroll(String, f32),
+    /// A right click on the desk.
+    Menu(Pointer),
+    CloseMenu,
+    /// Make that computer's display an extended display of this one.
+    Extend(String, u8),
+    /// Give that computer's screen back.
+    Unextend(String),
+    /// Take this computer's screen back from the computer using it as a display.
+    StopLending,
 }
 
 fn prefs(settings: &Settings) -> Prefs {
@@ -282,6 +295,7 @@ impl<B: Backend> Tool for Roam<B> {
             selected: None,
             asked: Vec::new(),
             draft: String::new(),
+            menu: None,
             backend: PhantomData,
         };
         (roam, pump)
@@ -383,6 +397,31 @@ impl<B: Backend> Tool for Roam<B> {
                 spot.scroll = speed;
                 self.desk_changed()
             }
+            Msg::Menu(pointer) => {
+                self.menu = self.screen_at(pointer);
+                if let Some((id, _)) = &self.menu {
+                    self.selected = Some(id.clone());
+                }
+                Command::none()
+            }
+            Msg::CloseMenu => {
+                self.menu = None;
+                Command::none()
+            }
+            Msg::Extend(id, display) => {
+                self.menu = None;
+                self.control(Control::Extend { id, display });
+                Command::none()
+            }
+            Msg::Unextend(id) => {
+                self.menu = None;
+                self.control(Control::Unextend(id));
+                Command::none()
+            }
+            Msg::StopLending => {
+                self.control(Control::StopLending);
+                Command::none()
+            }
         }
     }
 
@@ -457,6 +496,24 @@ impl<B: Backend> Tool for Roam<B> {
                 .into(),
             );
         }
+        for extended in &self.status.extended {
+            parts.push(extended_view(extended));
+        }
+        if let Some(lending) = &self.status.lending {
+            let me = self.me().map_or(1, |m| m.displays.len());
+            let which = if me > 1 { format!("screen {}", lending.display + 1) } else { "screen".to_owned() };
+            parts.push(
+                row![
+                    icon(Icon::Display).tone(Tone::Green),
+                    text(format!("{} is using this computer's {which} as a display", lending.to)).callout().wrap(),
+                    spacer(),
+                    button("Stop").on_press(Msg::StopLending),
+                ]
+                .spacing(8.0)
+                .align(Align::Center)
+                .into(),
+            );
+        }
         if !self.prefs.open && self.status.controller.is_none() {
             parts.push(
                 row![
@@ -469,6 +526,9 @@ impl<B: Backend> Tool for Roam<B> {
             );
         }
         parts.push(self.desk_view());
+        if let Some(menu) = self.menu_view() {
+            parts.push(menu);
+        }
         if let Some(details) = self.selected_details() {
             parts.push(details);
         }
@@ -551,6 +611,44 @@ fn transfer_view(transfer: &Transfer) -> Element<Msg> {
         ]
         .spacing(6.0),
     )
+}
+
+/// A screen on its way to being, or being, an extended display of this computer.
+fn extended_view(extended: &ExtendedView) -> Element<Msg> {
+    let id = extended.id.clone();
+    if let Some(why) = &extended.failed {
+        return card(
+            row![
+                icon(Icon::Exclamation).tone(Tone::Orange),
+                column![
+                    text(format!("{}'s screen didn't become a display", extended.name)).callout().wrap(),
+                    text(why.clone()).caption().secondary().wrap(),
+                ]
+                .spacing(2.0),
+                spacer(),
+                button("OK").on_press(Msg::Unextend(id)),
+            ]
+            .spacing(8.0)
+            .align(Align::Center),
+        );
+    }
+    let (title, detail, action) = match &extended.working {
+        Some(working) => (format!("Making {}'s screen a display", extended.name), format!("{working}…"), "Cancel"),
+        None => (
+            format!("{}'s screen is a display of this computer", extended.name),
+            "Arrange it in Display settings like any monitor".to_owned(),
+            "Disconnect",
+        ),
+    };
+    row![
+        icon(Icon::Display).tone(Tone::Blue),
+        column![text(title).callout().wrap(), text(detail).caption().secondary().wrap()].spacing(2.0),
+        spacer(),
+        button(action).on_press(Msg::Unextend(id)),
+    ]
+    .spacing(8.0)
+    .align(Align::Center)
+    .into()
 }
 
 fn percent(transfer: &Transfer) -> String {
@@ -752,7 +850,7 @@ impl<B: Backend> Roam<B> {
         }
         let view = self.view();
         let me = self.me().map(|m| m.id.clone()).unwrap_or_default();
-        let mut canvas = canvas::<Msg>(WIDTH, HEIGHT).stretch().on_pointer(Msg::Pointer);
+        let mut canvas = canvas::<Msg>(WIDTH, HEIGHT).stretch().on_pointer(Msg::Pointer).on_menu(Msg::Menu);
         let away = self.status.away_on.clone();
         for spot in &self.desk {
             let peer = self.peer(&spot.id);
@@ -767,10 +865,13 @@ impl<B: Backend> Roam<B> {
                 Color::white(0.12)
             };
             let computer = spot.computer();
-            for display in computer.desk_displays() {
+            for (index, display) in computer.desk_displays().into_iter().enumerate() {
                 let [x, y] = view.to_canvas([display.x, display.y]);
                 let w = (display.w * view.scale) as f32;
                 let h = (display.h * view.scale) as f32;
+                // A screen lent here as a display is drawn as one of this computer's.
+                let lent = self.extended(&spot.id, index).is_some_and(|e| e.failed.is_none());
+                let fill = if lent { Color::rgba(90, 150, 255, 140) } else { fill };
                 let mut shape =
                     draw::rect(x + 0.75, y + 0.75, (w - 1.5).max(1.0), (h - 1.5).max(1.0)).radius(3.0).fill(fill);
                 if selected {
@@ -801,9 +902,79 @@ impl<B: Backend> Roam<B> {
                 canvas = canvas.push(draw::circle(cx, cy + 10.0, 2.5).fill(Color::white(0.9)));
             }
         }
-        column![canvas, text("Drag the screens to match your desk").caption().tertiary().align(Align::Center)]
-            .spacing(4.0)
-            .into()
+        let hint = if matches!(self.status.ability, Ability::No(_)) {
+            "Drag the screens to match your desk"
+        } else {
+            "Drag the screens to match your desk · right-click one to use it as a display"
+        };
+        column![canvas, text(hint).caption().tertiary().align(Align::Center)].spacing(4.0).into()
+    }
+
+    fn extended(&self, id: &str, display: usize) -> Option<&ExtendedView> {
+        self.status.extended.iter().find(|e| e.id == id && usize::from(e.display) == display)
+    }
+
+    /// Another computer's display under a right click: its id and which display.
+    fn screen_at(&self, pointer: Pointer) -> Option<(String, u8)> {
+        let at = self.view().to_desk(pointer.x, pointer.y);
+        let me = self.me().map(|m| m.id.clone()).unwrap_or_default();
+        self.desk.iter().rev().filter(|s| s.id != me).find_map(|spot| {
+            let index = spot.computer().desk_displays().iter().position(|d| d.contains(at))?;
+            Some((spot.id.clone(), u8::try_from(index).ok()?))
+        })
+    }
+
+    /// What can be done with the right-clicked screen.
+    fn menu_view(&self) -> Option<Element<Msg>> {
+        let (id, display) = self.menu.clone()?;
+        let spot = self.desk.iter().find(|s| s.id == id)?;
+        let peer = self.peer(&id);
+        let title = if spot.displays.len() > 1 {
+            format!("{}'s screen {}", spot.name, display + 1)
+        } else {
+            format!("{}'s screen", spot.name)
+        };
+        let (detail, action): (String, Element<Msg>) = match self.extended(&id, usize::from(display)) {
+            Some(extended) if extended.failed.is_none() => (
+                "A display of this computer now".into(),
+                button("Disconnect display").destructive().on_press(Msg::Unextend(id.clone())).into(),
+            ),
+            _ => {
+                let connected = peer.is_some_and(|p| p.link == LinkState::Connected);
+                let blocked = match &self.status.ability {
+                    Ability::No(why) => Some(why.clone()),
+                    _ if !connected => Some(format!("Connect to {} first", spot.name)),
+                    _ if !peer.is_some_and(|p| p.lends) => Some(format!("Update notchbase on {} first", spot.name)),
+                    _ => None,
+                };
+                let detail = blocked.clone().unwrap_or_else(|| match self.status.ability {
+                    Ability::NeedsDriver => {
+                        "Installs a free display driver first; Windows asks for permission once".into()
+                    }
+                    _ => "It becomes another display of this computer, like a monitor plugged in".into(),
+                });
+                let button = button("Turn into extended display")
+                    .filled()
+                    .enabled(blocked.is_none())
+                    .on_press(Msg::Extend(id.clone(), display));
+                (detail, button.into())
+            }
+        };
+        Some(card(
+            column![
+                row![
+                    icon(Icon::Display).tone(Tone::Blue),
+                    text(title).headline(),
+                    spacer(),
+                    button("").icon(Icon::Xmark).plain().on_press(Msg::CloseMenu),
+                ]
+                .spacing(8.0)
+                .align(Align::Center),
+                text(detail).caption().secondary().wrap(),
+                action,
+            ]
+            .spacing(6.0),
+        ))
     }
 
     fn selected_details(&self) -> Option<Element<Msg>> {

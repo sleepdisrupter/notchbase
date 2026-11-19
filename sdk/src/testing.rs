@@ -335,6 +335,21 @@ impl<T: Tool> Harness<T> {
         self.ui(surface, handler, UiValue::Pointer(pointer))
     }
 
+    /// A right click on canvas `nth` at `x`, `y`.
+    pub fn right_click(&mut self, nth: usize, x: f32, y: f32) -> &[Request] {
+        let mut found = Vec::new();
+        for (surface, node) in self.surfaces() {
+            gather(&node, &mut |node| {
+                if let Node::Canvas(canvas) = node {
+                    found.push((surface, canvas.on_menu));
+                }
+            });
+        }
+        let (surface, handler) = *found.get(nth).unwrap_or_else(|| panic!("there are {} canvases", found.len()));
+        let handler = handler.unwrap_or_else(|| panic!("canvas {nth} has no menu"));
+        self.ui(surface, handler, UiValue::Pointer(Pointer::at(PointerKind::Press, x, y)))
+    }
+
     pub fn pick_day(&mut self, day: u8) -> &[Request] {
         let (surface, handler, year, month) = self.month();
         self.ui(surface, handler, UiValue::Index(MonthNode::pack(year, month, day)))

@@ -316,10 +316,11 @@ struct Touch {
 }
 
 fn listen(scene: &mut Scene, canvas: &CanvasNode, rect: Rect, view: View, id: Id) {
-    if !scene.live || (canvas.on_pointer.is_none() && canvas.on_scroll.is_none()) {
+    if !scene.live || (canvas.on_pointer.is_none() && canvas.on_scroll.is_none() && canvas.on_menu.is_none()) {
         return;
     }
-    let sense = if canvas.on_pointer.is_some() { Sense::click_and_drag() } else { Sense::hover() };
+    let sense =
+        if canvas.on_pointer.is_some() || canvas.on_menu.is_some() { Sense::click_and_drag() } else { Sense::hover() };
     let response = scene.ui.interact(rect, id, sense);
     let at = response.interact_pointer_pos().or_else(|| response.hover_pos()).map(|at| view.local(at));
     let memory = id.with("touch");
@@ -348,6 +349,9 @@ fn listen(scene: &mut Scene, canvas: &CanvasNode, rect: Rect, view: View, id: Id
     }
     if response.clicked() {
         tell(scene, PointerKind::Click, Vec2::ZERO);
+    }
+    if let Some([x, y]) = at.filter(|_| canvas.on_menu.is_some() && response.secondary_clicked()) {
+        scene.emit(canvas.on_menu, UiValue::Pointer(Pointer::at(PointerKind::Press, x, y)));
     }
     if before.over && !over {
         let gone = Pointer::at(PointerKind::Leave, -1.0, -1.0);

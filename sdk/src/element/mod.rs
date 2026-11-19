@@ -156,6 +156,7 @@ enum Kind<Msg> {
         node: CanvasNode,
         on_pointer: Option<Map<Pointer, Msg>>,
         on_scroll: Option<Map<Pointer, Msg>>,
+        on_menu: Option<Map<Pointer, Msg>>,
     },
 }
 
@@ -251,9 +252,10 @@ impl<Msg> Element<Msg> {
             Kind::Palette { colors, selected, on_select } => {
                 Node::Palette { colors, selected, on_select: on_select.map(|map| handlers.add(Handler::Index(map))) }
             }
-            Kind::Canvas { node, on_pointer, on_scroll } => Node::Canvas(CanvasNode {
+            Kind::Canvas { node, on_pointer, on_scroll, on_menu } => Node::Canvas(CanvasNode {
                 on_pointer: on_pointer.map(|map| handlers.add(Handler::Pointer(map))),
                 on_scroll: on_scroll.map(|map| handlers.add(Handler::Pointer(map))),
+                on_menu: on_menu.map(|map| handlers.add(Handler::Pointer(map))),
                 ..node
             }),
         }
@@ -338,10 +340,11 @@ impl<Msg: 'static> Element<Msg> {
             Kind::Palette { colors, selected, on_select } => {
                 Kind::Palette { colors, selected, on_select: on_select.map(|inner| compose(inner, map)) }
             }
-            Kind::Canvas { node, on_pointer, on_scroll } => Kind::Canvas {
+            Kind::Canvas { node, on_pointer, on_scroll, on_menu } => Kind::Canvas {
                 node,
                 on_pointer: on_pointer.map(|inner| compose(inner, map)),
                 on_scroll: on_scroll.map(|inner| compose(inner, map)),
+                on_menu: on_menu.map(|inner| compose(inner, map)),
             },
         })
     }

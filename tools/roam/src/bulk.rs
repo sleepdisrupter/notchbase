@@ -104,6 +104,11 @@ impl Hello {
     pub fn read(input: &mut impl Read) -> io::Result<Hello> {
         let mut header = [0u8; 12];
         input.read_exact(&mut header)?;
+        Self::parse(&header)
+    }
+
+    /// From the first 12 bytes of a connection.
+    pub fn parse(header: &[u8; 12]) -> io::Result<Hello> {
         if &header[..4] != MAGIC {
             return Err(invalid("not a Roam transfer"));
         }
