@@ -119,8 +119,9 @@ fn ready_source(size: [u32; 2]) -> Result<monitor::Source, String> {
     if monitor::virtual_sources().is_empty() {
         return Err("The display driver isn't running. Restart the PC and try again".into());
     }
-    // Already in the driver's list: nothing to wait for.
-    let added = vdd::offer(size, HZ)?;
+    // Already in the driver's list: nothing to wait for. Settings it can't change (kept
+    // somewhere else, or not writable) still leave the sizes Windows makes up for it to try.
+    let added = vdd::offer(size, HZ).unwrap_or(false);
     let started = Instant::now();
     while added && started.elapsed() < MODE_WAIT {
         std::thread::sleep(Duration::from_millis(250));

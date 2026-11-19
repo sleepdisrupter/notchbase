@@ -44,7 +44,9 @@ pub fn virtual_sources() -> Vec<Source> {
             break;
         }
         let name = text(&device.DeviceString);
-        if ADAPTERS.iter().any(|adapter| name.contains(adapter)) {
+        // Its device id (Root\MttVDD) holds whatever Windows calls it.
+        let id = text(&device.DeviceID).to_ascii_lowercase();
+        if ADAPTERS.iter().any(|adapter| name.contains(adapter)) || id.contains("mttvdd") {
             found.push(Source {
                 name: device.DeviceName,
                 attached: device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != Default::default(),

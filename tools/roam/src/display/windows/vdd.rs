@@ -1,13 +1,12 @@
 //! The Virtual Display Driver (github.com/VirtualDrivers/Virtual-Display-Driver): an
 //! open-source indirect display driver, signed, so Windows takes it without test mode. It
 //! offers the sizes listed in its settings file and takes commands on a named pipe that anyone
-//! may open. Installing it is the one step that asks for administrator rights, through winget.
+//! may open. Installing it is the one step that asks for administrator rights.
 
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, GENERIC_WRITE, GetLastError};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING, WriteFile,
 };
@@ -18,68 +17,167 @@ use windows::core::{HSTRING, w};
 use super::monitor;
 
 const PIPE: &str = r"\\.\pipe\MTTVirtualDisplayPipe";
-const PACKAGE: &str = "VirtualDrivers.Virtual-Display-Driver";
 const DEFAULT_FOLDER: &str = r"C:\VirtualDisplayDriver";
+/// The driver's own installer, from its project's 25.5.2 release, and what it must hash to.
+const SETUP_URL: &str = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.5.2/Virtual.Display.Driver-v25.05.03-setup-x64.exe";
+const SETUP_NAME: &str = "Virtual.Display.Driver-v25.05.03-setup-x64.exe";
+const SETUP_SHA256: &str = "ca10b85babecfb636c85b3f04d2306968d4f940dd3dd35767f866207bfba846e";
+/// How long the person may take with the installer.
+const SETUP_RUN: Duration = Duration::from_secs(15 * 60);
 /// How long the driver may take to show up after installing.
-const INSTALL_WAIT: Duration = Duration::from_secs(90);
-/// How long winget may take, permission prompt and download included.
-const WINGET_WAIT: Duration = Duration::from_secs(5 * 60);
-/// A console window of its own, even when started from an app without one.
-const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-/// winget's answers for a package that's already there: no applicable upgrade, already
-/// installed, and no newer version.
-const ALREADY: [u32; 3] = [0x8A15_002B, 0x8A15_0061, 0x8A15_0060];
+const INSTALL_WAIT: Duration = Duration::from_secs(30);
 const NOT_RUNNING: &str = "The display driver is installed, but Windows isn't running it. Restart the PC and try again. If it still doesn't work, look for Virtual Display Driver under Display adapters in Device Manager";
 
-/// Whether the driver is there: its adapter is among Windows' displays.
+/// Whether the driver is there: its adapter is among Windows' displays, or it's running and
+/// listening for commands.
 pub fn installed() -> bool {
-    !monitor::virtual_sources().is_empty()
+    !monitor::virtual_sources().is_empty() || listening()
 }
 
-/// Installs the driver with winget, which asks the person for administrator rights, and waits
-/// for it to show up. winget runs in a window of its own, so its progress and Windows'
-/// permission prompt are in front of the person rather than hidden behind a background app.
+/// Whether the driver's pipe is there. Waiting on a pipe doesn't connect to it, so the driver
+/// doesn't notice.
+fn listening() -> bool {
+    let pipe = HSTRING::from(PIPE);
+    // SAFETY: waits by name, for at most a millisecond.
+    if unsafe { WaitNamedPipeW(&pipe, 1) }.as_bool() {
+        return true;
+    }
+    // Busy with another client still means it's there; only a missing pipe means it isn't.
+    // SAFETY: reads this thread's last error, just set by the call above.
+    let error = unsafe { GetLastError() };
+    error != ERROR_FILE_NOT_FOUND
+}
+
+/// Installs the driver with its project's own installer, the one in its 25.5.2 release,
+/// pinned by SHA-256: downloaded, then opened for the person, after Windows asks them for
+/// permission. Then waits for the driver to show up. (The winget package of the same name is
+/// only the project's control app, not the driver.)
 pub fn install() -> Result<(), String> {
-    let mut winget = std::process::Command::new("winget")
-        .args(["install", "--id", PACKAGE, "-e", "--silent"])
-        .args(["--accept-package-agreements", "--accept-source-agreements"])
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|err| format!("Couldn't run winget to install the display driver: {err}"))?;
-    let started = Instant::now();
-    let status = loop {
-        match winget.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < WINGET_WAIT => std::thread::sleep(Duration::from_millis(250)),
-            Ok(None) => {
-                let _ = winget.kill();
-                return Err(format!(
-                    "The display driver install didn't finish in {} minutes. Run \"winget install --id {PACKAGE} -e\" in a terminal to see why",
-                    WINGET_WAIT.as_secs() / 60
-                ));
-            }
-            Err(err) => return Err(format!("Lost track of the display driver install: {err}")),
+    // Installed by hand, or by an earlier try, since Roam last looked.
+    if installed() {
+        return Ok(());
+    }
+    if cfg!(target_arch = "aarch64") {
+        return Err("The display driver doesn't support ARM PCs yet".into());
+    }
+    let folder = std::env::temp_dir().join("roam-display-driver");
+    std::fs::create_dir_all(&folder).map_err(|err| format!("Couldn't make {}: {err}", folder.display()))?;
+    let setup = folder.join(SETUP_NAME);
+    if !matches_pin(&setup) {
+        download(SETUP_URL, &setup)?;
+        if !matches_pin(&setup) {
+            let _ = std::fs::remove_file(&setup);
+            return Err("The display driver download didn't match the expected file. Try again later".into());
         }
-    };
-    let code = status.code().map(|c| c as u32);
-    // Nothing was installed, so there's nothing to wait for.
-    let wait = if code.is_some_and(|c| ALREADY.contains(&c)) { Duration::from_secs(2) } else { INSTALL_WAIT };
+    }
+    let code = elevated::run(&setup.to_string_lossy(), "", SETUP_RUN)?;
+    match code {
+        0 => {}
+        // The installer's own answers for being closed before it finished.
+        2 | 5 => return Err("The display driver installer was closed before it finished".into()),
+        code => return Err(format!("The display driver installer stopped with code {code}")),
+    }
     let started = Instant::now();
-    while started.elapsed() < wait {
+    while started.elapsed() < INSTALL_WAIT {
         if installed() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    match code {
-        Some(0) => Err(NOT_RUNNING.into()),
-        // Already installed, with nothing newer: the files are there but the driver isn't.
-        Some(code) if ALREADY.contains(&code) => Err(NOT_RUNNING.into()),
-        // winget's codes are HRESULTs, which read best in hex.
-        code => Err(format!(
-            "The display driver didn't install (winget said {}). Run \"winget install --id {PACKAGE} -e\" in a terminal to see why",
-            code.map_or_else(|| "nothing".to_owned(), |c| format!("0x{c:08X}"))
-        )),
+    Err(NOT_RUNNING.into())
+}
+
+/// Whether `path` is the pinned installer.
+fn matches_pin(path: &std::path::Path) -> bool {
+    use sha2::{Digest, Sha256};
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    let digest = Sha256::digest(&bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex == SETUP_SHA256
+}
+
+/// Downloads `url` to `to` with the curl that comes with Windows.
+fn download(url: &str, to: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut curl = std::process::Command::new("curl.exe")
+        .args(["--fail", "--location", "--silent", "--show-error", "--max-time", "300", "--output"])
+        .arg(to)
+        .arg(url)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Couldn't download the display driver: {err}"))?;
+    let mut why = String::new();
+    if let Some(mut stderr) = curl.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_string(&mut why);
+    }
+    let status = curl.wait().map_err(|err| format!("Couldn't download the display driver: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        let why = why.trim();
+        Err(format!("Couldn't download the display driver: {}", if why.is_empty() { "no connection" } else { why }))
+    }
+}
+
+/// Running a program as administrator.
+mod elevated {
+    use std::time::Duration;
+
+    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_OBJECT_0};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, TerminateProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, PCWSTR, w};
+
+    /// Runs `program` with `arguments` as administrator, once Windows has asked the person,
+    /// and answers its exit code. Gives up after `most`.
+    pub fn run(program: &str, arguments: &str, most: Duration) -> Result<u32, String> {
+        // The shell may hand the call to its extensions, which want COM on this thread.
+        // SAFETY: plain set-up; a thread that already has COM keeps it.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        let (program, arguments) = (HSTRING::from(program), HSTRING::from(arguments));
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: w!("runas"),
+            lpFile: PCWSTR(program.as_ptr()),
+            lpParameters: PCWSTR(arguments.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        // SAFETY: `info` is filled in as the call expects, and its strings outlive it.
+        if let Err(err) = unsafe { ShellExecuteExW(&mut info) } {
+            return Err(if err.code() == ERROR_CANCELLED.to_hresult() {
+                "Windows didn't get permission to install the display driver. Try again and say Yes".into()
+            } else {
+                format!("Couldn't open the display driver installer: {}", err.message())
+            });
+        }
+        let process = info.hProcess;
+        if process.is_invalid() {
+            return Err("Couldn't follow the display driver install".into());
+        }
+        // SAFETY: the process handle is ours until it's closed below.
+        let finished = unsafe { WaitForSingleObject(process, most.as_millis() as u32) } == WAIT_OBJECT_0;
+        let mut code = 0;
+        // SAFETY: as above.
+        let read = unsafe { GetExitCodeProcess(process, &mut code) };
+        if !finished {
+            // SAFETY: as above.
+            let _ = unsafe { TerminateProcess(process, 1) };
+        }
+        // SAFETY: closes the handle the call above gave.
+        let _ = unsafe { CloseHandle(process) };
+        if !finished {
+            return Err(format!("The display driver install didn't finish in {} minutes", most.as_secs() / 60));
+        }
+        read.map_err(|err| format!("Lost track of the display driver install: {}", err.message()))?;
+        Ok(code)
     }
 }
 
