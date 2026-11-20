@@ -90,7 +90,9 @@ impl Resampler {
     pub(crate) fn process(&mut self, input: &[u8], out: &mut Vec<u8>) {
         out.clear();
         let frames: Vec<[f32; CHANNELS]> = input
-            .chunks_exact(FRAME_BYTES)
+            .as_chunks::<FRAME_BYTES>()
+            .0
+            .iter()
             .map(|frame| [0, 1].map(|channel| Encoding::Int16.read(&frame[channel * SAMPLE_BYTES..])))
             .collect();
         let Some(&last) = frames.last() else { return };
@@ -115,7 +117,7 @@ fn quantize(value: f32) -> i16 {
 }
 
 pub(crate) fn downmix(frame: &[u8]) -> f32 {
-    let sum: f32 = frame.chunks_exact(SAMPLE_BYTES).map(|sample| Encoding::Int16.read(sample)).sum();
+    let sum: f32 = frame.as_chunks::<SAMPLE_BYTES>().0.iter().map(|sample| Encoding::Int16.read(sample)).sum();
     sum / CHANNELS as f32
 }
 
@@ -124,7 +126,7 @@ mod tests {
     use super::*;
 
     fn samples(bytes: &[u8]) -> Vec<i16> {
-        bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect()
+        bytes.as_chunks::<2>().0.iter().map(|&pair| i16::from_le_bytes(pair)).collect()
     }
 
     #[test]

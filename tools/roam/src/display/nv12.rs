@@ -72,13 +72,13 @@ fn to_nv12(bgra: &[u8], [width, height]: [usize; 2], workers: usize, out: &mut [
 fn band(bgra: &[u8], width: usize, luma_rows: &mut [u8], chroma_rows: &mut [u8]) {
     let stride = width * BYTES_PER_PIXEL;
     for (row, line) in bgra.chunks_exact(stride).zip(luma_rows.chunks_exact_mut(width)) {
-        for (dst, px) in line.iter_mut().zip(row.chunks_exact(BYTES_PER_PIXEL)) {
+        for (dst, px) in line.iter_mut().zip(row.as_chunks::<BYTES_PER_PIXEL>().0) {
             *dst = luma(i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
         }
     }
     for (rows, uv) in bgra.chunks_exact(2 * stride).zip(chroma_rows.chunks_exact_mut(width)) {
         let (top, bottom) = rows.split_at(stride);
-        for (x, dst) in uv.chunks_exact_mut(2).enumerate() {
+        for (x, dst) in uv.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let at = 2 * x * BYTES_PER_PIXEL;
             let sum = |channel: usize| {
                 let pick = |line: &[u8], offset: usize| i32::from(line[at + offset + channel]);
@@ -133,7 +133,7 @@ fn back_band(luma: &[u8], chroma: &[u8], width: usize, stride: usize, out: &mut 
         let (Some(ys), Some(uv)) = (luma.get(y * stride..y * stride + width), chroma.get((y / 2) * stride..)) else {
             break;
         };
-        for (x, px) in line.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+        for (x, px) in line.as_chunks_mut::<BYTES_PER_PIXEL>().0.iter_mut().enumerate() {
             let c = 298 * (i32::from(ys[x]) - 16);
             let at = x & !1;
             let (u, v) = (
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn oversized_frames_are_halved_first() {
         let mut frame = solid([4, 4], [0, 0, 0, 255]);
-        for px in frame.chunks_exact_mut(4).step_by(2) {
+        for px in frame.as_chunks_mut::<4>().0.iter_mut().step_by(2) {
             px.copy_from_slice(&[255, 255, 255, 255]);
         }
         let mut converter = Converter::new([4, 4], [2, 2]);
