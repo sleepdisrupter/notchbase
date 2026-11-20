@@ -8,7 +8,7 @@
 //! you reach the edge, with no round trip. The controlled computer just shows what it's told.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -56,6 +56,9 @@ const STILL: u64 = 4 * MS;
 const STALL: u64 = 1_500 * MS;
 /// With no word for this long, the session is over (and is started again when possible).
 const DEAD: u64 = 8 * SECOND;
+/// Once packets seem to go astray one way, how long they also take the detour, and how often.
+const DETOUR_FOR: u64 = 30 * SECOND;
+const DETOUR_EVERY: u64 = 50 * MS;
 const STATUS_EVERY: u64 = 100 * MS;
 const SCREENS_EVERY: u64 = 2 * SECOND;
 /// How often typed addresses are looked up again, and the name and networks read again.
@@ -157,6 +160,10 @@ pub enum Control {
     /// Tests: cut the lent screen's picture stream, as a network hiccup does.
     #[cfg(test)]
     CutStream,
+    /// Tests: lose the packets this computer sends straight to the other one, as Wi-Fi does for
+    /// a while after a PC hops to its router's other band.
+    #[cfg(test)]
+    LoseDirect(bool),
 }
 
 enum Event {
@@ -596,6 +603,8 @@ struct Core {
     pointer_over: Option<(Id, [i32; 2])>,
     #[cfg(test)]
     deaf: bool,
+    /// Tests: see `Control::LoseDirect`.
+    lose_direct: bool,
 }
 
 impl Core {
@@ -688,6 +697,7 @@ impl Core {
             pointer_over: None,
             #[cfg(test)]
             deaf: false,
+            lose_direct: false,
         };
         if fresh {
             core.save();
@@ -1015,9 +1025,11 @@ impl Core {
         }
         for id in ended {
             self.note(&format!("no word from {} for 8 s: session over", self.who(id)));
-            // Only the network went: what's lent between them waits for it to come back.
+            // Only the network went: what's lent between them waits for it to come back. No
+            // goodbye: if the other one still hears this one, a goodbye would end its displays for
+            // good, while without one it hears Reset (or a new offer) and holds on the same way.
             self.hold_displays(id);
-            self.end_session(id, false);
+            self.end_session(id, true);
         }
         // Stalled: bring the cursor home, let go of held keys.
         if let Cursor::Away { peer, .. } = self.cursor
@@ -1050,6 +1062,8 @@ impl Core {
         let motion = self.pending_motion.take();
         let here = self.here;
         let Some(socket) = self.socket.clone() else { return };
+        let detours = self.detours();
+        let lose_direct = self.lose_direct;
         let mut notes = Vec::new();
         for (id, session) in &mut self.sessions {
             let addr = session.addr;
@@ -1081,7 +1095,24 @@ impl Core {
                     if send {
                         let packet = link.packet(now, moved);
                         notes.extend(priority::mark(socket2::SockRef::from(&*socket), Some(addr), Traffic::Voice));
-                        let _ = socket.send_to(&packet, addr);
+                        if !lose_direct {
+                            let _ = socket.send_to(&packet, addr);
+                        }
+                        if astray(link, now) {
+                            if link.detour_until <= now {
+                                notes.push(format!(
+                                    "packets to {addr} seem to go astray: sending copies by broadcast as well"
+                                ));
+                            }
+                            link.detour_until = now + DETOUR_FOR;
+                        }
+                        if now < link.detour_until && now.saturating_sub(link.detoured) >= DETOUR_EVERY {
+                            link.detoured = now;
+                            for to in detours.iter().map(|&(ip, port)| SocketAddr::new(ip, port.unwrap_or(addr.port())))
+                            {
+                                let _ = socket.send_to(&packet, to);
+                            }
+                        }
                     }
                 }
                 Phase::Offered { ephemeral, sent } if now.saturating_sub(*sent) >= OFFER_EVERY => {
@@ -1261,6 +1292,8 @@ impl Core {
                     && self.sessions.get(&id).is_some_and(|s| s.side == Side::Controller && from == s.addr)
                 {
                     self.note(&format!("{} has no such session (it restarted?): starting over", self.who(id)));
+                    // The session lapsed over there: what's lent waits for the new one.
+                    self.hold_displays(id);
                     self.end_session(id, false);
                     self.offer_to_desk(now);
                 }
@@ -1269,9 +1302,35 @@ impl Core {
     }
 
     fn send(&self, packet: &Packet, to: SocketAddr) {
-        if let Some(socket) = &self.socket {
+        if let Some(socket) = &self.socket
+            && !self.lose_direct
+        {
             let _ = socket.send_to(&packet.encode(), to);
         }
+    }
+
+    /// Sends a handshake packet straight to `to` and by the detour as well: right after a
+    /// computer hops between its router's bands, packets straight to it can go astray for half
+    /// a minute while broadcasts still arrive. Only for packets that name their session, which
+    /// any other computer hearing them ignores.
+    fn send_both_ways(&self, packet: &Packet, to: SocketAddr) {
+        self.send(packet, to);
+        let Some(socket) = &self.socket else { return };
+        let bytes = packet.encode();
+        for (ip, port) in self.detours() {
+            let _ = socket.send_to(&bytes, SocketAddr::new(ip, port.unwrap_or(to.port())));
+        }
+    }
+
+    /// Where copies go when packets straight to the other computer seem lost: each network's
+    /// broadcast address (on the other computer's port), and the addresses typed in.
+    fn detours(&self) -> Vec<(IpAddr, Option<u16>)> {
+        let mut detours = vec![(IpAddr::V4(Ipv4Addr::BROADCAST), None)];
+        detours.extend(self.networks.iter().map(|&(_, broadcast)| (IpAddr::V4(broadcast), None)));
+        detours.extend(self.typed.iter().map(|typed| (typed.ip(), Some(typed.port()))));
+        detours.sort();
+        detours.dedup();
+        detours
     }
 
     fn offered(&mut self, id: Id, key: Key, session: u32, commitment: [u8; 32], from: SocketAddr, now: u64) {
@@ -1291,7 +1350,7 @@ impl Core {
                         session,
                         ephemeral: ephemeral.key,
                     };
-                    self.send(&answer, from);
+                    self.send_both_ways(&answer, from);
                 }
                 return;
             }
@@ -1318,12 +1377,14 @@ impl Core {
         if self.sessions.get(&id).is_some_and(|s| s.side == Side::Controlled) {
             // A new session from the same controller replaces the old one (it restarted).
             self.note(&format!("{} started a new session: replacing the old one", self.who(id)));
+            // Its old session lapsed: a screen lent to it carries on in the new one.
+            self.hold_displays(id);
             self.end_session(id, false);
         }
         self.sessions.remove(&id);
         let ephemeral = Ephemeral::generate();
         let answer = Packet::Answer { id: self.identity.id, key: self.identity.key, session, ephemeral: ephemeral.key };
-        self.send(&answer, from);
+        self.send_both_ways(&answer, from);
         let phase = Phase::Answered { ephemeral, commit: commitment, peer_key: key };
         self.sessions.insert(
             id,
@@ -1358,7 +1419,7 @@ impl Core {
             self.sessions.remove(&id);
             return;
         };
-        self.send(&Packet::Reveal { session, ephemeral: ephemeral.key }, from);
+        self.send_both_ways(&Packet::Reveal { session, ephemeral: ephemeral.key }, from);
         let code = agreed.code;
         let link = Link::new(session, agreed, now);
         let trusted = self.trusts(id, &key);
@@ -1375,7 +1436,7 @@ impl Core {
     fn reveal_again(&self, id: Id, to: SocketAddr) {
         let Some(session) = self.sessions.get(&id) else { return };
         if let Some(ephemeral) = session.revealed {
-            self.send(&Packet::Reveal { session: session.id, ephemeral }, to);
+            self.send_both_ways(&Packet::Reveal { session: session.id, ephemeral }, to);
         }
     }
 
@@ -2428,6 +2489,8 @@ impl Core {
             #[cfg(test)]
             Control::Deaf(deaf) => self.deaf = deaf,
             #[cfg(test)]
+            Control::LoseDirect(lose) => self.lose_direct = lose,
+            #[cfg(test)]
             Control::CutStream => self.cut_lent_stream(),
             Control::Release => {
                 let controlled: Vec<Id> =
@@ -2727,3 +2790,14 @@ pub fn computer_name() -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether packets between the two seem to go astray one way: this side hasn't heard the other
+/// lately, or the other says it hasn't heard this one (or never has, a while into the link).
+fn astray(link: &Link, now: u64) -> bool {
+    let unheard_here = now.saturating_sub(link.heard) > STALL;
+    let unheard_there = match link.their_wait {
+        Some(wait) => wait > STALL,
+        None => now.saturating_sub(link.born) > STALL,
+    };
+    unheard_here || unheard_there
+}

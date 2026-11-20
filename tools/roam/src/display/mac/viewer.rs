@@ -37,8 +37,9 @@ use crate::display::{Picture, PointerAt, PointerShape, Remote, RemoteSink, Showi
 use crate::keys;
 use crate::layout::Rect;
 
-/// Above every other window, even a full-screen app's.
-const LEVEL: isize = 1000;
+/// Above every other window, even a full-screen app's, but one below the screen saver level, where notchbase's
+/// screenshot and recording pickers sit: armed over a lent screen, they stay on top of its pictures.
+const LEVEL: isize = 999;
 /// How long the main thread may take to put the window up.
 const OPEN_WAIT: Duration = Duration::from_secs(3);
 /// Trackpad scrolling comes in pixels; this many make one wheel notch (as Roam's own input).

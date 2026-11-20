@@ -59,6 +59,14 @@ pub struct Link {
     rtt: Option<f64>,
     pub heard: u64,
     pub sent: u64,
+    /// When the link started.
+    pub born: u64,
+    /// How long the other side had gone without hearing this one when it sent its latest
+    /// packet; `None` until it has heard this one at all.
+    pub their_wait: Option<u64>,
+    /// Until when packets also take the detour (see the engine), and when one last did.
+    pub detour_until: u64,
+    pub detoured: u64,
 }
 
 fn newer(a: u32, b: u32) -> bool {
@@ -88,6 +96,10 @@ impl Link {
             rtt: None,
             heard: now,
             sent: 0,
+            born: now,
+            their_wait: None,
+            detour_until: 0,
+            detoured: 0,
         }
     }
 
@@ -176,6 +188,7 @@ impl Link {
         self.mark(seq);
         self.heard = now;
         self.peer_time = Some((body.time, now));
+        self.their_wait = (body.echo != 0).then_some(u64::from(body.held));
         if body.echo != 0 {
             let rtt = f64::from((now as u32).wrapping_sub(body.echo).wrapping_sub(body.held));
             if rtt < 2_000_000.0 {

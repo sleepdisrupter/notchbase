@@ -226,6 +226,38 @@ fn paired_computers_reconnect_by_themselves() {
 }
 
 #[test]
+fn a_session_lives_through_packets_going_astray_one_way() {
+    let (mut a, mut b) = pair();
+    let (a_id, b_id) = (a.id(), b.id());
+    connect(&mut a, &mut b);
+    // The PC's packets straight to the Mac go missing for longer than a silent session lasts,
+    // as after the PC hops to the router's other band; broadcasts still arrive.
+    b.engine.send(Control::LoseDirect(true));
+    std::thread::sleep(Duration::from_millis(super::DEAD / super::MS + 2_000));
+    assert!(!log_of(&a).contains("session over"), "{}", log_of(&a));
+    assert!(!log_of(&b).contains("session over"), "{}", log_of(&b));
+    assert!(log_of(&b).contains("go astray"), "{}", log_of(&b));
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+}
+
+#[test]
+fn a_session_forms_while_packets_go_astray_one_way() {
+    let (mut a, mut b) = pair();
+    let (a_id, b_id) = (a.id(), b.id());
+    connect(&mut a, &mut b);
+    b.engine.send(Control::LoseDirect(true));
+    // The other one restarts Roam meanwhile: the handshake has to get through as well.
+    let Machine { engine, fake, port, data, .. } = a;
+    drop(engine);
+    std::thread::sleep(Duration::from_millis(300));
+    let mut a = start(data, fake, port, b.port);
+    place(&mut a, &mut b);
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+}
+
+#[test]
 fn declining_stops_the_requests() {
     let (mut a, mut b) = pair();
     let a_id = a.id();
@@ -662,6 +694,26 @@ fn an_extended_display_waits_for_a_session_lost_to_silence() {
     displays::wait("pictures still coming", || viewer.seen.lock().unwrap().pictures.len() > before + 5);
     still_extended(&a, &host, &viewer);
     b.until("still lending", |s| s.lending.as_ref().is_some_and(|l| l.display == 1));
+}
+
+#[test]
+fn an_extended_display_waits_when_only_one_side_went_deaf() {
+    let (mut a, mut b, host, viewer, b_id) = lend_a_screen();
+    let a_id = a.id();
+    // Only the Mac stops hearing: it ends the session, while the PC still hears it until then.
+    b.engine.send(Control::Deaf(true));
+    std::thread::sleep(Duration::from_millis(super::DEAD / super::MS + 1_500));
+    assert!(log_of(&b).contains("session over"), "{}", log_of(&b));
+    assert!(log_of(&b).contains("stays up while"), "{}", log_of(&b));
+    assert!(!log_of(&a).contains("said goodbye"), "the PC must not take the silence for a goodbye: {}", log_of(&a));
+    b.engine.send(Control::Deaf(false));
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+    displays::wait("the PC asking again", || log_of(&a).contains("again: the extended display carries on"));
+    assert!(log_of(&b).contains("again: the lent screen carries on"), "{}", log_of(&b));
+    let before = viewer.seen.lock().unwrap().pictures.len();
+    displays::wait("pictures still coming", || viewer.seen.lock().unwrap().pictures.len() > before + 5);
+    still_extended(&a, &host, &viewer);
 }
 
 #[test]

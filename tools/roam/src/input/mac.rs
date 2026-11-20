@@ -453,9 +453,12 @@ mod wifi {
 # Wi-Fi link (awdl0) stays off, so the Mac's radio stays on the network. When the flag goes
 # stale it comes back on. Remove with: sudo launchctl bootout system/app.notchbase.fast-wifi
 flag=/tmp/notchbase-fast-wifi
-off=0
+# Starting (or restarting) with the link maybe still down: bring it back unless the flag is fresh.
+off=1
 while :; do
-    if [ -f "$flag" ] && [ $(( $(date +%s) - $(stat -f %m "$flag") )) -lt 8 ]; then
+    at=$(stat -f %m "$flag" 2>/dev/null)
+    case "$at" in ''|*[!0-9]*) at=0 ;; esac
+    if [ $(( $(date +%s) - at )) -lt 8 ]; then
         /sbin/ifconfig awdl0 down 2>/dev/null
         off=1
     elif [ "$off" = 1 ]; then
@@ -520,12 +523,14 @@ done
         });
     }
 
-    /// Keeps the flag fresh, or takes it away.
+    /// Keeps the flag fresh, or makes it stale. The flag is never deleted: a helper installed
+    /// by an older Roam checks that the file is there, then reads its age, and crashed when it
+    /// went in between (leaving AirDrop's link down after the next start).
     pub fn flag(on: bool) {
         if on {
             let _ = std::fs::write(FLAG, b"");
-        } else {
-            let _ = std::fs::remove_file(FLAG);
+        } else if let Ok(file) = std::fs::OpenOptions::new().write(true).open(FLAG) {
+            let _ = file.set_modified(std::time::SystemTime::UNIX_EPOCH);
         }
     }
 }
