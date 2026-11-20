@@ -74,7 +74,8 @@ impl Duplicator {
         self.size
     }
 
-    /// Takes updates as they come until `deadline`.
+    /// Takes updates until something changes or `deadline` comes: a change goes to the encoder
+    /// the moment Windows has it, not at the next tick.
     pub fn wait(&mut self, deadline: Instant) -> Result<(), String> {
         loop {
             let now = Instant::now();
@@ -90,6 +91,9 @@ impl Duplicator {
                     let taken = self.take(&duplication, &info, resource);
                     let _ = unsafe { duplication.ReleaseFrame() };
                     taken?;
+                    if self.changed {
+                        return Ok(());
+                    }
                 }
                 Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
                 Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => self.duplication = None,

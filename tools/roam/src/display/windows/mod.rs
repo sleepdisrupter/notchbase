@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::core::PCWSTR;
 
-use super::{Ability, Displays, Feed, Hosted, Panel, Picture, RemoteSink, Showing, Want, h264, nv12};
+use super::{Ability, Displays, Feed, Hosted, Pace, Panel, Picture, RemoteSink, Showing, Want, h264, nv12};
 use crate::layout::Rect;
 
 /// Virtual displays run at this rate: what every screen shows, and what encoders keep up with.
@@ -154,27 +154,52 @@ fn capture(
     let mut encoder = encoder::Encoder::new(size, HZ)?;
     let _ = opened.send(Ok(size));
     let every = Duration::from_secs(1) / HZ;
-    let mut next = Instant::now();
+    let mut pace = Pace::new(every, Instant::now());
     let mut sent = Instant::now() - REFRESH_EVERY;
+    // Whether the network is holding back a change, so each wait is counted once.
+    let mut held_back = false;
+    // Whether the encoder has been sent the screen again to push out a picture it holds.
+    let mut nudged = false;
     while !stop.load(Ordering::Acquire) && !feed.stopped() {
         let now = Instant::now();
-        next = if next + every < now { now + every } else { next + every };
-        duplicator.wait(next)?;
+        let waiting = encoder.held_since().is_some() || duplicator.changed;
+        duplicator.wait(pace.wait_until(now, waiting))?;
+        for data in encoder.drain()? {
+            feed.push(Picture { key: h264::is_key(&data), data });
+        }
+        let now = Instant::now();
+        if !pace.may_encode(now) {
+            continue;
+        }
         let key = feed.key_wanted();
-        if !(duplicator.changed || key || sent.elapsed() >= REFRESH_EVERY) {
+        // An encoder that keeps the last picture until another comes would leave the end of a
+        // movement on its way until the next change: give it the screen once more.
+        let held = !nudged && encoder.held_since().is_some_and(|since| now - since >= every * 2);
+        if !(duplicator.changed || key || held || sent.elapsed() >= REFRESH_EVERY) {
             continue;
         }
         if feed.busy() {
             if key {
                 feed.ask_key();
             }
+            if duplicator.changed && !held_back {
+                feed.count_skipped();
+                held_back = true;
+            }
             continue;
         }
+        held_back = false;
+        let changed = duplicator.changed;
         let nv12 = converter.convert(duplicator.frame());
+        let converted = Instant::now();
         for data in encoder.encode(nv12, key)? {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
-        sent = Instant::now();
+        let encoded = Instant::now();
+        feed.count_encoded(converted - now, encoded - converted);
+        pace.encoded(now);
+        nudged = held && !changed && !key;
+        sent = encoded;
     }
     Ok(())
 }

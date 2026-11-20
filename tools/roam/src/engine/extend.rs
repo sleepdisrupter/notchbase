@@ -27,6 +27,11 @@ use crate::wire::{Id, Message};
 const ASK_FOR: u64 = 6 * super::SECOND;
 /// How often the host checks where the system put its virtual display.
 const CHECK_EVERY: Duration = Duration::from_millis(500);
+/// The host's network send buffer: a few pictures' worth, so a busy network shows up as the
+/// feed being busy within a frame or two, not as a growing delay.
+const SEND_BUFFER: usize = 128 * 1024;
+/// How often the host writes how its pictures went to the log.
+const TALLY_EVERY: Duration = Duration::from_secs(5);
 /// A key picture is asked for at most this often after pictures fail to show.
 const KEY_EVERY: Duration = Duration::from_millis(500);
 
@@ -75,6 +80,8 @@ pub(super) enum ExtendEvent {
     Stream { session: u32, answer: Sender<Option<Grant>> },
     /// The lending side is over.
     LendEnded { serial: u32, why: String },
+    /// A line for the log from the host's side.
+    Note { text: String },
 }
 
 /// What a lending computer needs to show an incoming stream.
@@ -436,6 +443,7 @@ impl Core {
                     self.stop_lending(Some(&why));
                 }
             }
+            ExtendEvent::Note { text } => self.note(&text),
         }
     }
 
@@ -590,6 +598,9 @@ fn run_host(job: &HostJob) -> Result<String, String> {
         .map_err(|err| format!("Couldn't reach {}: {err}", job.want.name))?;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // A small send buffer, as game streaming keeps: pictures that can't go out yet wait in the
+    // feed, where a newer one replaces them, rather than queueing in the network for seconds.
+    let _ = socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER);
     let reader = stream.try_clone().map_err(|err| err.to_string())?;
     let mut out = BufWriter::with_capacity(256 * 1024, stream.try_clone().map_err(|err| err.to_string())?);
     job.hello.write(&mut out).map_err(|err| err.to_string())?;
@@ -621,13 +632,22 @@ fn run_host(job: &HostJob) -> Result<String, String> {
     let mut checked = Instant::now() - CHECK_EVERY;
     let mut was: Option<Option<Rect>> = None;
     let mut why = "Stopped".to_owned();
+    let mut tallied = Instant::now();
+    let _ = job.feed.take_tally();
     while !job.feed.stopped() {
         if let Some(picture) = job.feed.next(Duration::from_millis(40)) {
+            let started = Instant::now();
             let sent = sealer.down(&mut out, &Down::Picture(picture)).and_then(|()| out.flush());
             if let Err(err) = sent {
                 why = format!("The connection dropped: {err}");
                 break;
             }
+            job.feed.count_sent(started.elapsed());
+        }
+        if tallied.elapsed() >= TALLY_EVERY {
+            let text = job.feed.take_tally().line(tallied.elapsed().as_secs_f64());
+            tallied = Instant::now();
+            let _ = job.events.send(Event::Extend(ExtendEvent::Note { text }));
         }
         if checked.elapsed() >= CHECK_EVERY {
             checked = Instant::now();

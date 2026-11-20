@@ -25,8 +25,10 @@ use windows::core::Interface;
 use super::media::{self, pack};
 use crate::display::h264;
 
-/// How long an asynchronous encoder may take to hand a picture back before the next goes in.
-const OUTPUT_WAIT: Duration = Duration::from_millis(25);
+/// How long to wait for an asynchronous encoder to hand a picture straight back. Most do within
+/// this; a slower one's picture is collected on the capture loop's next pass instead of holding
+/// up the next change.
+const OUTPUT_WAIT: Duration = Duration::from_millis(3);
 
 pub struct Encoder {
     transform: IMFTransform,
@@ -35,6 +37,9 @@ pub struct Encoder {
     events: Option<IMFMediaEventGenerator>,
     /// Inputs an asynchronous encoder has asked for and not been given.
     wanted: u32,
+    /// Pictures given to the encoder and not yet back, and since when the oldest has waited.
+    pending: u32,
+    held_since: Option<Instant>,
     provides: bool,
     output_size: u32,
     fps: u32,
@@ -114,6 +119,8 @@ impl Encoder {
                 codec,
                 events,
                 wanted: 0,
+                pending: 0,
+                held_since: None,
                 provides: info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0,
                 output_size: info.cbSize.max(size[0] * size[1]),
                 fps,
@@ -146,6 +153,7 @@ impl Encoder {
             self.wanted -= 1;
             // SAFETY: the encoder asked for this input.
             unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|err| err.message())?;
+            self.given();
             let deadline = Instant::now() + OUTPUT_WAIT;
             let before = out.len();
             while out.len() == before && Instant::now() < deadline {
@@ -156,11 +164,37 @@ impl Encoder {
         } else {
             // SAFETY: a synchronous encoder takes input whenever its output has been drained.
             unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|err| err.message())?;
+            self.given();
             while let Some(picture) = self.take_output()? {
                 out.push(picture);
             }
         }
         Ok(out.into_iter().map(|p| self.with_header(p)).collect())
+    }
+
+    /// The pictures the encoder has finished since it was last asked, without waiting: the
+    /// capture loop calls this every pass, so a picture is sent as soon as it's ready rather
+    /// than when the next change comes along.
+    pub fn drain(&mut self) -> Result<Vec<Vec<u8>>, String> {
+        let mut out = Vec::new();
+        if self.events.is_some() {
+            while self.poll(&mut out)? {}
+        } else if self.pending > 0 {
+            while let Some(picture) = self.take_output()? {
+                out.push(picture);
+            }
+        }
+        Ok(out.into_iter().map(|p| self.with_header(p)).collect())
+    }
+
+    /// Since when the encoder has held a picture it was given, if it has one.
+    pub fn held_since(&self) -> Option<Instant> {
+        self.held_since
+    }
+
+    fn given(&mut self) {
+        self.pending += 1;
+        self.held_since.get_or_insert_with(Instant::now);
     }
 
     /// Handles one waiting event of an asynchronous encoder. Answers whether there was one.
@@ -237,7 +271,10 @@ impl Encoder {
             Err(err) => return Err(err.message()),
         }
         let Some(sample) = sample else { return Ok(None) };
-        Ok(Some(media::bytes(&sample)?))
+        let picture = media::bytes(&sample)?;
+        self.pending = self.pending.saturating_sub(1);
+        self.held_since = if self.pending == 0 { None } else { Some(Instant::now()) };
+        Ok(Some(picture))
     }
 
     fn with_header(&mut self, picture: Vec<u8>) -> Vec<u8> {

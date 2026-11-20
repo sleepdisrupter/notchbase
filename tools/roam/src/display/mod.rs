@@ -29,13 +29,13 @@ mod windows;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::layout::Rect;
 
 /// How many encoded pictures may wait to go out before the host stops encoding new ones: a
 /// slow network then shows fewer pictures, never older ones.
-const MOST_WAITING: usize = 2;
+const MOST_WAITING: usize = 1;
 
 /// A screen that will show another computer's picture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,6 +111,78 @@ struct FeedInner {
     changed: Condvar,
     stopped: AtomicBool,
     key_wanted: AtomicBool,
+    tally: Mutex<Tally>,
+}
+
+/// How the pictures went since the last look, for the log.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tally {
+    /// Pictures the encoder made.
+    pub pictures: u32,
+    /// Changes not encoded because the network was still sending.
+    pub skipped: u32,
+    pub bytes: u64,
+    /// Time spent getting pictures ready for the encoder, and encoding them.
+    pub convert: Duration,
+    pub encode: Duration,
+    /// Pictures sent, the time sending took, and the longest one.
+    pub sent: u32,
+    pub send: Duration,
+    pub longest_send: Duration,
+}
+
+impl Tally {
+    /// One line for the log, over `seconds`.
+    pub fn line(&self, seconds: f64) -> String {
+        let seconds = seconds.max(0.001);
+        let each = |total: Duration, count: u32| total.as_secs_f64() * 1000.0 / f64::from(count.max(1));
+        format!(
+            "extended display, last {seconds:.0} s: {:.0} pictures a second ({} skipped while the network was busy), {:.1} Mbit/s; getting ready {:.1} ms, encoding {:.1} ms, sending {:.1} ms (longest {:.0} ms)",
+            f64::from(self.pictures) / seconds,
+            self.skipped,
+            self.bytes as f64 * 8.0 / seconds / 1_000_000.0,
+            each(self.convert, self.pictures),
+            each(self.encode, self.pictures),
+            each(self.send, self.sent),
+            self.longest_send.as_secs_f64() * 1000.0,
+        )
+    }
+}
+
+/// When the capture loop may encode: as soon as the screen changes, but no more than `every`
+/// apart. Waiting for a fixed tick instead adds up to a whole frame to every change.
+#[derive(Clone, Copy, Debug)]
+pub struct Pace {
+    every: Duration,
+    next: Instant,
+}
+
+impl Pace {
+    /// How long to wait for the screen when nothing is due: the loop still comes round this
+    /// often to send what the encoder finishes, and the occasional refresh.
+    const IDLE: Duration = Duration::from_millis(50);
+    /// How often to look for a picture the encoder is still working on.
+    const POLL: Duration = Duration::from_millis(2);
+
+    pub fn new(every: Duration, now: Instant) -> Self {
+        Self { every, next: now }
+    }
+
+    /// Until when to wait for the screen: until a picture may go again, else for the next
+    /// change (returning at once when one comes), or only briefly while something is waiting:
+    /// a picture in the encoder, or a change the network held back.
+    pub fn wait_until(&self, now: Instant, waiting: bool) -> Instant {
+        if now < self.next { self.next } else { now + if waiting { Self::POLL } else { Self::IDLE } }
+    }
+
+    pub fn may_encode(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    /// A picture went to the encoder at `at`.
+    pub fn encoded(&mut self, at: Instant) {
+        self.next = at + self.every;
+    }
 }
 
 impl Feed {
@@ -127,6 +199,7 @@ impl Feed {
     }
 
     pub fn push(&self, picture: Picture) {
+        self.count(|t| t.bytes += picture.data.len() as u64);
         if let Ok(mut waiting) = self.0.waiting.lock() {
             waiting.push_back(picture);
         }
@@ -154,6 +227,40 @@ impl Feed {
     pub fn stop(&self) {
         self.0.stopped.store(true, Ordering::Release);
         self.0.changed.notify_all();
+    }
+
+    fn count(&self, change: impl FnOnce(&mut Tally)) {
+        if let Ok(mut tally) = self.0.tally.lock() {
+            change(&mut tally);
+        }
+    }
+
+    /// A picture was got ready and encoded, taking these long.
+    pub fn count_encoded(&self, convert: Duration, encode: Duration) {
+        self.count(|t| {
+            t.pictures += 1;
+            t.convert += convert;
+            t.encode += encode;
+        });
+    }
+
+    /// A change wasn't encoded: the network was still sending.
+    pub fn count_skipped(&self) {
+        self.count(|t| t.skipped += 1);
+    }
+
+    /// A picture went out, taking this long to hand to the network.
+    pub fn count_sent(&self, took: Duration) {
+        self.count(|t| {
+            t.sent += 1;
+            t.send += took;
+            t.longest_send = t.longest_send.max(took);
+        });
+    }
+
+    /// What happened since the last call.
+    pub fn take_tally(&self) -> Tally {
+        self.0.tally.lock().map(|mut t| std::mem::take(&mut *t)).unwrap_or_default()
     }
 
     /// The next picture to send, waiting at most `wait`.
@@ -300,13 +407,63 @@ mod tests {
         assert!(!feed.key_wanted());
         assert!(!feed.busy());
         feed.push(Picture { key: true, data: vec![1] });
+        assert!(feed.busy(), "one picture waiting is enough: the next one waits for the network");
         feed.push(Picture { key: false, data: vec![2] });
-        assert!(feed.busy());
         assert_eq!(feed.next(Duration::ZERO).map(|p| p.data), Some(vec![1]));
-        assert!(!feed.busy());
+        assert!(feed.busy());
+        assert_eq!(feed.take_tally().bytes, 2);
+        assert_eq!(feed.take_tally(), Tally::default(), "taking the tally starts it again");
         feed.stop();
         assert!(feed.stopped());
         assert_eq!(feed.next(Duration::from_secs(5)).map(|p| p.data), Some(vec![2]));
+        assert!(!feed.busy());
         assert_eq!(feed.next(Duration::from_secs(5)), None, "stopped and empty: no wait");
+    }
+
+    #[test]
+    fn a_change_is_encoded_at_once_but_never_faster_than_the_rate() {
+        let every = Duration::from_millis(16);
+        let start = Instant::now();
+        let mut pace = Pace::new(every, start);
+        assert!(pace.may_encode(start));
+        // Nothing due: wait for the next change, briefly while the encoder is busy.
+        assert_eq!(pace.wait_until(start, false), start + Pace::IDLE);
+        assert_eq!(pace.wait_until(start, true), start + Pace::POLL);
+        pace.encoded(start);
+        // Just after one, the next waits out the rest of the frame, gathering changes.
+        let soon = start + Duration::from_millis(5);
+        assert!(!pace.may_encode(soon));
+        assert_eq!(pace.wait_until(soon, false), start + every);
+        assert!(pace.may_encode(start + every));
+    }
+
+    #[test]
+    fn the_tally_reads_as_one_line() {
+        let tally = Tally {
+            pictures: 300,
+            skipped: 4,
+            bytes: 7_500_000,
+            convert: Duration::from_millis(600),
+            encode: Duration::from_millis(900),
+            sent: 300,
+            send: Duration::from_millis(300),
+            longest_send: Duration::from_millis(21),
+        };
+        assert_eq!(
+            tally.line(5.0),
+            "extended display, last 5 s: 60 pictures a second (4 skipped while the network was busy), 12.0 Mbit/s; getting ready 2.0 ms, encoding 3.0 ms, sending 1.0 ms (longest 21 ms)"
+        );
+    }
+
+    #[test]
+    fn the_feed_tally_is_unused_until_asked() {
+        let feed = Feed::new();
+        feed.count_encoded(Duration::from_millis(2), Duration::from_millis(3));
+        feed.count_skipped();
+        feed.count_sent(Duration::from_millis(9));
+        feed.count_sent(Duration::from_millis(4));
+        let tally = feed.take_tally();
+        assert_eq!((tally.pictures, tally.skipped, tally.sent), (1, 1, 2));
+        assert_eq!(tally.longest_send, Duration::from_millis(9));
     }
 }
