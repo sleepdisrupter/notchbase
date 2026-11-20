@@ -73,6 +73,9 @@ pub struct Beacon {
     pub lends: bool,
     /// Draws the host's pointer itself on a screen it lends, from news sent apart.
     pub draws_pointer: bool,
+    /// Takes that pointer's place from the session's packets too (`Body::pointer`), not only
+    /// from the picture stream.
+    pub fast_pointer: bool,
     pub ppu: f32,
     pub displays: Vec<Rect>,
     pub name: String,
@@ -158,7 +161,8 @@ impl Packet {
                 out.u8(u8::from(beacon.open)
                     | (u8::from(beacon.busy) << 1)
                     | (u8::from(beacon.lends) << 2)
-                    | (u8::from(beacon.draws_pointer) << 3));
+                    | (u8::from(beacon.draws_pointer) << 3)
+                    | (u8::from(beacon.fast_pointer) << 4));
                 out.f32(beacon.ppu);
                 let displays = &beacon.displays[..beacon.displays.len().min(16)];
                 out.u8(displays.len() as u8);
@@ -235,6 +239,7 @@ impl Packet {
                     busy: flags & 2 != 0,
                     lends: flags & 4 != 0,
                     draws_pointer: flags & 8 != 0,
+                    fast_pointer: flags & 16 != 0,
                     ppu,
                     displays,
                     name,
@@ -476,6 +481,15 @@ pub struct Motion {
     pub at: [f32; 2],
 }
 
+/// Where the host's pointer is on a screen the other computer lends it, in that screen's
+/// picture pixels (the pointer image's top left). The newest wins, like `Motion`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pointer {
+    pub seq: u32,
+    pub at: [i32; 2],
+    pub visible: bool,
+}
+
 /// The inside of a sealed packet.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Body {
@@ -489,7 +503,14 @@ pub struct Body {
     pub motion: Option<Motion>,
     /// Reliable messages, each with its number.
     pub messages: Vec<(u32, Message)>,
+    /// After the messages, where older versions stop reading: they never see it.
+    pub pointer: Option<Pointer>,
 }
+
+/// Marks the pointer's news after a body's messages.
+const POINTER_NEWS: u8 = 1;
+/// The bytes the pointer's news takes.
+pub const POINTER_SIZE: usize = 14;
 
 impl Body {
     pub fn encode(&self) -> Vec<u8> {
@@ -513,6 +534,13 @@ impl Body {
             out.extend_from_slice(&seq.to_le_bytes());
             message.encode(&mut out);
         }
+        if let Some(pointer) = self.pointer {
+            out.push(POINTER_NEWS);
+            out.extend_from_slice(&pointer.seq.to_le_bytes());
+            out.extend_from_slice(&pointer.at[0].to_le_bytes());
+            out.extend_from_slice(&pointer.at[1].to_le_bytes());
+            out.push(u8::from(pointer.visible));
+        }
         out
     }
 
@@ -532,7 +560,16 @@ impl Body {
             let seq = input.u32()?;
             messages.push((seq, Message::decode(&mut input)?));
         }
-        Some(Body { ack, time, echo, held, motion, messages })
+        // Anything after the messages is news a newer version added; what isn't known is left.
+        let pointer = match input.u8() {
+            Some(POINTER_NEWS) => (|| {
+                let seq = input.u32()?;
+                let at = [input.u32()? as i32, input.u32()? as i32];
+                Some(Pointer { seq, at, visible: input.u8()? != 0 })
+            })(),
+            _ => None,
+        };
+        Some(Body { ack, time, echo, held, motion, messages, pointer })
     }
 }
 
@@ -629,6 +666,7 @@ mod tests {
                 busy: false,
                 lends: true,
                 draws_pointer: true,
+                fast_pointer: true,
                 ppu: 1.5,
                 displays: vec![Rect::new(-1920.0, 0.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
                 name: "Desk PC".into(),
@@ -670,8 +708,12 @@ mod tests {
                 (17, Message::Lent { display: 1, pixels: [2560, 1440], hz: 60, scale: 1.0 }),
                 (18, Message::Unlend { display: 1, why: "Stopped on the Mac".into() }),
             ],
+            pointer: Some(Pointer { seq: 3, at: [-4, 1080], visible: true }),
         };
-        assert_eq!(Body::decode(&body.encode()), Some(body));
+        assert_eq!(Body::decode(&body.encode()), Some(body.clone()));
+        // A version that knows no pointer news still reads the rest.
+        let bytes = body.encode();
+        assert_eq!(bytes.len(), Body { pointer: None, ..body.clone() }.encode().len() + POINTER_SIZE);
     }
 
     #[test]
@@ -693,6 +735,7 @@ mod tests {
             busy: true,
             lends: false,
             draws_pointer: false,
+            fast_pointer: false,
             ppu: 1.0,
             displays: vec![],
             name: "é".repeat(40),

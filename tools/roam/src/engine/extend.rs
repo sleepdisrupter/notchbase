@@ -613,6 +613,50 @@ impl Core {
 
     /// The lending computer's own mouse or keyboard, over its lent screen: it works this
     /// computer's cursor there.
+    /// This computer's cursor is at `at` (`None`: it left for another computer). Over a virtual
+    /// display whose lending computer draws the pointer, that computer hears where the pointer
+    /// image goes in the session's packets, straight from the mouse hook: ahead of the
+    /// pictures, without waiting for the screen to be captured, and newest-wins like any
+    /// cursor move.
+    pub(super) fn quick_pointer(&mut self, at: Option<[f64; 2]>) {
+        let mut over = None;
+        if let Some(at) = at {
+            for (peer, entry) in &self.extended {
+                let (Some(rect), Some(feed)) = (entry.rect, &entry.feed) else { continue };
+                if !rect.contains(at) || !self.peers.get(peer).is_some_and(|p| p.fast_pointer) {
+                    continue;
+                }
+                let Some(cursor) = feed.cursor() else { continue };
+                feed.go_quick();
+                over = Some((*peer, pointer_image_at(rect, at, cursor), cursor.visible));
+                break;
+            }
+        }
+        let was = self.pointer_over;
+        // It left the display it was over: hide it there.
+        if let Some((peer, last)) = was
+            && over.is_none_or(|(now_over, ..)| now_over != peer)
+            && let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live)
+        {
+            link.pointer = Some((last, false));
+        }
+        self.pointer_over = over.map(|(peer, image, _)| (peer, image));
+        if let Some((peer, image, visible)) = over
+            && was != Some((peer, image))
+            && let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live)
+        {
+            link.pointer = Some((image, visible));
+        }
+    }
+
+    /// The computer this one lends a screen to says where its pointer is on it.
+    pub(super) fn lent_pointer(&mut self, from: Id, pointer: crate::wire::Pointer) {
+        let Some(lending) = self.lending.as_ref().filter(|l| l.to == from) else { return };
+        if let Some(shown) = lending.shown.lock().ok().as_mut().and_then(|s| s.as_mut()) {
+            shown.showing.pointer(display::PointerAt { at: pointer.at, visible: pointer.visible });
+        }
+    }
+
     fn remote(&mut self, rect: Rect, remote: Remote) {
         match remote {
             // Off the lent screen: an older lending computer also passes on moves its window
@@ -926,6 +970,8 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
     if back.is_err() {
         return dropped("Couldn't start the display".into());
     }
+    // Whether the pointer was last said to show.
+    let mut shown: Option<bool> = None;
     let ended = loop {
         if job.feed.stopped() {
             let _ = sealer.down(&mut out, &Down::Bye).and_then(|()| out.flush());
@@ -945,8 +991,12 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
         if let Some(shape) = news.shape {
             sent = sealer.down(&mut out, &Down::Shape(shape));
         }
-        if let Some(at) = news.at.filter(|_| sent.is_ok()) {
+        // Once the engine sends the pointer's place the quick way, the stream only says when it
+        // shows or hides: an older place from here would pull it back.
+        let at = news.at.filter(|at| !job.feed.quick() || shown != Some(at.visible));
+        if let Some(at) = at.filter(|_| sent.is_ok()) {
             sent = sealer.down(&mut out, &Down::Pointer(at));
+            shown = Some(at.visible);
         }
         if pointed && sent.is_ok() {
             sent = out.flush();
@@ -965,6 +1015,16 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
     };
     let _ = stream.shutdown(Shutdown::Both);
     ended
+}
+
+/// Where the pointer image's top left goes in the pictures of the virtual display at `rect`
+/// (this computer's units), for the cursor at `at`.
+fn pointer_image_at(rect: Rect, at: [f64; 2], cursor: display::Cursor) -> [i32; 2] {
+    let scale = [f64::from(cursor.size[0]) / rect.w.max(1.0), f64::from(cursor.size[1]) / rect.h.max(1.0)];
+    [
+        ((at[0] - rect.x) * scale[0]).round() as i32 - cursor.hotspot[0],
+        ((at[1] - rect.y) * scale[1]).round() as i32 - cursor.hotspot[1],
+    ]
 }
 
 // ---------------------------------------------------------------- the lending side's threads

@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::core::PCWSTR;
 
-use super::{Ability, Displays, Feed, Hosted, Pace, Panel, Picture, RemoteSink, Showing, Want, h264};
+use super::{Ability, Cursor, Displays, Feed, Hosted, Pace, Panel, Picture, RemoteSink, Showing, Want, h264};
 use crate::layout::Rect;
 
 /// Virtual displays run at this rate: what every screen shows, and what encoders keep up with.
@@ -205,6 +205,9 @@ fn capture(
         }
         let (at, shape) = duplicator.take_pointer();
         feed.pointer(at, shape);
+        if apart && let Some((hotspot, visible)) = duplicator.cursor() {
+            feed.set_cursor(Cursor { hotspot, visible, size });
+        }
         for data in or_restart!(pictures.drain(&mut duplicator)) {
             feed.push(Picture { key: h264::is_key(&data), data });
         }

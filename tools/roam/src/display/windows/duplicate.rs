@@ -42,6 +42,8 @@ pub struct Duplicator {
     pub changed: bool,
     pointer: Pointer,
     shape: Vec<u8>,
+    /// The cursor's spot in the pointer image.
+    hotspot: [i32; 2],
     /// Whether the pointer goes apart from the pictures, which then leave it out, and what's
     /// new about it since the last `take_pointer`.
     apart: bool,
@@ -80,6 +82,7 @@ impl Duplicator {
             changed: true,
             pointer: Pointer::default(),
             shape: Vec::new(),
+            hotspot: [0, 0],
             apart: false,
             moved: false,
             reshaped: false,
@@ -119,6 +122,13 @@ impl Duplicator {
             visible: self.pointer.visible && self.pointer.shape.is_some(),
         });
         (at, shape)
+    }
+
+    /// What the engine needs to place the pointer image from its own mouse hook: the cursor's
+    /// spot in the image, and whether it shows. `None` until the shape is known.
+    pub fn cursor(&self) -> Option<([i32; 2], bool)> {
+        self.pointer.shape.as_ref()?;
+        Some((self.hotspot, self.pointer.visible))
     }
 
     /// Takes updates until something changes or `deadline` comes: a change goes to the encoder
@@ -292,6 +302,7 @@ impl Duplicator {
             t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 => Kind::MaskedColor,
             _ => return,
         };
+        self.hotspot = [info.HotSpot.x, info.HotSpot.y];
         self.pointer.shape = Some(Shape {
             kind,
             width: info.Width as usize,

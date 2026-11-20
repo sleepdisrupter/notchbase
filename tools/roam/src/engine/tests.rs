@@ -360,6 +360,7 @@ mod displays {
         pub pictures: Vec<Picture>,
         pub gone: bool,
         pub remote: Option<RemoteSink>,
+        pub pointers: Vec<crate::display::PointerAt>,
     }
 
     #[derive(Clone)]
@@ -412,6 +413,10 @@ mod displays {
             self.0.lock().unwrap().pictures.push(picture.clone());
             Ok(())
         }
+
+        fn pointer(&mut self, at: crate::display::PointerAt) {
+            self.0.lock().unwrap().pointers.push(at);
+        }
     }
 
     impl Drop for PretendShowing {
@@ -429,6 +434,10 @@ mod displays {
             true
         }
 
+        fn draws_pointer(&self) -> bool {
+            true
+        }
+
         fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
             self.seen.lock().unwrap().wants.push(want.clone());
             let rect = Rect::new(
@@ -438,6 +447,10 @@ mod displays {
                 f64::from(want.panel.pixels[1]),
             );
             self.fake.state().screens.push(rect);
+            if want.pointer_apart {
+                let size = [rect.w as u32, rect.h as u32];
+                feed.set_cursor(crate::display::Cursor { hotspot: [2, 3], visible: true, size });
+            }
             let sending = feed.clone();
             std::thread::spawn(move || {
                 let mut n = 0u8;
@@ -665,4 +678,24 @@ fn moves_the_lent_window_hears_off_the_lent_screen_leave_the_cursor_where_it_is(
     let last = b.fake.state().played.iter().rev().find_map(|p| if let Play::Move(at) = p { Some(*at) } else { None });
     let last = last.unwrap();
     assert!(last[0] > 300.0 && last[0] < 600.0, "the cursor went on toward the middle: {last:?}");
+}
+
+#[test]
+fn the_pointer_over_an_extended_display_goes_the_quick_way() {
+    let (a, _b, _host, viewer, _b_id) = lend_a_screen();
+    a.wait_for("listening", |s| s.sink.is_some());
+    // The virtual display sits at (3432, 0), 2560 by 1440.
+    for x in [100.0, 140.0, 180.0] {
+        a.fake.input(Input::Move { at: [3432.0 + x, 50.0], delta: [1.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    displays::wait("the pointer drawn on the Mac", || {
+        viewer.seen.lock().unwrap().pointers.contains(&crate::display::PointerAt { at: [178, 47], visible: true })
+    });
+    // Back on the PC's own screen: it hides on the lent one.
+    a.fake.input(Input::Move { at: [900.0, 500.0], delta: [-1.0, 0.0] });
+    displays::wait("the pointer hidden on the Mac", || {
+        viewer.seen.lock().unwrap().pointers.last()
+            == Some(&crate::display::PointerAt { at: [178, 47], visible: false })
+    });
 }

@@ -357,6 +357,7 @@ struct Peer {
     busy: bool,
     lends: bool,
     draws_pointer: bool,
+    fast_pointer: bool,
     displays: Vec<Rect>,
     ppu: f64,
     seen: u64,
@@ -585,6 +586,9 @@ struct Core {
     /// This computer's screen, lent to the computer controlling it.
     lending: Option<Lending>,
     extend_serial: u32,
+    /// The extended display this computer's cursor is over, whose lending computer is told
+    /// where the pointer is the quick way, and where it was last said to be.
+    pointer_over: Option<(Id, [i32; 2])>,
     #[cfg(test)]
     deaf: bool,
 }
@@ -676,6 +680,7 @@ impl Core {
             extended: HashMap::new(),
             lending: None,
             extend_serial: 0,
+            pointer_over: None,
             #[cfg(test)]
             deaf: false,
         };
@@ -852,6 +857,12 @@ impl Core {
         }
         if self.smoother.pending() {
             next = next.min(now + FRAME);
+        }
+        if let Some((peer, _)) = self.pointer_over
+            && let Some(Phase::Live { link }) = self.sessions.get(&peer).map(|s| &s.phase)
+            && link.pointer.is_some()
+        {
+            next = next.min((link.sent + COALESCE).max(now + 100));
         }
         if self.moving
             && let Some(sent) = self.away_link_sent()
@@ -1037,7 +1048,8 @@ impl Core {
         let mut notes = Vec::new();
         for (id, session) in &mut self.sessions {
             let addr = session.addr;
-            let busy = away == Some(*id) || (here && session.side == Side::Controlled);
+            let pointing = self.pointer_over.is_some_and(|(over, _)| over == *id);
+            let busy = away == Some(*id) || (here && session.side == Side::Controlled) || pointing;
             match &mut session.phase {
                 Phase::Pairing { link, .. } | Phase::Live { link } => {
                     let mine = away == Some(*id);
@@ -1046,6 +1058,7 @@ impl Core {
                     let every = if busy { BUSY_EVERY } else { IDLE_EVERY };
                     let still = mine && self.moving && motion.is_none() && since >= STILL;
                     let send = (mine && motion.is_some() && paced)
+                        || (link.pointer.is_some() && paced)
                         || (urgent && mine)
                         || link.due(now)
                         || since >= every
@@ -1099,6 +1112,7 @@ impl Core {
             busy,
             lends: self.displays.lends(),
             draws_pointer: self.displays.draws_pointer(),
+            fast_pointer: self.displays.draws_pointer(),
             ppu: ppu as f32,
             displays,
             name: self.name(),
@@ -1161,6 +1175,7 @@ impl Core {
             busy: beacon.busy,
             lends: beacon.lends,
             draws_pointer: beacon.draws_pointer,
+            fast_pointer: beacon.fast_pointer,
             displays: beacon.displays,
             ppu: f64::from(beacon.ppu),
             seen: now,
@@ -1408,6 +1423,7 @@ impl Core {
                     busy: false,
                     lends: false,
                     draws_pointer: false,
+                    fast_pointer: false,
                     displays: Vec::new(),
                     ppu: 1.0,
                     seen: now,
@@ -1436,6 +1452,9 @@ impl Core {
             peer.seen = now;
         }
         let controlled = side == Side::Controlled && existing.is_live();
+        if let Some(pointer) = incoming.pointer {
+            self.lent_pointer(id, pointer);
+        }
         let mut motion = incoming.motion.map(|m| m.at);
         if controlled && self.here && motion.is_none() {
             // A packet without movement: the controller's mouse is still.
@@ -1832,6 +1851,7 @@ impl Core {
         match self.cursor {
             Cursor::Home => {
                 let Input::Move { at, delta } = input else { return };
+                self.quick_pointer(Some(at));
                 // Only the left button may be held across, and only while dragging files.
                 let dragging = self.held_buttons == 1;
                 if (self.held_buttons != 0 && !dragging) || self.locked {
@@ -1996,6 +2016,8 @@ impl Core {
     }
 
     fn enter(&mut self, peer: Id, arrive: [f64; 2], left_from: [f64; 2], now: u64) {
+        // Off this computer's screens, virtual ones too.
+        self.quick_pointer(None);
         let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) else { return };
         link.queue(Message::Enter { at: [arrive[0] as f32, arrive[1] as f32] });
         let rtt = link.rtt().map_or(-1.0, |us| us / 1000.0);

@@ -144,6 +144,11 @@ struct FeedInner {
     stopped: AtomicBool,
     key_wanted: AtomicBool,
     pointer_wanted: AtomicBool,
+    /// What the capture knows of the pointer, for sending its place the quick way.
+    cursor: Mutex<Option<Cursor>>,
+    /// The pointer's place goes the quick way, in the session's packets: the picture stream
+    /// then only says when it shows or hides.
+    quick: AtomicBool,
     tally: Mutex<Tally>,
     notes: Mutex<Vec<String>>,
 }
@@ -160,6 +165,17 @@ impl Waiting {
     fn any(&self) -> bool {
         !self.pictures.is_empty() || self.pointer.is_some() || self.shape.is_some()
     }
+}
+
+/// What the host's capture knows of its pointer: enough for the engine to say where the
+/// pointer image goes from where its own mouse hook has the cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    /// The point of the pointer image that is the cursor's spot, in its pixels.
+    pub hotspot: [i32; 2],
+    pub visible: bool,
+    /// The pictures' size, in pixels.
+    pub size: [u32; 2],
 }
 
 /// The pointer's news, taken from the feed: a new shape (first), then where it is.
@@ -282,6 +298,26 @@ impl Feed {
             }
         }
         self.0.changed.notify_all();
+    }
+
+    /// The capture's latest word on the pointer.
+    pub fn set_cursor(&self, cursor: Cursor) {
+        if let Ok(mut slot) = self.0.cursor.lock() {
+            *slot = Some(cursor);
+        }
+    }
+
+    pub fn cursor(&self) -> Option<Cursor> {
+        self.0.cursor.lock().ok().and_then(|c| *c)
+    }
+
+    /// The engine sends the pointer's place the quick way from now on.
+    pub fn go_quick(&self) {
+        self.0.quick.store(true, Ordering::Release);
+    }
+
+    pub fn quick(&self) -> bool {
+        self.0.quick.load(Ordering::Acquire)
     }
 
     /// The pointer's news since the last call.
