@@ -73,6 +73,17 @@ pub struct Pointer {
 }
 
 impl Pointer {
+    /// The part of a `size` frame at `offset` the pointer covers, as left, top, width and
+    /// height: drawing it on the graphics card copies just this part off and back.
+    pub fn area(&self, size: [usize; 2], offset: [i32; 2]) -> Option<[usize; 4]> {
+        let shape = self.shape.as_ref().filter(|_| self.visible)?;
+        let [left, top] = [0, 1].map(|axis| i64::from(self.at[axis]) - i64::from(offset[axis]));
+        let [right, bottom] = [left + shape.width as i64, top + shape.rows() as i64];
+        let [x0, y0] = [left.max(0), top.max(0)];
+        let [x1, y1] = [right.min(size[0] as i64), bottom.min(size[1] as i64)];
+        (x1 > x0 && y1 > y0).then(|| [x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize])
+    }
+
     pub fn draw(&self, frame: &mut [u8], size: [usize; 2], offset: [i32; 2]) {
         let Some(shape) = self.shape.as_ref().filter(|_| self.visible) else { return };
         let [left, top] = [0, 1].map(|axis| i64::from(self.at[axis]) - i64::from(offset[axis]));
@@ -98,6 +109,21 @@ impl Pointer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pointer_covers_only_what_it_overlaps() {
+        let shape = Shape { kind: Kind::Monochrome, width: 32, height: 64, pitch: 4, pixels: vec![0; 256] };
+        let mut pointer = Pointer { shape: Some(shape), at: [110, 210], visible: true };
+        // A monochrome shape is half as tall as its masks; the frame starts at (100, 200).
+        assert_eq!(pointer.area([1920, 1080], [100, 200]), Some([10, 10, 32, 32]));
+        pointer.at = [90, 1270];
+        assert_eq!(pointer.area([1920, 1080], [100, 200]), Some([0, 1070, 22, 10]), "cut at the edges");
+        pointer.at = [5000, 210];
+        assert_eq!(pointer.area([1920, 1080], [100, 200]), None, "off the frame");
+        pointer.at = [110, 210];
+        pointer.visible = false;
+        assert_eq!(pointer.area([1920, 1080], [100, 200]), None, "hidden");
+    }
 
     fn frame(width: usize, height: usize, bgra: [u8; 4]) -> Vec<u8> {
         bgra.repeat(width * height)

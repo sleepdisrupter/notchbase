@@ -6,8 +6,10 @@
 mod decoder;
 mod duplicate;
 mod encoder;
+mod gpu;
 mod media;
 mod monitor;
+mod pictures;
 mod vdd;
 mod viewer;
 
@@ -25,7 +27,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::core::PCWSTR;
 
-use super::{Ability, Displays, Feed, Hosted, Pace, Panel, Picture, RemoteSink, Showing, Want, h264, nv12};
+use super::{Ability, Displays, Feed, Hosted, Pace, Panel, Picture, RemoteSink, Showing, Want, h264};
 use crate::layout::Rect;
 
 /// Virtual displays run at this rate: what every screen shows, and what encoders keep up with.
@@ -152,9 +154,7 @@ fn capture(
         return Err(format!("The virtual display is an odd size ({width}x{height})"));
     }
     let size = [width, height];
-    let mut converter = nv12::Converter::new(size, size);
-    let mut encoder = encoder::Encoder::new(size, HZ)?;
-    feed.note(format!("extended display encoder: {}", encoder.about));
+    let mut pictures = pictures::Pictures::new(&mut duplicator, size, HZ)?;
     let _ = opened.send(Ok(size));
     let every = Duration::from_secs(1) / HZ;
     let mut pace = Pace::new(every, Instant::now());
@@ -167,10 +167,13 @@ fn capture(
         let now = Instant::now();
         // Look again soon while a change waits for the network, or the encoder has had a
         // picture only a short while; one it keeps for good mustn't keep the loop spinning.
-        let recent = encoder.held_since().is_some_and(|since| now.saturating_duration_since(since) < HELD_LOOK);
+        for text in pictures.take_notes() {
+            feed.note(text);
+        }
+        let recent = pictures.held_since().is_some_and(|since| now.saturating_duration_since(since) < HELD_LOOK);
         let waiting = recent || duplicator.changed;
         duplicator.wait(pace.wait_until(now, waiting))?;
-        for data in encoder.drain()? {
+        for data in pictures.drain(&mut duplicator)? {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
         let now = Instant::now();
@@ -181,7 +184,7 @@ fn capture(
         // An encoder that keeps the last picture until another comes would leave the end of a
         // movement on its way until the next change: give it the screen once more.
         let held =
-            !nudged && encoder.held_since().is_some_and(|since| now.saturating_duration_since(since) >= every * 2);
+            !nudged && pictures.held_since().is_some_and(|since| now.saturating_duration_since(since) >= every * 2);
         if !(duplicator.changed || key || held || sent.elapsed() >= REFRESH_EVERY) {
             continue;
         }
@@ -197,16 +200,14 @@ fn capture(
         }
         held_back = false;
         let changed = duplicator.changed;
-        let nv12 = converter.convert(duplicator.frame());
-        let converted = Instant::now();
-        for data in encoder.encode(nv12, key)? {
+        let step = pictures.encode(&mut duplicator, key)?;
+        for data in step.pictures {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
-        let encoded = Instant::now();
-        feed.count_encoded(converted - now, encoded - converted);
+        feed.count_encoded(step.ready, step.encode);
         pace.encoded(now);
         nudged = held && !changed && !key;
-        sent = encoded;
+        sent = Instant::now();
     }
     Ok(())
 }

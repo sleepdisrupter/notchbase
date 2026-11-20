@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::LUID;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncMPVDefaultBPictureCount,
     CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
@@ -17,6 +19,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
     MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
     MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
+};
+use windows::Win32::Media::MediaFoundation::{
+    IMF2DBuffer, IMFDXGIDeviceManager, MF_SA_D3D11_AWARE, MFCreateAttributes, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFT_ENUM_ADAPTER_LUID, MFT_MESSAGE_SET_D3D_MANAGER, MFTEnum2,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::{VARIANT, VT_UI4};
@@ -48,6 +54,8 @@ pub struct Encoder {
     time: i64,
     /// Which encoder this is and how it's set, for the log.
     pub about: String,
+    /// For an encoder that takes pictures on the graphics card: the card it shares.
+    _manager: Option<IMFDXGIDeviceManager>,
 }
 
 impl Encoder {
@@ -59,7 +67,7 @@ impl Encoder {
             let name = friendly_name(&activate);
             // SAFETY: plain COM activation; a failure tries the next one.
             let Ok(transform) = (unsafe { activate.ActivateObject::<IMFTransform>() }) else { continue };
-            match Self::set_up(transform, size, fps, bitrate, &name) {
+            match Self::set_up(transform, size, fps, bitrate, &name, None) {
                 Ok(encoder) => return Ok(encoder),
                 Err(err) => {
                     why = err;
@@ -70,10 +78,44 @@ impl Encoder {
         // SAFETY: Windows' own software encoder.
         let transform: IMFTransform = unsafe { CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER) }
             .map_err(|err| format!("No H.264 encoder: {} {why}", err.message()))?;
-        Self::set_up(transform, size, fps, bitrate, "Windows' software H.264 encoder")
+        Self::set_up(transform, size, fps, bitrate, "Windows' software H.264 encoder", None)
     }
 
-    fn set_up(transform: IMFTransform, size: [u32; 2], fps: u32, bitrate: u32, name: &str) -> Result<Self, String> {
+    /// An encoder on the graphics card `device` is on, taking its NV12 textures as they are,
+    /// with nothing copied off the card. Fails when the card has none that can.
+    pub fn on_card(size: [u32; 2], fps: u32, device: &ID3D11Device, luid: LUID) -> Result<Self, String> {
+        media::start()?;
+        let err = |err: windows::core::Error| err.message();
+        let (mut token, mut manager) = (0, None);
+        // SAFETY: Media Foundation makes the manager, which then holds the device.
+        unsafe { MFCreateDXGIDeviceManager(&mut token, &mut manager) }.map_err(err)?;
+        let manager = manager.ok_or("No device manager")?;
+        unsafe { manager.ResetDevice(device, token) }.map_err(err)?;
+        let bitrate = bitrate(size, fps);
+        let mut why = "the graphics card has no H.264 encoder".to_owned();
+        for activate in hardware_encoders_on(luid) {
+            let name = friendly_name(&activate);
+            // SAFETY: plain COM activation; a failure tries the next one.
+            let Ok(transform) = (unsafe { activate.ActivateObject::<IMFTransform>() }) else { continue };
+            match Self::set_up(transform, size, fps, bitrate, &name, Some(&manager)) {
+                Ok(encoder) => return Ok(encoder),
+                Err(err) => {
+                    why = format!("{name}: {err}");
+                    let _ = unsafe { activate.ShutdownObject() };
+                }
+            }
+        }
+        Err(why)
+    }
+
+    fn set_up(
+        transform: IMFTransform,
+        size: [u32; 2],
+        fps: u32,
+        bitrate: u32,
+        name: &str,
+        manager: Option<&IMFDXGIDeviceManager>,
+    ) -> Result<Self, String> {
         let err = |err: windows::core::Error| err.message();
         unsafe {
             let attributes = transform.GetAttributes().ok();
@@ -83,6 +125,14 @@ impl Encoder {
                     attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).map_err(err)?;
                 }
                 let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
+            }
+            if let Some(manager) = manager {
+                // Once unlocked and before the media types, so the encoder sets itself up for
+                // textures.
+                if !attributes.as_ref().is_some_and(|a| a.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) != 0) {
+                    return Err("doesn't take pictures on the graphics card".into());
+                }
+                transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize).map_err(err)?;
             }
             let codec = transform.cast::<ICodecAPI>().ok();
             if let Some(codec) = &codec {
@@ -130,12 +180,14 @@ impl Encoder {
                 header,
                 time: 0,
                 about: format!(
-                    "{name} ({}), {}x{} at {fps} a second, {:.1} Mbit/s",
+                    "{name} ({}{}), {}x{} at {fps} a second, {:.1} Mbit/s",
                     if asynchronous { "graphics card, asynchronous" } else { "synchronous" },
+                    if manager.is_some() { ", pictures stay on the card" } else { "" },
                     size[0],
                     size[1],
                     f64::from(bitrate) / 1_000_000.0
                 ),
+                _manager: manager.cloned(),
             })
         }
     }
@@ -143,12 +195,32 @@ impl Encoder {
     /// Encodes one picture, a key picture when `key`. Answers the pictures that came out, in
     /// Annex B: usually this one, sometimes the one before as well, or none yet.
     pub fn encode(&mut self, nv12: &[u8], key: bool) -> Result<Vec<Vec<u8>>, String> {
+        let sample = media::sample(nv12)?;
+        self.encode_sample(sample, key)
+    }
+
+    /// Encodes one NV12 picture that's on the graphics card, as `encode` does.
+    pub fn encode_texture(&mut self, nv12: &ID3D11Texture2D, key: bool) -> Result<Vec<Vec<u8>>, String> {
+        let err = |err: windows::core::Error| err.message();
+        // SAFETY: wraps the texture, which the sample keeps alive, in a buffer of its own size.
+        let sample = unsafe {
+            let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12, 0, false).map_err(err)?;
+            let length = buffer.cast::<IMF2DBuffer>().and_then(|b| b.GetContiguousLength()).map_err(err)?;
+            buffer.SetCurrentLength(length).map_err(err)?;
+            let sample = MFCreateSample().map_err(err)?;
+            sample.AddBuffer(&buffer).map_err(err)?;
+            sample
+        };
+        self.encode_sample(sample, key)
+    }
+
+    fn encode_sample(&mut self, sample: IMFSample, key: bool) -> Result<Vec<Vec<u8>>, String> {
         let mut out = Vec::new();
         if key && let Some(codec) = &self.codec {
             // SAFETY: a value the encoder documents.
             let _ = unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &uint(1)) };
         }
-        let sample = self.sample(nv12)?;
+        self.time(&sample);
         if self.events.is_some() {
             // Wait for the encoder to ask for input, taking what it hands back meanwhile.
             let deadline = Instant::now() + Duration::from_millis(250);
@@ -224,16 +296,14 @@ impl Encoder {
         Ok(true)
     }
 
-    fn sample(&mut self, nv12: &[u8]) -> Result<IMFSample, String> {
+    fn time(&mut self, sample: &IMFSample) {
         let duration = 10_000_000 / i64::from(self.fps.max(1));
-        let sample = media::sample(nv12)?;
         // SAFETY: plain setters on a sample we own.
         unsafe {
             let _ = sample.SetSampleTime(self.time);
             let _ = sample.SetSampleDuration(duration);
         }
         self.time += duration;
-        Ok(sample)
     }
 
     /// One picture from the encoder, if it has one ready.
@@ -353,6 +423,49 @@ fn friendly_name(activate: &IMFActivate) -> String {
     }
 }
 
+/// The H.264 encoders of the graphics card `luid`, best first. Windows that can't pick by card
+/// list them all; one on another card then fails as it's set up.
+fn hardware_encoders_on(luid: LUID) -> Vec<IMFActivate> {
+    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
+    let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+    let mut attributes = None;
+    // SAFETY: plain attribute store, filled with the card's LUID as the call documents.
+    let found = unsafe {
+        MFCreateAttributes(&mut attributes, 1).ok().and(attributes).and_then(|attributes| {
+            let bytes = std::slice::from_raw_parts((&luid as *const LUID).cast::<u8>(), std::mem::size_of::<LUID>());
+            attributes.SetBlob(&MFT_ENUM_ADAPTER_LUID, bytes).ok()?;
+            let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
+            let mut count = 0u32;
+            MFTEnum2(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                Some(&input),
+                Some(&output),
+                &attributes,
+                &mut list,
+                &mut count,
+            )
+            .ok()?;
+            Some(taken(list, count))
+        })
+    };
+    found.filter(|list| !list.is_empty()).unwrap_or_else(hardware_encoders)
+}
+
+/// The activation objects Media Foundation listed, ours now, and the list freed.
+unsafe fn taken(list: *mut Option<IMFActivate>, count: u32) -> Vec<IMFActivate> {
+    if list.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `count` entries, each owned by us now; the list is Media Foundation's to free.
+    unsafe {
+        let entries = std::slice::from_raw_parts_mut(list, count as usize);
+        let taken: Vec<IMFActivate> = entries.iter_mut().filter_map(Option::take).collect();
+        CoTaskMemFree(Some(list.cast()));
+        taken
+    }
+}
+
 /// The graphics card's H.264 encoders, best first.
 fn hardware_encoders() -> Vec<IMFActivate> {
     let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
@@ -370,14 +483,9 @@ fn hardware_encoders() -> Vec<IMFActivate> {
             &mut count,
         )
     };
-    if found.is_err() || list.is_null() {
+    if found.is_err() {
         return Vec::new();
     }
-    // SAFETY: `count` entries, each owned by us now.
-    unsafe {
-        let entries = std::slice::from_raw_parts_mut(list, count as usize);
-        let taken: Vec<IMFActivate> = entries.iter_mut().filter_map(Option::take).collect();
-        CoTaskMemFree(Some(list.cast()));
-        taken
-    }
+    // SAFETY: the list the call above filled.
+    unsafe { taken(list, count) }
 }

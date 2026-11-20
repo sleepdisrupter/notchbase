@@ -4,12 +4,12 @@
 
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-    ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
@@ -41,6 +41,10 @@ pub struct Duplicator {
     pub changed: bool,
     pointer: Pointer,
     shape: Vec<u8>,
+    /// Whether the desktop stays on the graphics card, in `desk`, instead of coming off it.
+    on_card: bool,
+    desk: Option<ID3D11Texture2D>,
+    luid: LUID,
 }
 
 impl Duplicator {
@@ -51,6 +55,7 @@ impl Duplicator {
         let r = desc.DesktopCoordinates;
         let size = [(r.right - r.left).max(2) as usize, (r.bottom - r.top).max(2) as usize];
         let (device, context) = create_device(&adapter)?;
+        let luid = unsafe { adapter.GetDesc1() }.map(|desc| desc.AdapterLuid).unwrap_or_default();
         let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|err| err.message())?;
         Ok(Self {
             device,
@@ -67,6 +72,9 @@ impl Duplicator {
             changed: true,
             pointer: Pointer::default(),
             shape: Vec::new(),
+            on_card: false,
+            desk: None,
+            luid,
         })
     }
 
@@ -105,6 +113,56 @@ impl Duplicator {
         }
     }
 
+    pub fn device(&self) -> (&ID3D11Device, &ID3D11DeviceContext) {
+        (&self.device, &self.context)
+    }
+
+    /// The graphics card the display is on.
+    pub fn luid(&self) -> LUID {
+        self.luid
+    }
+
+    /// Keeps the desktop on the graphics card from now on, or brings it off again.
+    pub fn keep_on_card(&mut self, on_card: bool) {
+        if self.on_card == on_card {
+            return;
+        }
+        self.on_card = on_card;
+        if !on_card && let Some(desk) = self.desk.clone() {
+            // The picture on the card is the latest: the copy for the processor catches up.
+            if let Ok(staging) = self.staging() {
+                unsafe { self.context.CopyResource(&staging, &desk) };
+                self.fresh = true;
+            }
+        }
+        self.changed = true;
+    }
+
+    /// The display as it is now on the graphics card, before the pointer goes on, with the
+    /// pointer and where the display is. Nothing until it has a first picture.
+    pub fn on_card(&mut self) -> Option<(&ID3D11Texture2D, &Pointer, [i32; 2])> {
+        self.changed = false;
+        Some((self.desk.as_ref()?, &self.pointer, self.origin))
+    }
+
+    fn staging(&mut self) -> Result<ID3D11Texture2D, String> {
+        if let Some(staging) = &self.staging {
+            return Ok(staging.clone());
+        }
+        let made = texture(&self.device, self.size, true)?;
+        self.staging = Some(made.clone());
+        Ok(made)
+    }
+
+    fn desk(&mut self) -> Result<ID3D11Texture2D, String> {
+        if let Some(desk) = &self.desk {
+            return Ok(desk.clone());
+        }
+        let made = texture(&self.device, self.size, false)?;
+        self.desk = Some(made.clone());
+        Ok(made)
+    }
+
     /// The display as it is now, pointer and all, in BGRA.
     pub fn frame(&mut self) -> &[u8] {
         if std::mem::take(&mut self.fresh) {
@@ -141,16 +199,14 @@ impl Duplicator {
                 && desc.Width as usize >= self.size[0]
                 && desc.Height as usize >= self.size[1]
             {
-                let staging = match &self.staging {
-                    Some(staging) => staging.clone(),
-                    None => {
-                        let made = staging(&self.device, self.size)?;
-                        self.staging = Some(made.clone());
-                        made
-                    }
-                };
-                unsafe { self.context.CopyResource(&staging, &texture) };
-                self.fresh = true;
+                if self.on_card {
+                    let desk = self.desk()?;
+                    unsafe { self.context.CopyResource(&desk, &texture) };
+                } else {
+                    let staging = self.staging()?;
+                    unsafe { self.context.CopyResource(&staging, &texture) };
+                    self.fresh = true;
+                }
                 self.changed = true;
             }
         }
@@ -227,25 +283,44 @@ fn find_output(name: &[u16; 32]) -> Result<(IDXGIAdapter1, IDXGIOutput1), String
 }
 
 fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
-    let (mut device, mut context) = (None, None);
-    unsafe {
-        D3D11CreateDevice(
-            adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            Some(&mut context),
-        )
+    // Video support lets the card's video processor and encoder share the device; a card
+    // without it still duplicates.
+    let mut why = String::new();
+    for flags in
+        [D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_CREATE_DEVICE_BGRA_SUPPORT]
+    {
+        let (mut device, mut context) = (None, None);
+        let made = unsafe {
+            D3D11CreateDevice(
+                adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                flags,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        };
+        match (made, device, context) {
+            (Ok(()), Some(device), Some(context)) => {
+                // The encoder works the device from its own threads.
+                if let Ok(multithread) = context.cast::<ID3D11Multithread>() {
+                    let _ = unsafe { multithread.SetMultithreadProtected(true) };
+                }
+                return Ok((device, context));
+            }
+            (Err(err), ..) => why = err.message(),
+            _ => why = "no Direct3D device".into(),
+        }
     }
-    .map_err(|err| err.message())?;
-    device.zip(context).ok_or_else(|| "no Direct3D device".into())
+    Err(why)
 }
 
-fn staging(device: &ID3D11Device, [width, height]: [usize; 2]) -> Result<ID3D11Texture2D, String> {
+/// A BGRA texture the size of the display: for reading off the card when `staging`, else for
+/// the desktop to wait on it.
+fn texture(device: &ID3D11Device, [width, height]: [usize; 2], staging: bool) -> Result<ID3D11Texture2D, String> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width as u32,
         Height: height as u32,
@@ -253,9 +328,9 @@ fn staging(device: &ID3D11Device, [width, height]: [usize; 2]) -> Result<ID3D11T
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Usage: D3D11_USAGE_STAGING,
+        Usage: if staging { D3D11_USAGE_STAGING } else { D3D11_USAGE_DEFAULT },
         BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        CPUAccessFlags: if staging { D3D11_CPU_ACCESS_READ.0 as u32 } else { 0 },
         MiscFlags: 0,
     };
     let mut texture = None;
