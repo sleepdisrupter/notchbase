@@ -154,10 +154,10 @@ impl Encoder {
                 set("low latency", &CODECAPI_AVLowLatencyMode, 1);
                 set("no B pictures", &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
                 set("the bitrate", &CODECAPI_AVEncCommonMeanBitRate, bitrate);
-                // As game streaming sets it: a constant rate with room for about one picture, so
+                // As game streaming sets it: a constant rate with room for a picture or two, so
                 // no picture is ever much bigger than its share and takes longer to go out.
                 set("a constant rate", &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32);
-                set("a one-picture buffer", &CODECAPI_AVEncCommonBufferSize, one_picture(bitrate, fps));
+                set("a two-picture buffer", &CODECAPI_AVEncCommonBufferSize, two_pictures(bitrate, fps));
                 // Key pictures mostly when the other side asks: one every few seconds is a burst
                 // the network has to catch up on, and the connection doesn't lose pictures.
                 set("rare key pictures", &CODECAPI_AVEncMPVGOPSize, fps * KEY_EVERY_SECONDS);
@@ -343,6 +343,19 @@ impl Encoder {
 
     /// One picture from the encoder, if it has one ready.
     fn take_output(&mut self) -> Result<Option<Vec<u8>>, String> {
+        // An encoder that changes its output type says so instead of handing over the picture
+        // it has: asked again with the new type, it does. Left there, that picture would come
+        // out only with the next, and every later one a picture late.
+        for _ in 0..3 {
+            match self.output_once()? {
+                Output::Changed => continue,
+                Output::Picture(picture) => return Ok(picture),
+            }
+        }
+        Ok(None)
+    }
+
+    fn output_once(&mut self) -> Result<Output, String> {
         let sample = if self.provides {
             None
         } else {
@@ -368,7 +381,7 @@ impl Encoder {
         drop(std::mem::ManuallyDrop::into_inner(buffer.pEvents));
         match result {
             Ok(()) => {}
-            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(Output::Picture(None)),
             Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                 // SAFETY: takes the encoder's own choice of output type, as it asks.
                 unsafe {
@@ -377,11 +390,11 @@ impl Encoder {
                     }
                 }
                 self.header = sequence_header(&self.transform);
-                return Ok(None);
+                return Ok(Output::Changed);
             }
             Err(err) => return Err(err.message()),
         }
-        let Some(sample) = sample else { return Ok(None) };
+        let Some(sample) = sample else { return Ok(Output::Picture(None)) };
         let picture = media::bytes(&sample)?;
         if let Some(at) = self.given_at.pop_front() {
             self.delays.push(at.elapsed());
@@ -390,7 +403,7 @@ impl Encoder {
             self.pending = self.pending.saturating_sub(1);
             self.held_since = if self.pending == 0 { None } else { Some(Instant::now()) };
         }
-        Ok(Some(picture))
+        Ok(Output::Picture(Some(picture)))
     }
 
     fn with_header(&mut self, picture: Vec<u8>) -> Vec<u8> {
@@ -414,15 +427,25 @@ impl Drop for Encoder {
     }
 }
 
+/// What one ask of the encoder for output gave.
+enum Output {
+    Picture(Option<Vec<u8>>),
+    /// It changed its output type, and has the picture still.
+    Changed,
+}
+
 /// Enough for text to stay sharp: about 0.12 bits a pixel at 60 a second, from 8 to 40 Mbit/s.
 fn bitrate([width, height]: [u32; 2], fps: u32) -> u32 {
     let wanted = f64::from(width) * f64::from(height) * f64::from(fps) * 0.12;
     wanted.clamp(8_000_000.0, 40_000_000.0) as u32
 }
 
-/// The encoder's buffer, in bytes: one picture's share of the rate.
-fn one_picture(bitrate: u32, fps: u32) -> u32 {
-    (bitrate / 8 / fps.max(1)).max(1)
+/// The encoder's buffer: two pictures' share of the rate, in bits, as the codec API takes it.
+/// (Counted in bytes, an earlier version left the encoder an eighth of a picture's room, so
+/// it skipped changes to keep to the rate and the picture froze.) An encoder that reads it as
+/// bytes gets sixteen pictures' room, which is still a steady rate.
+fn two_pictures(bitrate: u32, fps: u32) -> u32 {
+    (bitrate / fps.max(1)).saturating_mul(2).max(1)
 }
 
 fn uint(value: u32) -> VARIANT {
