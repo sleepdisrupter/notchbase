@@ -720,3 +720,16 @@ fn with_roaming_off_the_cursor_stays_but_the_extended_display_works() {
         viewer.seen.lock().unwrap().pointers.contains(&crate::display::PointerAt { at: [298, 197], visible: true })
     });
 }
+
+#[test]
+fn an_extended_displays_pictures_go_over_udp() {
+    let (a, _b, _host, viewer, _) = lend_a_screen();
+    displays::wait("the pictures going over UDP", || log_of(&a).contains("pictures go over UDP"));
+    let before = viewer.seen.lock().unwrap().pictures.len();
+    displays::wait("pictures coming that way", || viewer.seen.lock().unwrap().pictures.len() > before + 20);
+    let seen = viewer.seen.lock().unwrap();
+    assert!(seen.pictures.iter().all(|p| !p.data.is_empty()), "the host's tries at the way aren't shown");
+    // One to start from, and one more to start the new way from.
+    assert!(seen.pictures.iter().filter(|p| p.key).count() >= 2, "a key picture to start the new way from");
+    assert!(!log_of(&a).contains("go over TCP"), "{}", log_of(&a));
+}

@@ -76,6 +76,8 @@ pub struct Beacon {
     /// Takes that pointer's place from the session's packets too (`Body::pointer`), not only
     /// from the picture stream.
     pub fast_pointer: bool,
+    /// Takes a lent screen's pictures over UDP when the host offers (`Down::UdpPlease`).
+    pub udp_pictures: bool,
     pub ppu: f32,
     pub displays: Vec<Rect>,
     pub name: String,
@@ -162,7 +164,8 @@ impl Packet {
                     | (u8::from(beacon.busy) << 1)
                     | (u8::from(beacon.lends) << 2)
                     | (u8::from(beacon.draws_pointer) << 3)
-                    | (u8::from(beacon.fast_pointer) << 4));
+                    | (u8::from(beacon.fast_pointer) << 4)
+                    | (u8::from(beacon.udp_pictures) << 5));
                 out.f32(beacon.ppu);
                 let displays = &beacon.displays[..beacon.displays.len().min(16)];
                 out.u8(displays.len() as u8);
@@ -240,6 +243,7 @@ impl Packet {
                     lends: flags & 4 != 0,
                     draws_pointer: flags & 8 != 0,
                     fast_pointer: flags & 16 != 0,
+                    udp_pictures: flags & 32 != 0,
                     ppu,
                     displays,
                     name,
@@ -667,6 +671,7 @@ mod tests {
                 lends: true,
                 draws_pointer: true,
                 fast_pointer: true,
+                udp_pictures: true,
                 ppu: 1.5,
                 displays: vec![Rect::new(-1920.0, 0.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
                 name: "Desk PC".into(),
@@ -736,6 +741,7 @@ mod tests {
             lends: false,
             draws_pointer: false,
             fast_pointer: false,
+            udp_pictures: false,
             ppu: 1.0,
             displays: vec![],
             name: "é".repeat(40),

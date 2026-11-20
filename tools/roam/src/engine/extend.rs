@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use super::{Core, Cursor, Event, Session, Side};
 use crate::crypto::{self, hex};
 use crate::display::stream::{self, Down, Hello, Keys, Opener, Sealer, Up};
+use crate::display::udp;
 use crate::display::{self, Ability, Displays, Feed, Panel, Remote, Showing, Want};
 use crate::input::Play;
 use crate::layout::{self, Computer, Rect};
@@ -53,6 +54,21 @@ const LASTED: Duration = Duration::from_millis(2_500);
 /// A lent screen that hears nothing for this long takes the stream as gone (a still screen still
 /// sends a picture a second).
 const QUIET: Duration = Duration::from_secs(5);
+/// Set on the host, the pictures always go over the TCP stream, never UDP.
+pub const TCP_PICTURES: &str = "NOTCHBASE_ROAM_TCP_PICTURES";
+/// While the pictures go over UDP, the stream says it's still up this often.
+const ALIVE_EVERY: Duration = Duration::from_secs(1);
+/// How often the host tries UDP before the other computer has heard it, and for how long.
+const PROBE_EVERY: Duration = Duration::from_millis(200);
+const PROBE_FOR: Duration = Duration::from_secs(3);
+/// Pictures over UDP that stop coming this long, though the stream is up, go back to TCP.
+const UDP_SILENT: Duration = Duration::from_secs(3);
+/// A key picture is asked for at most this often after pictures are lost over UDP.
+const LOST_KEY_EVERY: Duration = Duration::from_millis(150);
+/// The least share of its bitrate the encoder steps down to, and the clean seconds before it
+/// steps back up.
+const LEAST_RATE: u32 = 40;
+const CLEAN_FOR: u32 = 5;
 
 /// One of another computer's screens shown here as an extended display (this computer hosts).
 pub(super) struct Extended {
@@ -308,6 +324,8 @@ impl Core {
         // waiting for the pictures.
         let pointer_apart = self.peers.get(&peer).is_some_and(|p| p.draws_pointer)
             && std::env::var_os(display::POINTER_IN_PICTURE).is_none();
+        // And takes the pictures over UDP, where a lost packet costs one picture, not a freeze.
+        let udp = self.peers.get(&peer).is_some_and(|p| p.udp_pictures) && std::env::var_os(TCP_PICTURES).is_none();
         let Some(session) = self.sessions.get_mut(&peer) else { return };
         let addr = session.addr;
         let session_id = session.id;
@@ -340,6 +358,7 @@ impl Core {
             events: self.events.clone(),
             displays: self.displays.clone(),
             install,
+            udp,
         };
         self.note(&format!(
             "{name} lends its display {display}: {}x{} at {} Hz, scale {}; placing it at ({}, {})",
@@ -778,6 +797,8 @@ struct HostJob {
     events: Sender<Event>,
     displays: Arc<dyn Displays>,
     install: bool,
+    /// The other computer takes the pictures over UDP.
+    udp: bool,
 }
 
 impl HostJob {
@@ -904,6 +925,158 @@ fn run_host(job: &HostJob) -> Result<String, String> {
     Ok(why)
 }
 
+/// What the lending computer said about the pictures over UDP, from the host's input thread.
+#[derive(Default)]
+struct UdpWord {
+    port: Option<u16>,
+    heard: bool,
+    tcp_please: bool,
+    losses: Vec<(u32, u32)>,
+}
+
+/// How the host's pictures go over UDP on one stream.
+enum UdpOut {
+    /// Not offered, or given up on: the pictures go by TCP.
+    Off,
+    /// Offered; waiting for the other computer to say where.
+    Asked,
+    /// Trying the way there until the other computer hears it.
+    Probing {
+        sender: display::udp::Sender,
+        since: Instant,
+        probed: Instant,
+    },
+    On(display::udp::Sender),
+}
+
+/// The host's side of the pictures over UDP: the way there, and the bitrate it allows.
+struct UdpHost {
+    out: UdpOut,
+    word: Arc<Mutex<UdpWord>>,
+    /// The share of the encoder's bitrate in use, and the seconds without a loss since it changed.
+    rate: u32,
+    clean: u32,
+}
+
+impl UdpHost {
+    fn new(offered: bool) -> Self {
+        let out = if offered { UdpOut::Asked } else { UdpOut::Off };
+        Self { out, word: Arc::default(), rate: 100, clean: 0 }
+    }
+
+    fn sender(&mut self) -> Option<&mut display::udp::Sender> {
+        match &mut self.out {
+            UdpOut::On(sender) => Some(sender),
+            _ => None,
+        }
+    }
+
+    fn off(&mut self, job: &HostJob, why: &str) {
+        if !matches!(self.out, UdpOut::Off) {
+            job.note(format!("extended display pictures go over TCP: {why}"));
+        }
+        let was_on = matches!(self.out, UdpOut::On(_));
+        self.out = UdpOut::Off;
+        if was_on {
+            // The other computer's decoder carries on from whatever came last: start it clean.
+            job.feed.ask_key();
+        }
+        if self.rate != 100 {
+            self.rate = 100;
+            job.feed.set_rate(100);
+        }
+    }
+
+    /// Moves things on from what the other computer said.
+    fn step(&mut self, job: &HostJob, route: &Route, stream: u32) {
+        let (port, heard, tcp_please, losses) = match self.word.lock() {
+            Ok(mut word) => (word.port, word.heard, word.tcp_please, std::mem::take(&mut word.losses)),
+            Err(_) => return,
+        };
+        if tcp_please {
+            return self.off(job, "the other computer stopped hearing them");
+        }
+        match &mut self.out {
+            UdpOut::Off | UdpOut::On(_) => {}
+            UdpOut::Asked => {
+                let Some(port) = port else { return };
+                let to = SocketAddr::new(route.addr.ip(), port);
+                match udp_socket(to) {
+                    Ok(socket) => {
+                        if let Some(text) = priority::mark(socket2::SockRef::from(&socket), Some(to), Traffic::Video) {
+                            job.note(text);
+                        }
+                        let key = display::udp::key(route.keys.pictures);
+                        let sender = display::udp::Sender::new(socket, to, key, stream);
+                        let long_ago = Instant::now() - PROBE_EVERY;
+                        self.out = UdpOut::Probing { sender, since: Instant::now(), probed: long_ago };
+                    }
+                    Err(err) => return self.off(job, &format!("couldn't open a UDP socket: {err}")),
+                }
+            }
+            UdpOut::Probing { sender, since, probed } => {
+                if heard {
+                    let UdpOut::Probing { sender, .. } = std::mem::replace(&mut self.out, UdpOut::Off) else {
+                        return;
+                    };
+                    self.out = UdpOut::On(sender);
+                    job.feed.ask_key();
+                    job.note("extended display pictures go over UDP, with repair packets".into());
+                } else if since.elapsed() >= PROBE_FOR {
+                    return self.off(job, "nothing sent over UDP got through");
+                } else if probed.elapsed() >= PROBE_EVERY {
+                    *probed = Instant::now();
+                    // An empty key picture: the other computer says when it hears one.
+                    let _ = sender.send(&display::Picture { key: true, data: Vec::new() });
+                }
+            }
+        }
+        if matches!(self.out, UdpOut::On(_)) {
+            for (lost, repaired) in losses {
+                self.losses(job, lost, repaired);
+            }
+        }
+    }
+
+    /// A second's word on the pictures over UDP: a loss steps the bitrate down, a run of clean
+    /// seconds steps it back up.
+    fn losses(&mut self, job: &HostJob, lost: u32, repaired: u32) {
+        let was = self.rate;
+        if lost > 0 {
+            self.rate = (self.rate * 3 / 4).max(LEAST_RATE);
+            self.clean = 0;
+        } else {
+            self.clean += 1;
+            if self.clean >= CLEAN_FOR && self.rate < 100 {
+                self.rate = (self.rate + 10).min(100);
+                self.clean = 0;
+            }
+        }
+        if self.rate != was {
+            job.feed.set_rate(self.rate);
+            job.note(format!(
+                "extended display over UDP: {lost} pictures lost, {repaired} rebuilt in the last second: bitrate {} to {}%",
+                if self.rate < was { "down" } else { "back up" },
+                self.rate
+            ));
+        }
+    }
+}
+
+/// A socket to send pictures to `to` from, with room for a key picture's burst of packets.
+fn udp_socket(to: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let domain = if to.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
+    let any: SocketAddr = if to.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    socket.bind(&any.into())?;
+    Ok(socket.into())
+}
+
 /// One picture stream, from connecting until it ends.
 fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted>, upkeep: &mut Upkeep) -> Streamed {
     let started = Instant::now();
@@ -933,9 +1106,12 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
     job.feed.clear_pictures();
     job.feed.ask_key();
     job.feed.ask_pointer();
+    job.feed.set_rate(100);
+    let mut udp = UdpHost::new(job.udp);
     let said = hello
         .write(&mut out)
         .and_then(|()| sealer.down(&mut out, &Down::Size(hosted.size())))
+        .and_then(|()| if job.udp { sealer.down(&mut out, &Down::UdpPlease) } else { Ok(()) })
         .and_then(|()| out.flush());
     if let Err(err) = said {
         return dropped(format!("The connection dropped: {err}"));
@@ -945,6 +1121,7 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
     let back = {
         let (feed, events) = (job.feed.clone(), job.events.clone());
         let (gone, bye) = (gone.clone(), bye.clone());
+        let word = udp.word.clone();
         let (peer, serial) = (job.peer, job.serial);
         let mut opener = Opener::new(route.keys.input, hello.stream);
         std::thread::Builder::new().name("roam-host-input".into()).spawn(move || {
@@ -955,6 +1132,26 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
                         let _ = events.send(Event::Extend(ExtendEvent::Remote { peer, serial, remote }));
                     }
                     Ok(Up::KeyPlease) => feed.ask_key(),
+                    Ok(Up::UdpAt(port)) => {
+                        if let Ok(mut word) = word.lock() {
+                            word.port = Some(port);
+                        }
+                    }
+                    Ok(Up::UdpHeard) => {
+                        if let Ok(mut word) = word.lock() {
+                            word.heard = true;
+                        }
+                    }
+                    Ok(Up::TcpPlease) => {
+                        if let Ok(mut word) = word.lock() {
+                            word.tcp_please = true;
+                        }
+                    }
+                    Ok(Up::Losses { lost, repaired }) => {
+                        if let Ok(mut word) = word.lock() {
+                            word.losses.push((lost, repaired));
+                        }
+                    }
                     Ok(Up::Bye) => {
                         bye.store(true, Ordering::Release);
                         break;
@@ -972,6 +1169,8 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
     }
     // Whether the pointer was last said to show.
     let mut shown: Option<bool> = None;
+    // When the stream last carried anything.
+    let mut wrote = Instant::now();
     let ended = loop {
         if job.feed.stopped() {
             let _ = sealer.down(&mut out, &Down::Bye).and_then(|()| out.flush());
@@ -983,6 +1182,7 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
         if gone.load(Ordering::Acquire) {
             break dropped("the other computer closed it".into());
         }
+        udp.step(job, &route, hello.stream);
         let picture = job.feed.next(Duration::from_millis(40));
         // The pointer's news goes first: it's small, and the reason it goes apart is to be quick.
         let news = job.feed.take_pointer();
@@ -1000,13 +1200,32 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
         }
         if pointed && sent.is_ok() {
             sent = out.flush();
+            wrote = Instant::now();
         }
-        if let Some(picture) = picture.filter(|_| sent.is_ok()) {
+        let mut picture = picture.filter(|_| sent.is_ok());
+        if let Some(sending) = picture.as_ref() {
+            let started = Instant::now();
+            let big = sending.data.len() > display::udp::MOST_BYTES;
+            match udp.sender().filter(|_| !big).map(|sender| sender.send(sending)) {
+                Some(Ok(())) => {
+                    job.feed.count_sent(started.elapsed());
+                    picture = None;
+                }
+                Some(Err(err)) => udp.off(job, &format!("UDP failed: {err}")),
+                None if big && udp.sender().is_some() => udp.off(job, "a picture too big for UDP"),
+                None => {}
+            }
+        }
+        if let Some(picture) = picture {
             let started = Instant::now();
             sent = sealer.down(&mut out, &Down::Picture(picture)).and_then(|()| out.flush());
+            wrote = Instant::now();
             if sent.is_ok() {
                 job.feed.count_sent(started.elapsed());
             }
+        } else if sent.is_ok() && udp.sender().is_some() && wrote.elapsed() >= ALIVE_EVERY {
+            sent = sealer.down(&mut out, &Down::Alive).and_then(|()| out.flush());
+            wrote = Instant::now();
         }
         if let Err(err) = sent {
             break dropped(format!("The connection dropped: {err}"));
@@ -1069,24 +1288,49 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
         }
     })?;
     let mut opener = Opener::new(grant.keys.pictures, hello.stream);
+    let (local, from) = (stream.local_addr()?, stream.peer_addr()?.ip().to_canonical());
     let mut reader = BufReader::with_capacity(256 * 1024, stream);
     let mut asked_key = Instant::now() - KEY_EVERY;
-    let mut arrivals = Arrivals::default();
+    let arrivals = Arc::new(Mutex::new(Arrivals::default()));
     let mut tallied = Instant::now();
     let shown = grant.shown.clone();
-    let with_shown = |what: &mut dyn FnMut(&mut Box<dyn Showing>)| {
-        if let Some(shown) = shown.lock().ok().as_mut().and_then(|s| s.as_mut()) {
-            what(&mut shown.showing);
-        }
-    };
+    let with_shown = |what: &mut dyn FnMut(&mut Box<dyn Showing>)| with_shown(&shown, what);
+    // The pictures over UDP, once the host offers, ended with this stream. Pictures may come
+    // both ways for a moment as the host changes over.
+    let udp_over = Arc::new(AtomicBool::new(false));
+    let mut udp_started = false;
     let ended = loop {
         if tallied.elapsed() >= TALLY_EVERY {
-            with_shown(&mut |shown| arrivals.pointer_lag = shown.take_pointer_lag());
-            let text = std::mem::take(&mut arrivals).line(tallied.elapsed().as_secs_f64());
+            let mut lag = None;
+            with_shown(&mut |shown| lag = shown.take_pointer_lag());
+            let taken = arrivals.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
+            let text = Arrivals { pointer_lag: lag, ..taken }.line(tallied.elapsed().as_secs_f64());
             tallied = Instant::now();
             let _ = events.send(Event::Extend(ExtendEvent::Note { text }));
         }
         match opener.down(&mut reader) {
+            Ok(Down::UdpPlease) if !udp_started => {
+                udp_started = true;
+                let listen = ViewUdp {
+                    shown: grant.shown.clone(),
+                    up: up.clone(),
+                    arrivals: arrivals.clone(),
+                    over: udp_over.clone(),
+                    events: events.clone(),
+                    from,
+                    who: grant.who.clone(),
+                };
+                match listen.start(local, udp::key(grant.keys.pictures), hello.stream) {
+                    Ok(port) => {
+                        let _ = up.send(Up::UdpAt(port));
+                    }
+                    Err(err) => {
+                        let text = format!("couldn't take the pictures over UDP ({err}): they come over TCP");
+                        let _ = events.send(Event::Extend(ExtendEvent::Note { text }));
+                    }
+                }
+            }
+            Ok(Down::UdpPlease | Down::Alive) => {}
             Ok(Down::Size(size)) => {
                 let Ok(mut slot) = grant.shown.lock() else { break Some("Couldn't show the picture".to_owned()) };
                 if slot.as_ref().is_some_and(|s| s.size == size) {
@@ -1109,14 +1353,18 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
                 let mut result = None;
                 with_shown(&mut |shown| result = Some(shown.picture(&picture)));
                 let Some(result) = result else { continue };
-                arrivals.count(came, picture.data.len(), came.elapsed(), result.is_err());
+                if let Ok(mut arrivals) = arrivals.lock() {
+                    arrivals.count(came, picture.data.len(), came.elapsed(), result.is_err());
+                }
                 if result.is_err() && asked_key.elapsed() >= KEY_EVERY {
                     asked_key = Instant::now();
                     let _ = up.send(Up::KeyPlease);
                 }
             }
             Ok(Down::Pointer(at)) => {
-                arrivals.pointers += 1;
+                if let Ok(mut arrivals) = arrivals.lock() {
+                    arrivals.pointers += 1;
+                }
                 with_shown(&mut |shown| shown.pointer(at));
             }
             Ok(Down::Shape(shape)) => with_shown(&mut |shown| shown.shape(&shape)),
@@ -1128,10 +1376,121 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
             }
         }
     };
+    udp_over.store(true, Ordering::Release);
     if let Some(why) = ended {
         let _ = events.send(Event::Extend(ExtendEvent::LendEnded { serial: grant.serial, why }));
     }
     Ok(())
+}
+
+fn with_shown(shown: &Mutex<Option<Shown>>, what: &mut dyn FnMut(&mut Box<dyn Showing>)) {
+    if let Some(shown) = shown.lock().ok().as_mut().and_then(|s| s.as_mut()) {
+        what(&mut shown.showing);
+    }
+}
+
+/// What the lending computer's thread for pictures over UDP works with.
+struct ViewUdp {
+    shown: Arc<Mutex<Option<Shown>>>,
+    up: Sender<Up>,
+    arrivals: Arc<Mutex<Arrivals>>,
+    /// Set when the stream ends.
+    over: Arc<AtomicBool>,
+    events: Sender<Event>,
+    /// The host, the only one packets are taken from.
+    from: std::net::IpAddr,
+    who: String,
+}
+
+impl ViewUdp {
+    /// Opens a UDP socket beside the stream at `local` and takes pictures on it on a thread of
+    /// its own. Answers the socket's port.
+    fn start(self, local: SocketAddr, key: [u8; 32], stream: u32) -> std::io::Result<u16> {
+        let domain = if local.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        // Room for a key picture's burst while the thread is busy showing the one before.
+        let _ = socket.set_recv_buffer_size(8 * 1024 * 1024);
+        socket.bind(&SocketAddr::new(local.ip(), 0).into())?;
+        let socket: std::net::UdpSocket = socket.into();
+        let port = socket.local_addr()?.port();
+        let receiver = udp::Receiver::new(key, stream);
+        std::thread::Builder::new().name("roam-view-udp".into()).spawn(move || self.run(&socket, receiver))?;
+        Ok(port)
+    }
+
+    fn note(&self, text: String) {
+        let _ = self.events.send(Event::Extend(ExtendEvent::Note { text }));
+    }
+
+    fn run(self, socket: &std::net::UdpSocket, mut receiver: udp::Receiver) {
+        let mut buffer = vec![0u8; 2048];
+        let mut heard = false;
+        let mut last_picture = Instant::now();
+        let mut asked_key = Instant::now() - KEY_EVERY;
+        let mut reported = Instant::now();
+        while !self.over.load(Ordering::Acquire) {
+            let wait = receiver.check_in().unwrap_or(Duration::from_millis(100)).max(Duration::from_millis(1));
+            let _ = socket.set_read_timeout(Some(wait));
+            let arrived = match socket.recv_from(&mut buffer) {
+                Ok((n, addr)) if addr.ip().to_canonical() == self.from => receiver.take(&buffer[..n], Instant::now()),
+                Ok(_) => Vec::new(),
+                Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    receiver.ready(Instant::now())
+                }
+                Err(err) => {
+                    self.note(format!("pictures over UDP stopped ({err}): asking for them over TCP"));
+                    let _ = self.up.send(Up::TcpPlease);
+                    return;
+                }
+            };
+            for arrival in arrived {
+                match arrival {
+                    udp::Arrival::Picture(picture) if picture.data.is_empty() => {
+                        // The host trying the way: say it works.
+                        if !heard {
+                            heard = true;
+                            last_picture = Instant::now();
+                            let _ = self.up.send(Up::UdpHeard);
+                        }
+                    }
+                    udp::Arrival::Picture(picture) => {
+                        last_picture = Instant::now();
+                        let came = Instant::now();
+                        let mut result = None;
+                        with_shown(&self.shown, &mut |shown| result = Some(shown.picture(&picture)));
+                        let Some(result) = result else { continue };
+                        if let Ok(mut arrivals) = self.arrivals.lock() {
+                            arrivals.count(came, picture.data.len(), came.elapsed(), result.is_err());
+                        }
+                        if result.is_err() && asked_key.elapsed() >= KEY_EVERY {
+                            asked_key = Instant::now();
+                            let _ = self.up.send(Up::KeyPlease);
+                        }
+                    }
+                    udp::Arrival::Lost => {
+                        if asked_key.elapsed() >= LOST_KEY_EVERY {
+                            asked_key = Instant::now();
+                            let _ = self.up.send(Up::KeyPlease);
+                        }
+                    }
+                }
+            }
+            if heard && reported.elapsed() >= Duration::from_secs(1) {
+                reported = Instant::now();
+                let (lost, repaired) = (std::mem::take(&mut receiver.lost), std::mem::take(&mut receiver.repaired));
+                if let Ok(mut arrivals) = self.arrivals.lock() {
+                    arrivals.lost += lost;
+                    arrivals.repaired += repaired;
+                }
+                let _ = self.up.send(Up::Losses { lost, repaired });
+            }
+            if heard && last_picture.elapsed() >= UDP_SILENT && !self.over.load(Ordering::Acquire) {
+                self.note(format!("pictures over UDP from {} stopped coming: asking for them over TCP", self.who));
+                let _ = self.up.send(Up::TcpPlease);
+                return;
+            }
+        }
+    }
 }
 
 /// How a lent screen's pictures came in since the last look, for the log.
@@ -1147,6 +1506,9 @@ struct Arrivals {
     /// Pointer moves the host sent apart from the pictures, and the longest one waited to be drawn.
     pointers: u32,
     pointer_lag: Option<Duration>,
+    /// Over UDP: pictures given up on, and rebuilt from repair packets.
+    lost: u32,
+    repaired: u32,
 }
 
 impl Arrivals {
@@ -1170,7 +1532,15 @@ impl Arrivals {
             self.longest_gap.as_secs_f64() * 1000.0,
             self.longest_show.as_secs_f64() * 1000.0,
             self.failed,
-        ) + &self.pointer_line(seconds)
+        ) + &self.udp_line()
+            + &self.pointer_line(seconds)
+    }
+
+    fn udp_line(&self) -> String {
+        if self.lost == 0 && self.repaired == 0 {
+            return String::new();
+        }
+        format!("; over UDP {} rebuilt from repair packets, {} lost", self.repaired, self.lost)
     }
 
     fn pointer_line(&self, seconds: f64) -> String {

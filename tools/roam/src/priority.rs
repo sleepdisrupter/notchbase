@@ -63,7 +63,8 @@ fn raw(socket: &socket2::SockRef<'_>) -> u64 {
 fn fresh(socket: u64, to: Option<SocketAddr>) -> bool {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
-    static MARKED: OnceLock<Mutex<HashSet<(u64, Option<SocketAddr>)>>> = OnceLock::new();
+    type Marked = Mutex<HashSet<(u64, Option<SocketAddr>)>>;
+    static MARKED: OnceLock<Marked> = OnceLock::new();
     let mut marked = MARKED.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap_or_else(|e| e.into_inner());
     // Systems hand socket numbers out again: keep the list from growing for good.
     if marked.len() > 4096 {

@@ -129,6 +129,13 @@ impl Pictures {
         pictures
     }
 
+    /// Uses `percent` of the encoder's full bitrate.
+    pub fn set_rate(&mut self, percent: u32) {
+        if let Some(text) = self.encoder.set_rate(percent) {
+            self.notes.push(text);
+        }
+    }
+
     /// The card route failed: the processor route from now on. A failure there is the end.
     fn give_way(&mut self, duplicator: &mut Duplicator, why: String) -> Result<(), String> {
         if matches!(self.route, Route::Processor(_)) {
@@ -136,7 +143,9 @@ impl Pictures {
         }
         self.notes.push(format!("extended display pictures come off the graphics card from now on: {why}"));
         duplicator.keep_on_card(false);
+        let rate = self.encoder.rate();
         self.encoder = Encoder::new(self.size, self.fps)?;
+        self.encoder.set_rate(rate);
         self.route = Route::Processor(nv12::Converter::new(self.size, self.size));
         self.notes.push(format!("extended display encoder: {}", self.encoder.about));
         Ok(())

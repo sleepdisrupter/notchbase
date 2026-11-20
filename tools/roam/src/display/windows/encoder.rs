@@ -48,6 +48,9 @@ const OUTPUT_WAIT: Duration = Duration::from_millis(3);
 pub struct Encoder {
     transform: IMFTransform,
     codec: Option<ICodecAPI>,
+    /// The full bitrate, and the share of it in use (percent) since the network lost pictures.
+    bitrate: u32,
+    rate: u32,
     /// Set for an asynchronous (hardware) encoder.
     events: Option<IMFMediaEventGenerator>,
     /// Inputs an asynchronous encoder has asked for and not been given.
@@ -201,6 +204,8 @@ impl Encoder {
             Ok(Self {
                 transform,
                 codec,
+                bitrate,
+                rate: 100,
                 events,
                 wanted: 0,
                 pending: 0,
@@ -225,6 +230,34 @@ impl Encoder {
                 _manager: manager.cloned(),
             })
         }
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// Uses `percent` of the full bitrate from the next picture on, as game streaming steps
+    /// down on a network that loses pictures. Answers a line for the log when it changed.
+    pub fn set_rate(&mut self, percent: u32) -> Option<String> {
+        let percent = percent.clamp(10, 100);
+        if percent == self.rate {
+            return None;
+        }
+        self.rate = percent;
+        let bitrate = (u64::from(self.bitrate) * u64::from(percent) / 100) as u32;
+        let Some(codec) = &self.codec else {
+            return Some("extended display: the encoder can't change its bitrate".into());
+        };
+        // SAFETY: plain codec settings; an encoder that won't change them as it goes refuses.
+        let set = unsafe {
+            codec
+                .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &uint(bitrate))
+                .and_then(|()| codec.SetValue(&CODECAPI_AVEncCommonBufferSize, &uint(two_pictures(bitrate, self.fps))))
+        };
+        Some(match set {
+            Ok(()) => format!("extended display bitrate: {:.1} Mbit/s ({percent}%)", f64::from(bitrate) / 1_000_000.0),
+            Err(err) => format!("extended display: the encoder wouldn't change its bitrate: {}", err.message()),
+        })
     }
 
     /// Encodes one picture, a key picture when `key`. Answers the pictures that came out, in

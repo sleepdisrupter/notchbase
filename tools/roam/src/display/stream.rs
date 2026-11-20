@@ -27,6 +27,13 @@ const KEY_PLEASE: u8 = 5;
 // a kind it doesn't know.
 const POINTER: u8 = 6;
 const SHAPE: u8 = 7;
+// Only to a lending computer that says it takes pictures over UDP, and back only in answer.
+const UDP_PLEASE: u8 = 8;
+const ALIVE: u8 = 9;
+const UDP_AT: u8 = 8;
+const UDP_HEARD: u8 = 9;
+const TCP_PLEASE: u8 = 10;
+const LOSSES: u8 = 11;
 
 /// The clear start of the connection: the session, and a number for this stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +82,10 @@ pub enum Down {
     Pointer(PointerAt),
     /// The host's pointer changed shape.
     Shape(PointerShape),
+    /// The pictures may come over UDP: say where.
+    UdpPlease,
+    /// Nothing else to say: the pictures go over UDP, and this connection is still up.
+    Alive,
     Bye,
 }
 
@@ -84,6 +95,17 @@ pub enum Up {
     Input(Remote),
     /// A picture didn't decode: start again from a key picture.
     KeyPlease,
+    /// Send the pictures over UDP to this port, at the address this connection came from.
+    UdpAt(u16),
+    /// A packet came over UDP: the pictures can go that way.
+    UdpHeard,
+    /// The pictures stopped coming over UDP: send them here again.
+    TcpPlease,
+    /// How the pictures over UDP went in the last second: pictures lost, and rebuilt.
+    Losses {
+        lost: u32,
+        repaired: u32,
+    },
     Bye,
 }
 
@@ -138,6 +160,8 @@ impl Sealer {
             Down::Shape(PointerShape { size: [w, h], rgba }) => {
                 [&[SHAPE][..], &w.to_le_bytes(), &h.to_le_bytes(), rgba].concat()
             }
+            Down::UdpPlease => vec![UDP_PLEASE],
+            Down::Alive => vec![ALIVE],
             Down::Bye => vec![BYE],
         };
         self.send(out, &plain)
@@ -168,6 +192,14 @@ impl Sealer {
                 }
             }
             Up::KeyPlease => plain.push(KEY_PLEASE),
+            Up::UdpAt(port) => plain.extend_from_slice(&[&[UDP_AT][..], &port.to_le_bytes()].concat()),
+            Up::UdpHeard => plain.push(UDP_HEARD),
+            Up::TcpPlease => plain.push(TCP_PLEASE),
+            Up::Losses { lost, repaired } => {
+                plain.push(LOSSES);
+                plain.extend_from_slice(&lost.to_le_bytes());
+                plain.extend_from_slice(&repaired.to_le_bytes());
+            }
             Up::Bye => plain.push(BYE),
         }
         self.send(out, &plain)
@@ -225,6 +257,8 @@ impl Opener {
                 }
                 Down::Shape(shape)
             }
+            UDP_PLEASE => Down::UdpPlease,
+            ALIVE => Down::Alive,
             BYE => Down::Bye,
             _ => return Err(invalid("an unknown message")),
         })
@@ -249,6 +283,17 @@ impl Opener {
                 _ => return Err(invalid("an unknown input")),
             }),
             KEY_PLEASE => Up::KeyPlease,
+            UDP_AT => {
+                Up::UdpAt(u16::from_le_bytes([*plain.get(1).ok_or_else(short)?, *plain.get(2).ok_or_else(short)?]))
+            }
+            UDP_HEARD => Up::UdpHeard,
+            TCP_PLEASE => Up::TcpPlease,
+            LOSSES => {
+                let word = |at: usize| {
+                    plain.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or_else(short)
+                };
+                Up::Losses { lost: word(1)?, repaired: word(5)? }
+            }
             BYE => Up::Bye,
             _ => return Err(invalid("an unknown message")),
         })
@@ -282,6 +327,8 @@ mod tests {
             Down::Pointer(PointerAt { at: [-3, 1079], visible: true }),
             Down::Pointer(PointerAt { at: [0, 0], visible: false }),
             Down::Shape(PointerShape { size: [2, 1], rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] }),
+            Down::UdpPlease,
+            Down::Alive,
             Down::Bye,
         ];
         for down in &downs {
@@ -298,6 +345,10 @@ mod tests {
             Up::Input(Remote::Wheel { dx: 0.0, dy: -120.0 }),
             Up::Input(Remote::Key { hid: 0x1234, down: false }),
             Up::KeyPlease,
+            Up::UdpAt(50_123),
+            Up::UdpHeard,
+            Up::TcpPlease,
+            Up::Losses { lost: 3, repaired: 70_000 },
             Up::Bye,
         ];
         let mut wire = Vec::new();

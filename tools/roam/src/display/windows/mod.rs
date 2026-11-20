@@ -189,6 +189,9 @@ fn capture(
     let mut nudged = false;
     let mut last_change = Instant::now() - SETTLE;
     while !stop.load(Ordering::Acquire) && !feed.stopped() {
+        // The network's wish for a lower bitrate, or a higher one again; a new encoder after a
+        // restart starts at full and takes it again here.
+        pictures.set_rate(feed.rate());
         let now = Instant::now();
         // Look again soon while a change waits for the network, or the encoder has had a
         // picture only a short while; one it keeps for good mustn't keep the loop spinning.

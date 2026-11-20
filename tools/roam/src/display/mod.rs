@@ -20,6 +20,7 @@ pub mod h264;
 #[cfg(any(windows, test))]
 mod nv12;
 pub mod stream;
+pub mod udp;
 
 #[cfg(target_os = "macos")]
 mod mac;
@@ -27,7 +28,7 @@ mod mac;
 mod windows;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -149,6 +150,8 @@ struct FeedInner {
     /// The pointer's place goes the quick way, in the session's packets: the picture stream
     /// then only says when it shows or hides.
     quick: AtomicBool,
+    /// How much of its full bitrate the encoder may use, in percent; 0 is all of it.
+    rate: AtomicU32,
     tally: Mutex<Tally>,
     notes: Mutex<Vec<String>>,
 }
@@ -318,6 +321,19 @@ impl Feed {
 
     pub fn quick(&self) -> bool {
         self.0.quick.load(Ordering::Acquire)
+    }
+
+    /// The network is losing pictures: the encoder should use this much of its full bitrate.
+    pub fn set_rate(&self, percent: u32) {
+        self.0.rate.store(percent.clamp(1, 100), Ordering::Release);
+    }
+
+    /// How much of its full bitrate the encoder should use, in percent.
+    pub fn rate(&self) -> u32 {
+        match self.0.rate.load(Ordering::Acquire) {
+            0 => 100,
+            percent => percent,
+        }
     }
 
     /// The pointer's news since the last call.
