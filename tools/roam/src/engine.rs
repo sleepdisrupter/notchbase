@@ -65,6 +65,10 @@ const CORNER: f64 = 12.0;
 const SHORT_TEXT: usize = 16 * 1024;
 /// How often a drag held against the edge is checked for files.
 const DRAG_CHECK_EVERY: u64 = 60 * MS;
+/// How long after the cursor arrives on another computer it stays there whatever the mouse
+/// does: the first moves after a crossing can carry the push that made it, or a jump from the
+/// cursor being parked, which would send it straight back (or somewhere else) at once.
+const SETTLE_AFTER_CROSSING: u64 = 120 * MS;
 /// How often a held button is checked against the mouse itself.
 const BUTTONS_CHECK_EVERY: u64 = 500 * MS;
 /// How often the log may say why the edge didn't cross.
@@ -549,6 +553,8 @@ struct Core {
     /// When this computer's own drag was last checked for files, and the computer the cursor
     /// is on was last asked.
     drag_checked_at: u64,
+    /// When the cursor last arrived on another computer.
+    entered_at: u64,
     // The controlled side:
     /// The controller's left button is held while files it dragged here are on their way.
     drag_held: bool,
@@ -648,6 +654,7 @@ impl Core {
             peer_dragging: None,
             drag_home: false,
             drag_checked_at: 0,
+            entered_at: 0,
             drag_held: false,
             drag_out: None,
             played_at: [0.0, 0.0],
@@ -1880,6 +1887,10 @@ impl Core {
                         self.drag_home = true;
                         step
                     }
+                    // Just arrived: it stays, rather than bouncing straight back.
+                    Step::Cross { .. } if now < self.entered_at + SETTLE_AFTER_CROSSING => {
+                        Step::Stay(desk[on].onto_displays([at[0] + scaled[0], at[1] + scaled[1]]))
+                    }
                     // No dragging across otherwise: a held button keeps the cursor where the drag
                     // started.
                     Step::Cross { to, .. } if self.held_buttons != 0 || self.locked => {
@@ -1984,6 +1995,7 @@ impl Core {
         if self.cursor == Cursor::Home {
             self.platform.capture(true);
         }
+        self.entered_at = now;
         self.cursor = Cursor::Away { peer, at: arrive, left_from };
         self.flush(now, true);
         if self.prefs.clipboard {

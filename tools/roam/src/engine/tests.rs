@@ -60,6 +60,11 @@ impl Machine {
     }
 }
 
+/// Waits out the moment after a crossing when the cursor stays put whatever the mouse does.
+fn settle() {
+    std::thread::sleep(Duration::from_millis(super::SETTLE_AFTER_CROSSING / super::MS + 30));
+}
+
 fn pair() -> (Machine, Machine) {
     let a_port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
     let b_port = a_port + 1;
@@ -133,11 +138,39 @@ fn pairing_then_the_cursor_crosses_over_and_back() {
 
     // A key held when the cursor goes home is let go on the PC.
     a.fake.input(Input::Key { hid: 0x05, down: true });
+    settle();
     a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [-100.0, 0.0] });
     a.wait_for("coming home", |s| !s.captured);
     let warped = *a.fake.state().warped.last().unwrap();
     assert_eq!(warped[0], 1509.0);
     b.wait_for("letting go", |s| s.played.last() == Some(&Play::Key { hid: 5, down: false }));
+}
+
+#[test]
+fn a_jolt_right_after_crossing_does_not_bounce_the_cursor_back() {
+    let (mut a, mut b) = pair();
+    let (a_id, b_id) = (a.id(), b.id());
+    place(&mut a, &mut b);
+    a.until("the code", |s| !s.asks.is_empty());
+    b.until("the request", |s| !s.asks.is_empty());
+    a.engine.send(Control::Allow(b_id.clone()));
+    b.engine.send(Control::Allow(a_id.clone()));
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+    a.wait_for("listening to the mouse", |s| s.sink.is_some());
+    a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [3.0, 0.0] });
+    a.wait_for("capturing", |s| s.captured);
+
+    // The very next move jumps back past the edge, as a parked cursor's first move can: it
+    // stays over on the PC.
+    a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [-200.0, 0.0] });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(a.fake.state().captured, "the cursor stayed on the PC");
+
+    // Once it has settled, going back works as usual.
+    settle();
+    a.fake.input(Input::Move { at: [1511.0, 480.0], delta: [-200.0, 0.0] });
+    a.wait_for("coming home", |s| !s.captured);
 }
 
 #[test]
@@ -517,6 +550,7 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
         s.played.iter().any(|p| matches!(p, Play::Move([x, _]) if *x < 1512.0))
     });
     // And straight back the way it came.
+    settle();
     a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [-10.0, 0.0] });
     a.wait_for("coming home", |s| !s.captured);
 
