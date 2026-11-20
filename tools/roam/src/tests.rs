@@ -253,3 +253,141 @@ fn a_computer_that_cant_lend_its_screen_says_why() {
     harness.right_click(0, x, y);
     assert!(harness.shows("Update notchbase on Desk PC first"));
 }
+
+/// Every shape drawn on the page's canvases, as JSON.
+fn shapes(harness: &mut Harness<Tool>) -> Vec<serde_json::Value> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(shapes)) = map.get("shapes")
+                    && map.contains_key("width")
+                {
+                    out.extend(shapes.iter().cloned());
+                }
+                map.values().for_each(|v| walk(v, out));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let page = serde_json::to_value(harness.page()).unwrap();
+    let mut out = Vec::new();
+    walk(&page, &mut out);
+    out
+}
+
+fn two_screen_pc() -> PeerView {
+    let mut pc = view("pc", "Desk PC", Os::Windows, LinkState::Connected);
+    // A small second screen up and to the left of the main one, as on a laptop with a monitor.
+    pc.displays = vec![Rect::new(0.0, 0.0, 1920.0, 1080.0), Rect::new(-1500.0, -900.0, 1500.0, 900.0)];
+    pc.ppu = 1.0;
+    pc
+}
+
+#[test]
+fn a_moved_screen_saves_on_its_own_and_undo_puts_it_back() {
+    let mut harness = Harness::<Tool>::start();
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]))));
+    harness.click("Add");
+    harness.click("Undo");
+    assert_eq!(desk(&harness).len(), 1, "Undo takes the PC off again");
+    harness.click("Add");
+    let before = desk(&harness);
+    let view = View::fit(&harness.model().desk);
+    let pc = harness.model().desk[1].computer().rect();
+    let grab = view.to_canvas([pc.x + pc.w / 2.0, pc.y + pc.h / 2.0]);
+    let target = view.to_canvas([pc.x + pc.w / 2.0, pc.y + pc.h / 2.0 + 400.0]);
+    harness.pointer(0, Pointer::at(PointerKind::Press, grab[0], grab[1]));
+    harness.pointer(0, Pointer::at(PointerKind::Drag, target[0], target[1]));
+    assert!(harness.shows("Lines show where edges line up"));
+    let lines = shapes(&mut harness).into_iter().filter(|s| s["type"] == "line").count();
+    assert!(lines >= 1, "a guide where the PC meets the Mac");
+    harness.pointer(0, Pointer::at(PointerKind::Release, target[0], target[1]));
+    let after = desk(&harness);
+    assert_ne!(after[1].at, before[1].at, "saved as soon as it's dropped");
+    assert!(harness.shows("Saved"));
+    harness.click("Undo");
+    assert_eq!(desk(&harness)[1].at, before[1].at);
+}
+
+#[test]
+fn a_name_sits_on_its_main_screen_not_between_screens() {
+    let mut harness = Harness::<Tool>::start();
+    harness.send(Msg::Status(Box::new(status(vec![two_screen_pc()]))));
+    harness.click("Add");
+    let view = View::fit(&harness.model().desk);
+    let pc = harness.model().desk[1].computer();
+    let main = pc.desk_displays()[0];
+    let [left, top] = view.to_canvas([main.x, main.y]);
+    let [right, bottom] = view.to_canvas([main.right(), main.bottom()]);
+    let label = shapes(&mut harness).into_iter().find(|s| s["text"] == "Desk PC").expect("the PC's name is drawn");
+    let [x, y] = [label["at"][0].as_f64().unwrap() as f32, label["at"][1].as_f64().unwrap() as f32];
+    assert!(x > left && x < right && y > top && y < bottom, "{x},{y} in {left},{top} to {right},{bottom}");
+}
+
+#[test]
+fn right_clicking_one_of_several_screens_picks_that_one() {
+    let mut harness = Harness::<Tool>::start();
+    let mut update = status(vec![two_screen_pc()]);
+    update.ability = Ability::Ready;
+    harness.send(Msg::Status(Box::new(update)));
+    harness.click("Add");
+    assert!(harness.shows("Right-click one of its screens to use it as a display"));
+    assert!(!harness.shows("Turn into extended display"));
+    let view = View::fit(&harness.model().desk);
+    let second = harness.model().desk[1].computer().desk_displays()[1];
+    let [x, y] = view.to_canvas([second.x + second.w / 2.0, second.y + second.h / 2.0]);
+    harness.right_click(0, x, y);
+    assert_eq!(harness.model().menu, Some(("pc".to_owned(), 1)));
+    assert!(harness.shows("Desk PC's screen 2"));
+    assert!(!harness.shows("Desk PC's screen 1"));
+    harness.click("Turn into extended display");
+}
+
+#[test]
+fn a_screen_coming_or_going_leaves_the_others_where_they_were() {
+    let mut harness = Harness::<Tool>::start();
+    harness.send(Msg::Status(Box::new(status(vec![two_screen_pc()]))));
+    harness.click("Add");
+    let main_before = harness.model().desk[1].computer().desk_displays()[0];
+    // The monitor is unplugged: only the main screen is left.
+    let mut pc = two_screen_pc();
+    pc.displays.truncate(1);
+    harness.send(Msg::Status(Box::new(status(vec![pc]))));
+    let spot = &desk(&harness)[1];
+    assert_eq!(spot.displays.len(), 1);
+    assert_eq!(spot.computer().desk_displays()[0], main_before, "the main screen didn't move");
+    // And plugged back in.
+    harness.send(Msg::Status(Box::new(status(vec![two_screen_pc()]))));
+    assert_eq!(desk(&harness)[1].computer().desk_displays()[0], main_before);
+}
+
+/// Writes the desk's shapes to ROAM_PREVIEW, for looking at the editor while working on it.
+#[test]
+#[ignore = "a preview, not a check"]
+fn preview_the_desk() {
+    let Ok(path) = std::env::var("ROAM_PREVIEW") else { return };
+    let mut harness = Harness::<Tool>::start();
+    let mut mac = view("mac", "John's MacBook Air", Os::Mac, LinkState::Connected);
+    mac.displays = vec![Rect::new(0.0, 0.0, 1470.0, 956.0), Rect::new(-225.0, -1080.0, 1920.0, 1080.0)];
+    mac.ppu = 1.0;
+    let mut me = view("me", "DESKTOP-FTP7GKN", Os::Windows, LinkState::None);
+    me.displays = vec![Rect::new(0.0, 0.0, 1920.0, 1200.0), Rect::new(1920.0, -300.0, 2560.0, 1440.0)];
+    me.ppu = 1.25;
+    let mut update = Status { me: Some(me), peers: vec![mac], ability: Ability::Ready, ..Status::default() };
+    harness.send(Msg::Status(Box::new(update.clone())));
+    harness.click("Add");
+    update.away_on = Some("John's MacBook Air".into());
+    harness.send(Msg::Status(Box::new(update)));
+    let view = View::fit(&harness.model().desk);
+    let mac = harness.model().desk[1].computer().desk_displays()[0];
+    let grab = view.to_canvas([mac.x + 10.0, mac.y + 10.0]);
+    harness.pointer(0, Pointer::at(PointerKind::Press, grab[0], grab[1]));
+    harness.pointer(0, Pointer::at(PointerKind::Drag, grab[0] - 60.0, grab[1] + 5.0));
+    let dragging = shapes(&mut harness);
+    harness.pointer(0, Pointer::at(PointerKind::Release, grab[0] - 60.0, grab[1] + 5.0));
+    let resting = shapes(&mut harness);
+    let texts = harness.texts();
+    let out = serde_json::json!({ "dragging": dragging, "resting": resting, "texts": texts });
+    std::fs::write(path, out.to_string()).unwrap();
+}

@@ -41,11 +41,13 @@ const ADDRESSES: &str = "addresses";
 const DESK: &str = "desk";
 
 const WIDTH: f32 = 340.0;
-const HEIGHT: f32 = 170.0;
+const HEIGHT: f32 = 200.0;
 const PAD: f32 = 14.0;
 const SNAP: f32 = 10.0;
 const GLYPH: f32 = 14.0;
 const RING: f32 = 13.0;
+/// How many arrangements back Undo goes.
+const UNDO_DEPTH: usize = 30;
 const ASK_FOR: Duration = Duration::from_secs(30);
 const SCROLL_MIN: f32 = 0.25;
 const SCROLL_MAX: f32 = 4.0;
@@ -110,10 +112,10 @@ impl View {
     fn fit(spots: &[Spot]) -> Self {
         let rects: Vec<Rect> = spots.iter().map(|s| s.computer().rect()).collect();
         let bounds = layout::bounds(&rects);
-        let room = [f64::from(WIDTH - PAD * 2.0), f64::from(HEIGHT - PAD * 2.0 - 12.0)];
+        let room = [f64::from(WIDTH - PAD * 2.0), f64::from(HEIGHT - PAD * 2.0)];
         let scale = (room[0] / bounds.w).min(room[1] / bounds.h).min(0.2);
         let used = [bounds.w * scale, bounds.h * scale];
-        let offset = [(f64::from(WIDTH) - used[0]) / 2.0, (f64::from(HEIGHT) - 12.0 - used[1]) / 2.0];
+        let offset = [(f64::from(WIDTH) - used[0]) / 2.0, (f64::from(HEIGHT) - used[1]) / 2.0];
         View { scale, origin: [bounds.x, bounds.y], offset }
     }
 
@@ -132,12 +134,14 @@ impl View {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Drag {
     index: usize,
     grab: [f64; 2],
     view: View,
     moved: bool,
+    /// The desk before the drag, for Undo.
+    before: Vec<Spot>,
 }
 
 /// What starts the engine: the real one, or none in tests.
@@ -164,6 +168,10 @@ pub struct Roam<B: Backend = Native> {
     draft: String,
     /// The screen right-clicked on the desk: whose, and which of its displays.
     menu: Option<(String, u8)>,
+    /// The computer under the pointer on the desk.
+    hover: Option<String>,
+    /// Earlier arrangements, newest last, for Undo.
+    history: Vec<Vec<Spot>>,
     backend: PhantomData<B>,
 }
 
@@ -189,13 +197,14 @@ pub enum Msg {
     Scroll(String, f32),
     /// A right click on the desk.
     Menu(Pointer),
-    CloseMenu,
     /// Make that computer's display an extended display of this one.
     Extend(String, u8),
     /// Give that computer's screen back.
     Unextend(String),
     /// Take this computer's screen back from the computer using it as a display.
     StopLending,
+    /// Put the desk back the way it was before the last change.
+    Undo,
 }
 
 fn prefs(settings: &Settings) -> Prefs {
@@ -296,6 +305,8 @@ impl<B: Backend> Tool for Roam<B> {
             asked: Vec::new(),
             draft: String::new(),
             menu: None,
+            hover: None,
+            history: Vec::new(),
             backend: PhantomData,
         };
         (roam, pump)
@@ -323,11 +334,13 @@ impl<B: Backend> Tool for Roam<B> {
                 self.ensure_me();
                 let computers: Vec<Computer> = self.desk.iter().map(Spot::computer).collect();
                 let spot = Spot::from_view(&peer, layout::free_spot(&computers));
+                self.remember();
                 self.selected = Some(spot.id.clone());
                 self.desk.push(spot);
                 self.desk_changed()
             }
             Msg::Remove(id) => {
+                self.remember();
                 self.desk.retain(|s| s.id != id);
                 if self.selected.as_deref() == Some(&id) {
                     self.selected = None;
@@ -348,11 +361,15 @@ impl<B: Backend> Tool for Roam<B> {
             }
             Msg::Forget(id) => {
                 self.control(Control::Forget(id.clone()));
+                self.remember();
                 self.desk.retain(|s| s.id != id);
                 self.selected = None;
                 self.desk_changed()
             }
             Msg::Select(id) => {
+                if id != self.selected {
+                    self.menu = None;
+                }
                 self.selected = id;
                 Command::none()
             }
@@ -404,10 +421,6 @@ impl<B: Backend> Tool for Roam<B> {
                 }
                 Command::none()
             }
-            Msg::CloseMenu => {
-                self.menu = None;
-                Command::none()
-            }
             Msg::Extend(id, display) => {
                 self.menu = None;
                 self.control(Control::Extend { id, display });
@@ -421,6 +434,14 @@ impl<B: Backend> Tool for Roam<B> {
             Msg::StopLending => {
                 self.control(Control::StopLending);
                 Command::none()
+            }
+            Msg::Undo => {
+                let Some(before) = self.history.pop() else { return Command::none() };
+                self.desk = before;
+                if self.selected.as_ref().is_some_and(|id| !self.desk.iter().any(|s| &s.id == id)) {
+                    self.selected = None;
+                }
+                self.desk_changed()
             }
         }
     }
@@ -443,16 +464,7 @@ impl<B: Backend> Tool for Roam<B> {
     fn page(&self) -> Option<Element<Msg>> {
         let mut parts: Vec<Element<Msg>> = Vec::new();
         if let Some(problem) = &self.status.problem {
-            parts.push(card(
-                row![
-                    icon(Icon::Exclamation).tone(Tone::Orange),
-                    text(problem.clone()).callout().wrap(),
-                    spacer(),
-                    button("Allow").on_press(Msg::Permission),
-                ]
-                .spacing(8.0)
-                .align(Align::Center),
-            ));
+            parts.push(banner(Icon::Exclamation, Tone::Orange, problem.clone(), None, ("Allow", Msg::Permission)));
         }
         for ask in &self.status.asks {
             parts.push(ask_card(ask));
@@ -461,40 +473,21 @@ impl<B: Backend> Tool for Roam<B> {
             parts.push(transfer_view(transfer));
         }
         if let Some(name) = &self.status.away_on {
-            parts.push(
-                row![
-                    icon(Icon::Mouse).tone(Tone::Blue),
-                    column![
-                        text(format!("On {name}")).headline(),
-                        text(if self.status.locked {
-                            format!("Locked there · {HOME_KEYS} brings it back")
-                        } else {
-                            format!("{HOME_KEYS} brings it back")
-                        })
-                        .caption()
-                        .secondary(),
-                    ]
-                    .spacing(2.0),
-                    spacer(),
-                    button("Bring back").on_press(Msg::Home),
-                ]
-                .spacing(8.0)
-                .align(Align::Center)
-                .into(),
-            );
+            let detail = if self.status.locked {
+                format!("Locked there · {HOME_KEYS} brings it back")
+            } else {
+                format!("{HOME_KEYS} brings it back")
+            };
+            parts.push(banner(Icon::Mouse, Tone::Blue, format!("On {name}"), Some(detail), ("Bring back", Msg::Home)));
         }
         if let Some(name) = &self.status.controller {
-            parts.push(
-                row![
-                    icon(Icon::Keyboard).tone(Tone::Green),
-                    text(format!("Using {name}'s keyboard and mouse")).callout(),
-                    spacer(),
-                    button("Stop").on_press(Msg::Release),
-                ]
-                .spacing(8.0)
-                .align(Align::Center)
-                .into(),
-            );
+            parts.push(banner(
+                Icon::Keyboard,
+                Tone::Green,
+                format!("Using {name}'s keyboard and mouse"),
+                None,
+                ("Stop", Msg::Release),
+            ));
         }
         for extended in &self.status.extended {
             parts.push(extended_view(extended));
@@ -502,33 +495,24 @@ impl<B: Backend> Tool for Roam<B> {
         if let Some(lending) = &self.status.lending {
             let me = self.me().map_or(1, |m| m.displays.len());
             let which = if me > 1 { format!("screen {}", lending.display + 1) } else { "screen".to_owned() };
-            parts.push(
-                row![
-                    icon(Icon::Display).tone(Tone::Green),
-                    text(format!("{} is using this computer's {which} as a display", lending.to)).callout().wrap(),
-                    spacer(),
-                    button("Stop").on_press(Msg::StopLending),
-                ]
-                .spacing(8.0)
-                .align(Align::Center)
-                .into(),
-            );
+            parts.push(banner(
+                Icon::Display,
+                Tone::Green,
+                format!("{} is using this computer's {which} as a display", lending.to),
+                Some("Your mouse and keyboard work on it as usual".into()),
+                ("Stop", Msg::StopLending),
+            ));
         }
         if !self.prefs.open && self.status.controller.is_none() {
-            parts.push(
-                row![
-                    text("Hidden from other computers").callout().secondary(),
-                    spacer(),
-                    button("Show").on_press(Msg::Open(true)),
-                ]
-                .align(Align::Center)
-                .into(),
-            );
+            parts.push(banner(
+                Icon::Lock,
+                Tone::Secondary,
+                "Hidden from other computers".into(),
+                Some("They can't find or use this computer".into()),
+                ("Show", Msg::Open(true)),
+            ));
         }
         parts.push(self.desk_view());
-        if let Some(menu) = self.menu_view() {
-            parts.push(menu);
-        }
         if let Some(details) = self.selected_details() {
             parts.push(details);
         }
@@ -640,15 +624,21 @@ fn extended_view(extended: &ExtendedView) -> Element<Msg> {
             "Disconnect",
         ),
     };
-    row![
-        icon(Icon::Display).tone(Tone::Blue),
-        column![text(title).callout().wrap(), text(detail).caption().secondary().wrap()].spacing(2.0),
-        spacer(),
-        button(action).on_press(Msg::Unextend(id)),
-    ]
-    .spacing(8.0)
-    .align(Align::Center)
-    .into()
+    banner(Icon::Display, Tone::Blue, title, Some(detail), (action, Msg::Unextend(id)))
+}
+
+/// A card at the top of the page for what's going on now: an icon, what it is, a word more,
+/// and the one thing to do about it.
+fn banner(glyph: Icon, tone: Tone, title: String, detail: Option<String>, (label, msg): (&str, Msg)) -> Element<Msg> {
+    let mut words: Vec<Element<Msg>> = vec![text(title).callout().wrap().into()];
+    if let Some(detail) = detail {
+        words.push(text(detail).caption().secondary().wrap().into());
+    }
+    card(
+        row![badge(glyph, tone, 28.0), column(words).spacing(2.0), spacer(), button(label).on_press(msg)]
+            .spacing(10.0)
+            .align(Align::Center),
+    )
 }
 
 fn percent(transfer: &Transfer) -> String {
@@ -786,7 +776,15 @@ impl<B: Backend> Roam<B> {
     }
 
     fn view(&self) -> View {
-        self.drag.map_or_else(|| View::fit(&self.desk), |drag| drag.view)
+        self.drag.as_ref().map_or_else(|| View::fit(&self.desk), |drag| drag.view)
+    }
+
+    /// Keeps the desk as it is now, for Undo.
+    fn remember(&mut self) {
+        self.history.push(self.desk.clone());
+        if self.history.len() > UNDO_DEPTH {
+            self.history.remove(0);
+        }
     }
 
     fn pointer(&mut self, pointer: Pointer) -> Command<Msg> {
@@ -795,11 +793,13 @@ impl<B: Backend> Roam<B> {
                 let view = self.view();
                 let at = view.to_desk(pointer.x, pointer.y);
                 // The top-most spot under the pointer is the last drawn.
-                let hit = self.desk.iter().rposition(|s| s.computer().rect().contains(at));
+                let hit = self.computer_at(at).and_then(|id| self.desk.iter().position(|s| s.id == id));
                 if let Some(index) = hit {
                     let grab = [at[0] - self.desk[index].at[0], at[1] - self.desk[index].at[1]];
-                    self.drag = Some(Drag { index, grab, view, moved: false });
+                    let before = self.desk.clone();
+                    self.drag = Some(Drag { index, grab, view, moved: false, before });
                     self.selected = Some(self.desk[index].id.clone());
+                    self.menu = None;
                 }
                 Command::none()
             }
@@ -817,21 +817,55 @@ impl<B: Backend> Roam<B> {
                 }
                 Command::none()
             }
-            PointerKind::Release | PointerKind::Leave => match self.drag.take() {
-                Some(drag) if drag.moved => self.desk_changed(),
-                _ => Command::none(),
-            },
+            PointerKind::Release | PointerKind::Leave => {
+                if pointer.kind == PointerKind::Leave {
+                    self.hover = None;
+                }
+                match self.drag.take() {
+                    Some(drag) if drag.moved => self.moved(drag),
+                    _ => Command::none(),
+                }
+            }
+            PointerKind::Hover => {
+                let at = self.view().to_desk(pointer.x, pointer.y);
+                self.hover = self.computer_at(at);
+                Command::none()
+            }
             PointerKind::Click => {
-                if self.drag.take().is_some_and(|d| d.moved) {
-                    return self.desk_changed();
+                if let Some(drag) = self.drag.take().filter(|d| d.moved) {
+                    return self.moved(drag);
                 }
                 let at = self.view().to_desk(pointer.x, pointer.y);
-                let hit = self.desk.iter().rev().find(|s| s.computer().rect().contains(at)).map(|s| s.id.clone());
+                let hit = self.computer_at(at);
+                if hit != self.selected {
+                    self.menu = None;
+                }
                 self.selected = hit;
                 Command::none()
             }
             _ => Command::none(),
         }
+    }
+
+    /// A drag that moved a computer: keep the desk from before it for Undo, and save.
+    fn moved(&mut self, drag: Drag) -> Command<Msg> {
+        if drag.before == self.desk {
+            return Command::none();
+        }
+        self.history.push(drag.before);
+        if self.history.len() > UNDO_DEPTH {
+            self.history.remove(0);
+        }
+        self.desk_changed()
+    }
+
+    /// The computer with a screen at `at` on the desk, the top-most one.
+    fn computer_at(&self, at: [f64; 2]) -> Option<String> {
+        self.desk
+            .iter()
+            .rev()
+            .find(|s| s.computer().desk_displays().iter().any(|d| d.contains(at)))
+            .map(|s| s.id.clone())
     }
 
     fn desk_view(&self) -> Element<Msg> {
@@ -851,44 +885,109 @@ impl<B: Backend> Roam<B> {
         let view = self.view();
         let me = self.me().map(|m| m.id.clone()).unwrap_or_default();
         let mut canvas = canvas::<Msg>(WIDTH, HEIGHT).stretch().on_pointer(Msg::Pointer).on_menu(Msg::Menu);
-        let away = self.status.away_on.clone();
-        for spot in &self.desk {
-            let peer = self.peer(&spot.id);
-            let mine = spot.id == me;
-            let connected = mine || peer.is_some_and(|p| p.link == LinkState::Connected);
-            let selected = self.selected.as_deref() == Some(spot.id.as_str());
-            let fill = if mine {
-                Color::rgba(90, 150, 255, 140)
-            } else if connected {
-                Color::rgba(90, 210, 140, 115)
+        // The desk itself, so the screens sit on something.
+        canvas = canvas.push(
+            draw::rect(0.5, 0.5, WIDTH - 1.0, HEIGHT - 1.0)
+                .radius(12.0)
+                .fill(Color::white(0.03))
+                .stroke(1.0, Color::white(0.06)),
+        );
+        let dragging = self.drag.as_ref().filter(|d| d.moved).map(|d| d.index);
+        for (index, spot) in self.desk.iter().enumerate() {
+            canvas = canvas.extend(self.spot_shapes(spot, view, &me, dragging == Some(index)));
+        }
+        if let Some(index) = dragging {
+            canvas = canvas.extend(guides(&self.desk, index, view));
+        }
+        let hint = if self.drag.as_ref().is_some_and(|d| d.moved) {
+            "Lines show where edges line up"
+        } else if matches!(self.status.ability, Ability::No(_)) {
+            "Drag the screens to match your desk"
+        } else {
+            "Drag the screens to match your desk · right-click one to use it as a display"
+        };
+        let mut footer: Vec<Element<Msg>> = vec![text(hint).caption().tertiary().wrap().into(), spacer()];
+        if !self.history.is_empty() {
+            footer.push(
+                row![icon(Icon::Checkmark).size(10.0).tone(Tone::Green), text("Saved").caption().secondary()]
+                    .spacing(3.0)
+                    .align(Align::Center)
+                    .into(),
+            );
+            footer.push(button("Undo").plain().on_press(Msg::Undo).into());
+        }
+        column![canvas, row(footer).spacing(6.0).align(Align::Center)].spacing(4.0).into()
+    }
+
+    /// One computer on the desk: each of its screens, its name on its main one, and where the
+    /// cursor is.
+    fn spot_shapes(&self, spot: &Spot, view: View, me: &str, dragging: bool) -> Vec<Shape> {
+        let peer = self.peer(&spot.id);
+        let mine = spot.id == me;
+        let connected = mine || peer.is_some_and(|p| p.link == LinkState::Connected);
+        let selected = self.selected.as_deref() == Some(spot.id.as_str());
+        let hovered = self.hover.as_deref() == Some(spot.id.as_str());
+        let tint = if mine {
+            [90, 150, 255]
+        } else if connected {
+            [70, 200, 130]
+        } else {
+            [150, 150, 160]
+        };
+        let computer = spot.computer();
+        let displays = computer.desk_displays();
+        let several = displays.len() > 1;
+        let mut shapes = Vec::new();
+        for (index, display) in displays.iter().enumerate() {
+            let [x, y] = view.to_canvas([display.x, display.y]);
+            let w = (display.w * view.scale) as f32;
+            let h = (display.h * view.scale) as f32;
+            let [x, y, w, h] = [x + 1.0, y + 1.0, (w - 2.0).max(2.0), (h - 2.0).max(2.0)];
+            // A screen lent here as a display is drawn as one of this computer's.
+            let lent = self.extended(&spot.id, index).is_some_and(|e| e.failed.is_none());
+            let [r, g, b] = if lent { [90, 150, 255] } else { tint };
+            let strength = if connected || lent { 1.0 } else { 0.45 };
+            let alpha = |a: f32| (a * strength) as u8;
+            let fill = draw::linear(Color::rgba(r, g, b, alpha(175.0)), Color::rgba(r, g, b, alpha(120.0)), 90.0);
+            let (width, edge) = if selected {
+                (1.5, Color::white(0.9))
+            } else if hovered || dragging {
+                (1.0, Color::white(0.4))
             } else {
-                Color::white(0.12)
+                (1.0, Color::white(0.1))
             };
-            let computer = spot.computer();
-            for (index, display) in computer.desk_displays().into_iter().enumerate() {
-                let [x, y] = view.to_canvas([display.x, display.y]);
-                let w = (display.w * view.scale) as f32;
-                let h = (display.h * view.scale) as f32;
-                // A screen lent here as a display is drawn as one of this computer's.
-                let lent = self.extended(&spot.id, index).is_some_and(|e| e.failed.is_none());
-                let fill = if lent { Color::rgba(90, 150, 255, 140) } else { fill };
-                let mut shape =
-                    draw::rect(x + 0.75, y + 0.75, (w - 1.5).max(1.0), (h - 1.5).max(1.0)).radius(3.0).fill(fill);
-                if selected {
-                    shape = shape.stroke(1.5, Color::white(0.9));
-                }
-                canvas = canvas.push(shape);
+            if dragging {
+                shapes.push(draw::shadow(x, y, w, h).radius(4.0).blur(8.0).color(Color::rgba(0, 0, 0, 120)));
             }
-            let rect = computer.rect();
-            let [cx, cy] = view.to_canvas([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
-            let [_, bottom] = view.to_canvas([rect.x, rect.bottom()]);
-            let label = if spot.name.chars().count() > 18 {
-                format!("{}…", spot.name.chars().take(17).collect::<String>())
-            } else {
-                spot.name.clone()
-            };
-            let tone = if connected { Color::white(0.95) } else { Color::white(0.55) };
-            canvas = canvas.push(draw::text(label, cx, cy).size(11.0).semibold().color(tone).anchor(Anchor::Center));
+            shapes.push(draw::rect(x, y, w, h).radius(4.0).fill(fill).stroke(width, edge));
+            if several && w > 14.0 && h > 12.0 {
+                shapes.push(
+                    draw::text(format!("{}", index + 1), x + 4.0, y + 3.0)
+                        .size(8.0)
+                        .semibold()
+                        .color(Color::white(0.6)),
+                );
+            }
+            if lent && h > 34.0 && w > 50.0 {
+                shapes.push(
+                    draw::text("Extended display", x + w / 2.0, y + h - 4.0)
+                        .size(8.0)
+                        .color(Color::white(0.75))
+                        .anchor(Anchor::Bottom),
+                );
+            }
+        }
+        // The name goes on the biggest screen, where it fits, never between screens.
+        let Some(display) = displays.get(biggest_display(&spot.displays)) else { return shapes };
+        let [x, y] = view.to_canvas([display.x, display.y]);
+        let (w, h) = ((display.w * view.scale) as f32, (display.h * view.scale) as f32);
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        // About how many characters fit across at each size.
+        let fits_at = |size: f32| ((w - 10.0) / (size * 0.62)).max(0.0) as usize;
+        let size = if spot.name.chars().count() <= fits_at(11.0) { 11.0 } else { 10.0 };
+        let fits = fits_at(size);
+        let tone = if connected { Color::white(0.95) } else { Color::white(0.6) };
+        if fits >= 3 && h >= 16.0 {
             let note = if mine {
                 "This computer".to_owned()
             } else if peer.is_some_and(|p| p.link == LinkState::Connected) {
@@ -896,18 +995,31 @@ impl<B: Backend> Roam<B> {
             } else {
                 state_words(peer)
             };
-            canvas =
-                canvas.push(draw::text(note, cx, bottom + 2.0).size(9.0).color(Color::white(0.5)).anchor(Anchor::Top));
-            if away.as_deref() == Some(spot.name.as_str()) || (mine && away.is_none()) {
-                canvas = canvas.push(draw::circle(cx, cy + 10.0, 2.5).fill(Color::white(0.9)));
+            let room_for_note = h >= 34.0;
+            let name_y = if room_for_note { cy - 6.0 } else { cy };
+            shapes.push(
+                draw::text(shorten(&spot.name, fits), cx, name_y)
+                    .size(size)
+                    .semibold()
+                    .color(tone)
+                    .anchor(Anchor::Center),
+            );
+            if room_for_note {
+                shapes.push(
+                    draw::text(shorten(&note, fits_at(9.0)), cx, cy + 8.0)
+                        .size(9.0)
+                        .color(Color::white(0.65))
+                        .anchor(Anchor::Center),
+                );
             }
         }
-        let hint = if matches!(self.status.ability, Ability::No(_)) {
-            "Drag the screens to match your desk"
-        } else {
-            "Drag the screens to match your desk · right-click one to use it as a display"
-        };
-        column![canvas, text(hint).caption().tertiary().align(Align::Center)].spacing(4.0).into()
+        let away = self.status.away_on.as_deref();
+        if away == Some(spot.name.as_str()) || (mine && away.is_none()) {
+            shapes.push(
+                draw::circle(x + w - 7.0, y + 7.0, 2.5).fill(Color::white(0.95)).stroke(1.0, Color::rgba(0, 0, 0, 90)),
+            );
+        }
+        shapes
     }
 
     fn extended(&self, id: &str, display: usize) -> Option<&ExtendedView> {
@@ -924,59 +1036,20 @@ impl<B: Backend> Roam<B> {
         })
     }
 
-    /// What can be done with the right-clicked screen.
-    fn menu_view(&self) -> Option<Element<Msg>> {
-        let (id, display) = self.menu.clone()?;
-        let spot = self.desk.iter().find(|s| s.id == id)?;
-        let peer = self.peer(&id);
-        let title = if spot.displays.len() > 1 {
-            format!("{}'s screen {}", spot.name, display + 1)
-        } else {
-            format!("{}'s screen", spot.name)
-        };
-        let (detail, action): (String, Element<Msg>) = match self.extended(&id, usize::from(display)) {
-            Some(extended) if extended.failed.is_none() => (
-                "A display of this computer now".into(),
-                button("Disconnect display").destructive().on_press(Msg::Unextend(id.clone())).into(),
-            ),
-            _ => {
-                let connected = peer.is_some_and(|p| p.link == LinkState::Connected);
-                let blocked = match &self.status.ability {
-                    Ability::No(why) => Some(why.clone()),
-                    _ if !connected => Some(format!("Connect to {} first", spot.name)),
-                    _ if !peer.is_some_and(|p| p.lends) => Some(format!("Update notchbase on {} first", spot.name)),
-                    _ => None,
-                };
-                let detail = blocked.clone().unwrap_or_else(|| match self.status.ability {
-                    Ability::NeedsDriver => {
-                        "Installs a free display driver first; Windows asks for permission once".into()
-                    }
-                    _ => "It becomes another display of this computer, like a monitor plugged in".into(),
-                });
-                let button = button("Turn into extended display")
-                    .filled()
-                    .enabled(blocked.is_none())
-                    .on_press(Msg::Extend(id.clone(), display));
-                (detail, button.into())
-            }
-        };
-        Some(card(
-            column![
-                row![
-                    icon(Icon::Display).tone(Tone::Blue),
-                    text(title).headline(),
-                    spacer(),
-                    button("").icon(Icon::Xmark).plain().on_press(Msg::CloseMenu),
-                ]
-                .spacing(8.0)
-                .align(Align::Center),
-                text(detail).caption().secondary().wrap(),
-                action,
-            ]
-            .spacing(6.0),
-        ))
+    /// Whether `display` of computer `id` can become a display of this one: why not, if not.
+    fn lend_blocked(&self, spot: &Spot) -> Option<String> {
+        let peer = self.peer(&spot.id);
+        let connected = peer.is_some_and(|p| p.link == LinkState::Connected);
+        match &self.status.ability {
+            Ability::No(why) => Some(why.clone()),
+            _ if !connected => Some(format!("Connect to {} first", spot.name)),
+            _ if !peer.is_some_and(|p| p.lends) => Some(format!("Update notchbase on {} first", spot.name)),
+            _ => None,
+        }
     }
 
+    /// The selected computer: how it's doing, what can be done with it and with each of its
+    /// screens, and its scroll speed. A right-clicked screen is the one picked out.
     fn selected_details(&self) -> Option<Element<Msg>> {
         let id = self.selected.clone()?;
         let spot = self.desk.iter().find(|s| s.id == id)?;
@@ -984,6 +1057,7 @@ impl<B: Backend> Roam<B> {
             return None;
         }
         let peer = self.peer(&id);
+        let connected = peer.is_some_and(|p| p.link == LinkState::Connected);
         let mut actions: Vec<Element<Msg>> = Vec::new();
         if peer.is_some_and(|p| p.link == LinkState::Declined) {
             actions.push(button("Try again").on_press(Msg::Retry(id.clone())).into());
@@ -992,24 +1066,94 @@ impl<B: Backend> Roam<B> {
             actions.push(button("Forget").on_press(Msg::Forget(id.clone())).into());
         }
         actions.push(button("Remove").destructive().on_press(Msg::Remove(id.clone())).into());
-        let mut line: Vec<Element<Msg>> = vec![
+        let glyph = if spot.os == Os::Windows.word() { Icon::Display } else { Icon::Device };
+        let mut header: Vec<Element<Msg>> = vec![
+            icon(glyph).tone(if connected { Tone::Green } else { Tone::Secondary }).into(),
             column![text(spot.name.clone()).headline(), text(state_words(peer)).caption().secondary()]
                 .spacing(2.0)
                 .into(),
             spacer(),
         ];
-        line.extend(actions);
-        let scroll = row![
-            text("Scroll speed").callout(),
-            slider(spot.scroll as f32)
-                .range(SCROLL_MIN, SCROLL_MAX)
-                .step(SCROLL_STEP)
-                .on_change(move |speed| Msg::Scroll(id.clone(), speed)),
-            text(times(spot.scroll)).callout().secondary(),
-        ]
-        .spacing(8.0)
-        .align(Align::Center);
-        Some(card(column![row(line).spacing(6.0).align(Align::Center), scroll].spacing(10.0)))
+        header.extend(actions);
+        header.push(button("").icon(Icon::Xmark).plain().on_press(Msg::Select(None)).into());
+        let mut parts: Vec<Element<Msg>> = vec![row(header).spacing(6.0).align(Align::Center).into()];
+
+        // Each screen, and whether it can be a display of this computer.
+        let blocked = self.lend_blocked(spot);
+        let picked = self.menu.as_ref().filter(|(m, _)| *m == id).map(|(_, d)| usize::from(*d));
+        let several = spot.displays.len() > 1;
+        for (index, display) in spot.displays.iter().enumerate() {
+            let display_index = u8::try_from(index).unwrap_or(u8::MAX);
+            let name = if several {
+                format!("{}'s screen {}", spot.name, index + 1)
+            } else {
+                format!("{}'s screen", spot.name)
+            };
+            let size = format!("{} × {}", display.w.round() as u32, display.h.round() as u32);
+            let extended = self.extended(&id, index);
+            let (detail, action): (String, Element<Msg>) = match extended {
+                Some(extended) if extended.failed.is_none() => (
+                    match &extended.working {
+                        Some(working) => format!("{working}…"),
+                        None => "A display of this computer now".into(),
+                    },
+                    button("Disconnect display").destructive().on_press(Msg::Unextend(id.clone())).into(),
+                ),
+                _ => {
+                    let detail = blocked.clone().unwrap_or_else(|| match self.status.ability {
+                        Ability::NeedsDriver => {
+                            "Installs a free display driver first; Windows asks for permission once".into()
+                        }
+                        _ => format!("{size} · Becomes another display of this computer, like a monitor plugged in"),
+                    });
+                    let button = button("Turn into extended display")
+                        .filled()
+                        .enabled(blocked.is_none())
+                        .on_press(Msg::Extend(id.clone(), display_index));
+                    (detail, button.into())
+                }
+            };
+            // Only the right-clicked screen shows its button when there are several; the
+            // others offer theirs on a right-click.
+            if several && picked != Some(index) && extended.is_none() {
+                continue;
+            }
+            let lit = picked == Some(index) || extended.is_some_and(|e| e.failed.is_none());
+            parts.push(divider());
+            parts.push(
+                column![
+                    row![
+                        icon(Icon::Display).tone(if lit { Tone::Blue } else { Tone::Secondary }),
+                        text(name).callout(),
+                    ]
+                    .spacing(8.0)
+                    .align(Align::Center),
+                    text(detail).caption().secondary().wrap(),
+                    action,
+                ]
+                .spacing(6.0)
+                .into(),
+            );
+        }
+        if several && picked.is_none() && !matches!(self.status.ability, Ability::No(_)) {
+            parts
+                .push(text("Right-click one of its screens to use it as a display").caption().tertiary().wrap().into());
+        }
+        parts.push(divider());
+        parts.push(
+            row![
+                text("Scroll speed").callout(),
+                slider(spot.scroll as f32)
+                    .range(SCROLL_MIN, SCROLL_MAX)
+                    .step(SCROLL_STEP)
+                    .on_change(move |speed| Msg::Scroll(id.clone(), speed)),
+                text(times(spot.scroll)).callout().secondary(),
+            ]
+            .spacing(8.0)
+            .align(Align::Center)
+            .into(),
+        );
+        Some(card(column(parts).spacing(10.0)))
     }
 
     fn nearby(&self) -> Element<Msg> {
@@ -1080,6 +1224,67 @@ impl<B: Backend> Roam<B> {
     }
 }
 
+/// A computer's main screen: the one at its origin, or else its biggest.
+fn main_display(displays: &[Rect]) -> usize {
+    displays.iter().position(|d| d.contains([0.0, 0.0])).unwrap_or_else(|| biggest_display(displays))
+}
+
+/// The screen with the most room, for a computer's name.
+fn biggest_display(displays: &[Rect]) -> usize {
+    let area = |d: &Rect| d.w * d.h;
+    (0..displays.len()).max_by(|&a, &b| area(&displays[a]).total_cmp(&area(&displays[b])).then(b.cmp(&a))).unwrap_or(0)
+}
+
+/// Words cut to `most` characters, with an ellipsis when cut.
+fn shorten(words: &str, most: usize) -> String {
+    if words.chars().count() <= most {
+        return words.to_owned();
+    }
+    let kept: String = words.chars().take(most.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// Lines where the dragged computer's screen edges meet or line up with another's, so it's
+/// clear what it snapped to.
+fn guides(desk: &[Spot], moving: usize, view: View) -> Vec<Shape> {
+    const NEAR: f64 = 0.5;
+    let Some(spot) = desk.get(moving) else { return Vec::new() };
+    let mine = spot.computer().desk_displays();
+    let others: Vec<Rect> = desk
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != moving)
+        .flat_map(|(_, s)| s.computer().desk_displays())
+        .collect();
+    let color = Color::rgba(255, 204, 0, 220);
+    let mut lines: Vec<[f64; 4]> = Vec::new();
+    for a in &mine {
+        for b in &others {
+            let (top, bottom) = (a.y.min(b.y), a.bottom().max(b.bottom()));
+            let (left, right) = (a.x.min(b.x), a.right().max(b.right()));
+            for x in [a.x, a.right()] {
+                if [b.x, b.right()].iter().any(|bx| (bx - x).abs() < NEAR) {
+                    lines.push([x, top, x, bottom]);
+                }
+            }
+            for y in [a.y, a.bottom()] {
+                if [b.y, b.bottom()].iter().any(|by| (by - y).abs() < NEAR) {
+                    lines.push([left, y, right, y]);
+                }
+            }
+        }
+    }
+    lines.dedup();
+    lines
+        .into_iter()
+        .map(|[x1, y1, x2, y2]| {
+            let from = view.to_canvas([x1, y1]);
+            let to = view.to_canvas([x2, y2]);
+            draw::line([(from[0], from[1]), (to[0], to[1])]).stroke(1.0, color)
+        })
+        .collect()
+}
+
 /// A multiplier as people read it: 1×, 1.5×, 0.25×.
 fn times(speed: f64) -> String {
     let words = format!("{speed:.2}");
@@ -1091,6 +1296,15 @@ fn times(speed: f64) -> String {
 fn refresh(spot: &mut Spot, peer: &PeerView) -> bool {
     let mut changed = false;
     if !peer.displays.is_empty() && (spot.displays != peer.displays || spot.ppu != peer.ppu) {
+        // The main screen stays where it was on the desk when screens come, go or change
+        // size, so the arrangement survives a monitor being unplugged or lent.
+        let before = Computer::new("", spot.displays.clone(), spot.ppu, spot.at);
+        let after = Computer::new("", peer.displays.clone(), peer.ppu, spot.at);
+        let was = before.desk_displays().get(main_display(&spot.displays)).map(|d| [d.x, d.y]);
+        let now = after.desk_displays().get(main_display(&peer.displays)).map(|d| [d.x, d.y]);
+        if let (Some(was), Some(now)) = (was, now) {
+            spot.at = [spot.at[0] + was[0] - now[0], spot.at[1] + was[1] - now[1]];
+        }
         spot.displays = peer.displays.clone();
         spot.ppu = peer.ppu;
         changed = true;
