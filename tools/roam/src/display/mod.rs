@@ -143,6 +143,7 @@ struct FeedInner {
     changed: Condvar,
     stopped: AtomicBool,
     key_wanted: AtomicBool,
+    pointer_wanted: AtomicBool,
     tally: Mutex<Tally>,
     notes: Mutex<Vec<String>>,
 }
@@ -304,6 +305,23 @@ impl Feed {
 
     pub fn ask_key(&self) {
         self.0.key_wanted.store(true, Ordering::Release);
+    }
+
+    /// A new stream: the pointer's place and shape should go again, though they haven't changed.
+    pub fn ask_pointer(&self) {
+        self.0.pointer_wanted.store(true, Ordering::Release);
+    }
+
+    /// Whether the pointer should go again (and forgets the wish).
+    pub fn pointer_wanted(&self) -> bool {
+        self.0.pointer_wanted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Forgets pictures not yet sent: a stream starting again has no use for them.
+    pub fn clear_pictures(&self) {
+        if let Ok(mut waiting) = self.0.waiting.lock() {
+            waiting.pictures.clear();
+        }
     }
 
     pub fn stopped(&self) -> bool {

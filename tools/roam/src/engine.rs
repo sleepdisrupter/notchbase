@@ -149,6 +149,9 @@ pub enum Control {
     /// Tests: stop hearing the network, as if Wi-Fi dropped out.
     #[cfg(test)]
     Deaf(bool),
+    /// Tests: cut the lent screen's picture stream, as a network hiccup does.
+    #[cfg(test)]
+    CutStream,
 }
 
 enum Event {
@@ -995,6 +998,8 @@ impl Core {
         }
         for id in ended {
             self.note(&format!("no word from {} for 8 s: session over", self.who(id)));
+            // Only the network went: what's lent between them waits for it to come back.
+            self.hold_displays(id);
             self.end_session(id, false);
         }
         // Stalled: bring the cursor home, let go of held keys.
@@ -2379,6 +2384,8 @@ impl Core {
             }
             #[cfg(test)]
             Control::Deaf(deaf) => self.deaf = deaf,
+            #[cfg(test)]
+            Control::CutStream => self.cut_lent_stream(),
             Control::Release => {
                 let controlled: Vec<Id> =
                     self.sessions.iter().filter(|(_, s)| s.side == Side::Controlled).map(|(id, _)| *id).collect();

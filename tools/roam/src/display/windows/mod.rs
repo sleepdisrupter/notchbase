@@ -200,6 +200,9 @@ fn capture(
         let waiting = recent || settling || duplicator.changed;
         or_restart!(duplicator.wait(pace.wait_until(now, waiting)));
         // The pointer, when it goes apart, goes the moment it moves: not a picture's work.
+        if feed.pointer_wanted() && apart {
+            duplicator.pointer_apart();
+        }
         let (at, shape) = duplicator.take_pointer();
         feed.pointer(at, shape);
         for data in or_restart!(pictures.drain(&mut duplicator)) {

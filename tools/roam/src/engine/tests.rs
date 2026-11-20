@@ -565,3 +565,82 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
     displays::wait("the picture closed on the Mac", || viewer.seen.lock().unwrap().gone);
     assert!(!a.fake.state().screens.iter().any(|s| s.x > 3000.0), "the virtual display is gone");
 }
+
+/// The PC hosts the Mac's second screen as an extended display, pictures flowing.
+fn lend_a_screen() -> (Machine, Machine, displays::Pretend, displays::Pretend, String) {
+    let a_port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
+    let b_port = a_port + 1;
+    let pc = Fake::new(vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], 1.0);
+    let mac = Fake::new(vec![Rect::new(0.0, 0.0, 1512.0, 982.0), Rect::new(1512.0, 0.0, 1280.0, 720.0)], 1.0);
+    let (mut a, host) = displays::start(folder(), pc, a_port, b_port);
+    let (mut b, viewer) = displays::start(folder(), mac, b_port, a_port);
+    let (a_id, b_id) = (a.id(), b.id());
+    a.until("seeing the Mac", |s| s.peers.iter().any(|p| p.id == b_id && p.displays.len() == 2 && p.lends));
+    a.engine.send(Control::Desk(vec![
+        Placement { id: a_id.clone(), at: [0.0, 0.0], scroll: 1.0 },
+        Placement { id: b_id.clone(), at: [1920.0, 0.0], scroll: 1.0 },
+    ]));
+    a.until("the code to check", |s| !s.asks.is_empty());
+    b.until("the request to allow", |s| !s.asks.is_empty());
+    a.engine.send(Control::Allow(b_id.clone()));
+    b.engine.send(Control::Allow(a_id.clone()));
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+    a.engine.send(Control::Extend { id: b_id.clone(), display: 1 });
+    a.until("the extended display up", |s| s.extended.iter().any(|e| e.id == b_id && e.running));
+    displays::wait("pictures shown on the Mac", || viewer.seen.lock().unwrap().pictures.len() >= 3);
+    (a, b, host, viewer, b_id)
+}
+
+/// Whether the PC still has its virtual display, and the Mac its one window.
+fn still_extended(a: &Machine, host: &displays::Pretend, viewer: &displays::Pretend) {
+    assert_eq!(host.seen.lock().unwrap().wants.len(), 1, "the virtual display was never made again");
+    assert!(a.fake.state().screens.iter().any(|s| s.x > 3000.0), "the virtual display is still there");
+    let seen = viewer.seen.lock().unwrap();
+    assert_eq!(seen.shown.len(), 1, "the same window throughout");
+    assert!(!seen.gone, "the window stayed up");
+}
+
+fn log_of(machine: &Machine) -> String {
+    std::fs::read_to_string(machine.data.join("roam.log")).unwrap_or_default()
+}
+
+#[test]
+fn a_dropped_picture_stream_comes_back_with_the_display_kept() {
+    let (mut a, b, host, viewer, b_id) = lend_a_screen();
+    // Long enough for the host to know the stream got through.
+    std::thread::sleep(Duration::from_secs(3));
+    b.engine.send(Control::CutStream);
+    displays::wait("the host noticing", || log_of(&a).contains("picture stream dropped"));
+    let before = viewer.seen.lock().unwrap().pictures.len();
+    displays::wait("pictures again", || viewer.seen.lock().unwrap().pictures.len() > before + 5);
+    still_extended(&a, &host, &viewer);
+    a.until("running again", |s| s.extended.iter().any(|e| e.id == b_id && e.running));
+    assert!(log_of(&b).contains("waiting for it again"), "{}", log_of(&b));
+}
+
+#[test]
+fn an_extended_display_waits_for_a_session_lost_to_silence() {
+    let (mut a, mut b, host, viewer, b_id) = lend_a_screen();
+    // Neither hears the other for longer than a session lasts in silence.
+    a.engine.send(Control::Deaf(true));
+    b.engine.send(Control::Deaf(true));
+    std::thread::sleep(Duration::from_millis(super::DEAD / super::MS + 1_500));
+    assert!(log_of(&a).contains("session over"), "{}", log_of(&a));
+    assert!(log_of(&a).contains("stays up while"), "{}", log_of(&a));
+    assert!(log_of(&b).contains("stays up while"), "{}", log_of(&b));
+    still_extended(&a, &host, &viewer);
+    a.until("waiting for the Mac", |s| {
+        s.extended.iter().any(|e| e.id == b_id && e.working.as_deref().is_some_and(|w| w.contains("come back")))
+    });
+    // The network comes back: the session forms again by itself, and the display carries on.
+    a.engine.send(Control::Deaf(false));
+    b.engine.send(Control::Deaf(false));
+    connected(&mut a, &b_id);
+    displays::wait("the PC asking again", || log_of(&a).contains("again: the extended display carries on"));
+    assert!(log_of(&b).contains("again: the lent screen carries on"), "{}", log_of(&b));
+    let before = viewer.seen.lock().unwrap().pictures.len();
+    displays::wait("pictures still coming", || viewer.seen.lock().unwrap().pictures.len() > before + 5);
+    still_extended(&a, &host, &viewer);
+    b.until("still lending", |s| s.lending.as_ref().is_some_and(|l| l.display == 1));
+}

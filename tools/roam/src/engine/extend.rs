@@ -5,12 +5,18 @@
 //! that size where the screen sits on the desk, then streams it over a connection of its own.
 //! Either side ends it with `Unlend`.
 //!
+//! A network hiccup ends neither: the host keeps its virtual display (so the system doesn't
+//! move every window off it) and tries the picture stream again, the lending computer keeps its
+//! window with the last picture, and when the network went quiet long enough to end the session,
+//! the host asks for the screen again as soon as the session is back.
+//!
 //! While a screen is lent, the desk counts it as the host's display: the host's cursor reaches
 //! it the way it reaches any of its own displays, and the lending computer's other screens stay
 //! where they were for the cursor to cross to.
 
 use std::io::{BufReader, BufWriter, Write as _};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,7 +24,7 @@ use std::time::{Duration, Instant};
 use super::{Core, Cursor, Event, Session, Side};
 use crate::crypto::{self, hex};
 use crate::display::stream::{self, Down, Hello, Keys, Opener, Sealer, Up};
-use crate::display::{self, Ability, Displays, Feed, Panel, Remote, Want};
+use crate::display::{self, Ability, Displays, Feed, Panel, Remote, Showing, Want};
 use crate::input::Play;
 use crate::layout::{self, Computer, Rect};
 use crate::wire::{Id, Message};
@@ -34,6 +40,18 @@ const SEND_BUFFER: usize = 128 * 1024;
 const TALLY_EVERY: Duration = Duration::from_secs(5);
 /// A key picture is asked for at most this often after pictures fail to show.
 const KEY_EVERY: Duration = Duration::from_millis(500);
+/// How long an extended display waits for the other computer after the network drops, before
+/// it gives up and the virtual display goes.
+const HOLD_FOR: u64 = 120 * super::SECOND;
+const HOLD: Duration = Duration::from_secs(120);
+/// How often the host tries the picture stream again while it's down.
+const RETRY_EVERY: Duration = Duration::from_millis(700);
+/// A stream that lasted this long reached the other computer, which would have turned it away
+/// within two seconds: trying again starts the wait over.
+const LASTED: Duration = Duration::from_millis(2_500);
+/// A lent screen that hears nothing for this long takes the stream as gone (a still screen still
+/// sends a picture a second).
+const QUIET: Duration = Duration::from_secs(5);
 
 /// One of another computer's screens shown here as an extended display (this computer hosts).
 pub(super) struct Extended {
@@ -44,7 +62,20 @@ pub(super) struct Extended {
     pub rect: Option<Rect>,
     pub feed: Option<Feed>,
     pub place: Option<Sender<[i32; 2]>>,
+    /// The way to the other computer's stream, for the host's thread: a new one when the
+    /// session forms again.
+    pub route: Option<Sender<Route>>,
     pub asked_at: u64,
+    /// When the session went quiet, while the display waits for it to come back.
+    pub held_since: Option<u64>,
+}
+
+/// Where the host sends its pictures, and with which keys.
+#[derive(Clone, Copy)]
+pub(super) struct Route {
+    addr: SocketAddr,
+    session: u32,
+    keys: Keys,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +95,18 @@ pub(super) struct Lending {
     pub session: u32,
     /// The connection, once it's up: shutting it down ends the showing.
     pub stream: Arc<Mutex<Option<TcpStream>>>,
+    /// The window showing the pictures, kept from one stream to the next.
+    pub shown: Arc<Mutex<Option<Shown>>>,
+    /// Where what the person does over it goes: the newest stream's way back.
+    pub up: Arc<Mutex<Option<Sender<Up>>>>,
+    /// When the session went quiet, while the window waits for the host to come back.
+    pub held_since: Option<u64>,
+}
+
+/// A lent screen's window, and the size of the pictures it was made for.
+pub(super) struct Shown {
+    size: [u32; 2],
+    showing: Box<dyn Showing>,
 }
 
 /// Word from the threads that carry the pictures.
@@ -91,6 +134,9 @@ pub(super) struct Grant {
     serial: u32,
     displays: Arc<dyn Displays>,
     stream: Arc<Mutex<Option<TcpStream>>>,
+    shown: Arc<Mutex<Option<Shown>>>,
+    up: Arc<Mutex<Option<Sender<Up>>>>,
+    who: String,
 }
 
 /// An extended display, for the page.
@@ -196,8 +242,17 @@ impl Core {
         self.unextend(peer, "Replaced by another screen");
         let serial = self.next_serial();
         let now = self.now();
-        let mut entry =
-            Extended { serial, display, state: State::Asking, rect: None, feed: None, place: None, asked_at: now };
+        let mut entry = Extended {
+            serial,
+            display,
+            state: State::Asking,
+            rect: None,
+            feed: None,
+            place: None,
+            route: None,
+            asked_at: now,
+            held_since: None,
+        };
         let lends = self.peers.get(&peer).is_some_and(|p| p.lends);
         let live = self.sessions.get(&peer).is_some_and(|s| s.side == Side::Controller && s.is_live());
         let failed = match self.ability.clone() {
@@ -235,9 +290,11 @@ impl Core {
 
     /// The other computer said yes: make the display and start sending it.
     pub(super) fn lent(&mut self, peer: Id, display: u8, pixels: [u16; 2], hz: u8, scale: f32) {
-        let Some(entry) = self.extended.get(&peer).filter(|e| e.display == display && e.state == State::Asking) else {
+        let Some(entry) = self.extended.get(&peer).filter(|e| e.display == display) else { return };
+        let held = entry.held_since.is_some() && entry.route.is_some();
+        if !held && entry.state != State::Asking {
             return;
-        };
+        }
         let serial = entry.serial;
         let panel = Panel {
             pixels: pixels.map(u32::from),
@@ -254,17 +311,29 @@ impl Core {
         let addr = session.addr;
         let session_id = session.id;
         let Some(link) = session.live() else { return };
-        let keys = stream::keys(link.bulk_send());
+        let route = Route { addr, session: session_id, keys: stream::keys(link.bulk_send()) };
+        if held {
+            // Back after the network dropped: the display is still up, only the way to it is new.
+            self.note(&format!("{name} lends its display {display} again: the extended display carries on"));
+            if let Some(entry) = self.extended.get_mut(&peer) {
+                entry.held_since = None;
+                entry.state = State::Working("Reconnecting".into());
+                if let Some(routes) = &entry.route {
+                    let _ = routes.send(route);
+                }
+            }
+            return;
+        }
         let feed = Feed::new();
+        let (reroute, routes) = mpsc::channel();
         let (place, placed) = mpsc::channel();
         let install = self.ability == Ability::NeedsDriver;
         let job = HostJob {
             peer,
             serial,
             want: Want { name: name.clone(), panel, at, pointer_apart },
-            addr,
-            hello: Hello { session: session_id, stream: u32::from_le_bytes(crypto::random::<4>()) },
-            keys,
+            route,
+            routes,
             feed: feed.clone(),
             placed,
             events: self.events.clone(),
@@ -286,6 +355,7 @@ impl Core {
         entry.state = State::Working(words.into());
         entry.feed = Some(feed);
         entry.place = Some(place);
+        entry.route = Some(reroute);
     }
 
     /// The desk changed: move each virtual display to where its screen now sits.
@@ -299,13 +369,40 @@ impl Core {
         }
     }
 
-    /// An extended display asked for and never answered gives up.
+    /// An extended display asked for and never answered gives up; one waiting for its session to
+    /// come back asks again once it has, and gives up when it doesn't.
     pub(super) fn check_extended(&mut self, now: u64) {
+        let (mut ask, mut gone) = (Vec::new(), Vec::new());
         for (id, entry) in &mut self.extended {
             if entry.state == State::Asking && now.saturating_sub(entry.asked_at) > ASK_FOR {
                 let name = self.peers.get(id).map_or_else(|| "The other computer".into(), |p| p.name.clone());
                 entry.state = State::Failed(format!("{name} didn't answer"));
             }
+            let Some(since) = entry.held_since else { continue };
+            if now.saturating_sub(since) > HOLD_FOR {
+                gone.push(*id);
+            } else if now.saturating_sub(entry.asked_at) > ASK_FOR
+                && self.sessions.get(id).is_some_and(|s| s.side == Side::Controller && s.is_live())
+            {
+                entry.asked_at = now;
+                ask.push((*id, entry.display));
+            }
+        }
+        for (id, display) in ask {
+            self.note(&format!("{} is back: asking for its display {display} again", self.who(id)));
+            if let Some(link) = self.sessions.get_mut(&id).and_then(Session::live) {
+                link.queue(Message::Lend { display });
+            }
+        }
+        for id in gone {
+            let why = format!("{} didn't come back", self.who(id));
+            self.unextend(id, &why);
+        }
+        if self.lending.as_ref().and_then(|l| l.held_since).is_some_and(|since| now.saturating_sub(since) > HOLD_FOR) {
+            if let Some(to) = self.lending.as_ref().map(|l| l.to) {
+                self.note(&format!("{} didn't come back for its extended display", self.who(to)));
+            }
+            self.stop_lending(None);
         }
     }
 
@@ -328,16 +425,16 @@ impl Core {
             }
             return;
         };
-        self.stop_lending(None);
-        let serial = self.next_serial();
-        self.note(&format!(
-            "{} asked for display {display} ({}x{} pixels at {} Hz) as its extended display",
-            self.who(to),
-            panel.pixels[0],
-            panel.pixels[1],
-            panel.hz
-        ));
-        self.lending = Some(Lending { serial, to, display, rect, session, stream: Arc::default() });
+        if let Some(lending) =
+            self.lending.as_mut().filter(|l| l.to == to && l.display == display && same(&l.rect, &rect))
+        {
+            // The host is back after the network dropped: the same window shows its pictures.
+            lending.session = session;
+            lending.held_since = None;
+            self.note(&format!("{} asked for display {display} again: the lent screen carries on", self.who(to)));
+        } else {
+            self.lend_anew(to, display, rect, panel, session);
+        }
         let clamp = |side: u32| side.min(u32::from(u16::MAX)) as u16;
         if let Some(link) = self.sessions.get_mut(&to).and_then(Session::live) {
             link.queue(Message::Lent {
@@ -349,12 +446,40 @@ impl Core {
         }
     }
 
+    fn lend_anew(&mut self, to: Id, display: u8, rect: Rect, panel: Panel, session: u32) {
+        self.stop_lending(None);
+        let serial = self.next_serial();
+        self.note(&format!(
+            "{} asked for display {display} ({}x{} pixels at {} Hz) as its extended display",
+            self.who(to),
+            panel.pixels[0],
+            panel.pixels[1],
+            panel.hz
+        ));
+        self.lending = Some(Lending {
+            serial,
+            to,
+            display,
+            rect,
+            session,
+            stream: Arc::default(),
+            shown: Arc::default(),
+            up: Arc::default(),
+            held_since: None,
+        });
+    }
+
     /// Stops showing another computer's picture, telling it why when `why` is given.
     pub(super) fn stop_lending(&mut self, why: Option<&str>) {
         let Some(lending) = self.lending.take() else { return };
+        if let Some(up) = lending.up.lock().ok().and_then(|mut up| up.take()) {
+            let _ = up.send(Up::Bye);
+        }
         if let Some(stream) = lending.stream.lock().ok().and_then(|mut s| s.take()) {
             let _ = stream.shutdown(Shutdown::Both);
         }
+        // Gives the screen back.
+        drop(lending.shown.lock().ok().and_then(|mut shown| shown.take()));
         if let Some(why) = why {
             self.note(&format!("no longer lending display {} to {}: {why}", lending.display, self.who(lending.to)));
             if let Some(link) = self.sessions.get_mut(&lending.to).and_then(Session::live) {
@@ -363,15 +488,45 @@ impl Core {
         }
     }
 
-    /// A computer in a session with this one stopped: whatever was lent between them ends.
+    /// The network to `id` went quiet for long enough to end the session: whatever is lent
+    /// between them holds on for it to come back, rather than ending.
+    pub(super) fn hold_displays(&mut self, id: Id) {
+        let now = self.now();
+        let name = self.who(id);
+        if let Some(entry) = self.extended.get_mut(&id).filter(|e| e.route.is_some() && e.held_since.is_none())
+            && matches!(entry.state, State::Running | State::Working(_))
+        {
+            entry.held_since = Some(now);
+            // Ask again as soon as the session is back.
+            entry.asked_at = 0;
+            entry.state = State::Working(format!("Waiting for {name} to come back"));
+            self.note(&format!("the extended display of {name} stays up while {name} comes back"));
+        }
+        if let Some(lending) = self.lending.as_mut().filter(|l| l.to == id && l.held_since.is_none()) {
+            lending.held_since = Some(now);
+            self.note(&format!("the screen lent to {name} stays up while {name} comes back"));
+        }
+    }
+
+    /// A computer in a session with this one stopped: whatever was lent between them ends,
+    /// unless it holds on for the session to come back.
     pub(super) fn session_ended_displays(&mut self, id: Id) {
-        if let Some(entry) = self.extended.remove(&id)
+        if self.extended.get(&id).is_none_or(|e| e.held_since.is_none())
+            && let Some(entry) = self.extended.remove(&id)
             && let Some(feed) = entry.feed
         {
             feed.stop();
         }
-        if self.lending.as_ref().is_some_and(|l| l.to == id) {
+        if self.lending.as_ref().is_some_and(|l| l.to == id && l.held_since.is_none()) {
             self.stop_lending(None);
+        }
+    }
+
+    /// Tests: cuts the picture stream of the lent screen, as a network hiccup does.
+    #[cfg(test)]
+    pub(super) fn cut_lent_stream(&mut self) {
+        if let Some(stream) = self.lending.as_ref().and_then(|l| l.stream.lock().ok()?.take()) {
+            let _ = stream.shutdown(Shutdown::Both);
         }
     }
 
@@ -429,6 +584,7 @@ impl Core {
                 self.screens_at = 0;
             }
             ExtendEvent::Stream { session, answer } => {
+                let who = self.lending.as_ref().map(|l| self.who(l.to)).unwrap_or_default();
                 let grant = self.lending.as_ref().filter(|l| l.session == session).and_then(|lending| {
                     let session = self.sessions.get_mut(&lending.to)?;
                     let keys = stream::keys(session.live()?.bulk_receive());
@@ -438,6 +594,9 @@ impl Core {
                         serial: lending.serial,
                         displays: self.displays.clone(),
                         stream: lending.stream.clone(),
+                        shown: lending.shown.clone(),
+                        up: lending.up.clone(),
+                        who,
                     })
                 });
                 let _ = answer.send(grant);
@@ -563,14 +722,25 @@ struct HostJob {
     peer: Id,
     serial: u32,
     want: Want,
-    addr: SocketAddr,
-    hello: Hello,
-    keys: Keys,
+    /// The way to the other computer's stream, and newer ones after the session forms again.
+    route: Route,
+    routes: Receiver<Route>,
     feed: Feed,
     placed: Receiver<[i32; 2]>,
     events: Sender<Event>,
     displays: Arc<dyn Displays>,
     install: bool,
+}
+
+impl HostJob {
+    fn working(&self, words: &str) {
+        let (peer, serial) = (self.peer, self.serial);
+        let _ = self.events.send(Event::Extend(ExtendEvent::Working { peer, serial, words: words.into() }));
+    }
+
+    fn note(&self, text: String) {
+        let _ = self.events.send(Event::Extend(ExtendEvent::Note { text }));
+    }
 }
 
 fn host(job: HostJob) {
@@ -582,40 +752,149 @@ fn host(job: HostJob) {
     let _ = job.events.send(Event::Extend(ExtendEvent::Ended { peer: job.peer, serial: job.serial, why }));
 }
 
-/// Makes the display and sends it until either side stops. Answers why it stopped.
+/// How one picture stream ended.
+enum Streamed {
+    /// For good: either side stopped.
+    Over(String),
+    /// The network dropped it; `lasted` when it had got through to the other computer.
+    Dropped { why: String, lasted: bool },
+}
+
+/// What the host's thread looks after between pictures: lines for the log, and where the
+/// virtual display is.
+struct Upkeep {
+    checked: Instant,
+    was: Option<Option<Rect>>,
+    tallied: Instant,
+}
+
+impl Upkeep {
+    fn run(&mut self, job: &HostJob, hosted: &mut Box<dyn display::Hosted>) {
+        if self.tallied.elapsed() >= TALLY_EVERY {
+            let text = job.feed.take_tally().line(self.tallied.elapsed().as_secs_f64());
+            self.tallied = Instant::now();
+            job.note(text);
+        }
+        if self.checked.elapsed() < CHECK_EVERY {
+            return;
+        }
+        self.checked = Instant::now();
+        for text in job.feed.take_notes() {
+            job.note(text);
+        }
+        while let Ok(at) = job.placed.try_recv() {
+            hosted.place(at);
+        }
+        let rect = hosted.rect();
+        if self.was != Some(rect) {
+            self.was = Some(rect);
+            let (peer, serial) = (job.peer, job.serial);
+            let _ = job.events.send(Event::Extend(ExtendEvent::At { peer, serial, rect }));
+        }
+    }
+}
+
+/// Makes the display and sends it until either side stops, keeping it up through network
+/// hiccups: the stream is tried again until it's back, or the other computer hasn't come back
+/// for a while. Answers why it stopped.
 fn run_host(job: &HostJob) -> Result<String, String> {
-    let (peer, serial) = (job.peer, job.serial);
-    let working = |words: &str| {
-        let _ = job.events.send(Event::Extend(ExtendEvent::Working { peer, serial, words: words.into() }));
-    };
     if job.install {
         job.displays.install()?;
-        working("Starting the display");
+        job.working("Starting the display");
     }
     if job.feed.stopped() {
         return Ok("Stopped".into());
     }
     let mut hosted = job.displays.host(&job.want, job.feed.clone())?;
-    let size = hosted.size();
-    working("Connecting");
-    let stream = TcpStream::connect_timeout(&job.addr, Duration::from_secs(4))
-        .map_err(|err| format!("Couldn't reach {}: {err}", job.want.name))?;
+    job.working("Connecting");
+    let mut route = job.route;
+    let mut upkeep = Upkeep { checked: Instant::now() - CHECK_EVERY, was: None, tallied: Instant::now() };
+    let _ = job.feed.take_tally();
+    // Since when the stream hasn't got through.
+    let mut down_since: Option<Instant> = None;
+    let mut ever = false;
+    let mut why = loop {
+        if job.feed.stopped() {
+            break "Stopped".into();
+        }
+        while let Ok(newer) = job.routes.try_recv() {
+            route = newer;
+        }
+        match stream_once(job, route, &mut hosted, &mut upkeep) {
+            Streamed::Over(why) => break why,
+            Streamed::Dropped { why, lasted } => {
+                if job.feed.stopped() {
+                    break "Stopped".into();
+                }
+                if !ever && !lasted {
+                    // It never got through at all: as before, that's the end.
+                    return Err(why);
+                }
+                if lasted {
+                    ever = true;
+                    down_since = None;
+                    job.note(format!("the extended display's picture stream dropped ({why}): trying again"));
+                    job.working("Reconnecting");
+                    // The next one starts the picture over.
+                    upkeep.was = None;
+                }
+                let since = *down_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= HOLD {
+                    break format!("The other computer didn't come back: {why}");
+                }
+                if let Ok(newer) = job.routes.recv_timeout(RETRY_EVERY) {
+                    route = newer;
+                }
+                upkeep.run(job, &mut hosted);
+            }
+        }
+    };
+    if let Some(failed) = hosted.failed() {
+        why = failed;
+    }
+    drop(hosted);
+    Ok(why)
+}
+
+/// One picture stream, from connecting until it ends.
+fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted>, upkeep: &mut Upkeep) -> Streamed {
+    let started = Instant::now();
+    let dropped = |why: String| Streamed::Dropped { why, lasted: started.elapsed() >= LASTED };
+    let stream = match TcpStream::connect_timeout(&route.addr, Duration::from_secs(4)) {
+        Ok(stream) => stream,
+        Err(err) => return dropped(format!("Couldn't reach {}: {err}", job.want.name)),
+    };
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     // A small send buffer, as game streaming keeps: pictures that can't go out yet wait in the
     // feed, where a newer one replaces them, rather than queueing in the network for seconds.
     let _ = socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER);
-    let reader = stream.try_clone().map_err(|err| err.to_string())?;
-    let mut out = BufWriter::with_capacity(256 * 1024, stream.try_clone().map_err(|err| err.to_string())?);
-    job.hello.write(&mut out).map_err(|err| err.to_string())?;
-    let mut sealer = Sealer::new(job.keys.pictures, job.hello.stream);
-    sealer.down(&mut out, &Down::Size(size)).map_err(|err| err.to_string())?;
-    out.flush().map_err(|err| err.to_string())?;
+    let (Ok(reader), Ok(writer)) = (stream.try_clone(), stream.try_clone()) else {
+        return dropped("Couldn't use the connection".into());
+    };
+    let mut out = BufWriter::with_capacity(256 * 1024, writer);
+    // A new number for every stream: the same keys never seal two streams' messages alike.
+    let hello = Hello { session: route.session, stream: u32::from_le_bytes(crypto::random::<4>()) };
+    let mut sealer = Sealer::new(route.keys.pictures, hello.stream);
+    // Pictures made while there was no stream are stale: start from a key picture, and say
+    // where the pointer is.
+    job.feed.clear_pictures();
+    job.feed.ask_key();
+    job.feed.ask_pointer();
+    let said = hello
+        .write(&mut out)
+        .and_then(|()| sealer.down(&mut out, &Down::Size(hosted.size())))
+        .and_then(|()| out.flush());
+    if let Err(err) = said {
+        return dropped(format!("The connection dropped: {err}"));
+    }
     // What comes back: the lending computer's mouse and keyboard, and wishes for key pictures.
+    let (gone, bye) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let back = {
-        let feed = job.feed.clone();
-        let events = job.events.clone();
-        let mut opener = Opener::new(job.keys.input, job.hello.stream);
+        let (feed, events) = (job.feed.clone(), job.events.clone());
+        let (gone, bye) = (gone.clone(), bye.clone());
+        let (peer, serial) = (job.peer, job.serial);
+        let mut opener = Opener::new(route.keys.input, hello.stream);
         std::thread::Builder::new().name("roam-host-input".into()).spawn(move || {
             let mut reader = BufReader::new(reader);
             loop {
@@ -624,21 +903,32 @@ fn run_host(job: &HostJob) -> Result<String, String> {
                         let _ = events.send(Event::Extend(ExtendEvent::Remote { peer, serial, remote }));
                     }
                     Ok(Up::KeyPlease) => feed.ask_key(),
-                    Ok(Up::Bye) | Err(_) => break,
+                    Ok(Up::Bye) => {
+                        bye.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(_) => break,
                 }
             }
-            feed.stop();
+            gone.store(true, Ordering::Release);
+            // Wakes the sending loop.
+            feed.pointer(None, None);
         })
     };
     if back.is_err() {
-        return Err("Couldn't start the display".into());
+        return dropped("Couldn't start the display".into());
     }
-    let mut checked = Instant::now() - CHECK_EVERY;
-    let mut was: Option<Option<Rect>> = None;
-    let mut why = "Stopped".to_owned();
-    let mut tallied = Instant::now();
-    let _ = job.feed.take_tally();
-    while !job.feed.stopped() {
+    let ended = loop {
+        if job.feed.stopped() {
+            let _ = sealer.down(&mut out, &Down::Bye).and_then(|()| out.flush());
+            break Streamed::Over("Stopped".into());
+        }
+        if bye.load(Ordering::Acquire) {
+            break Streamed::Over("Stopped".into());
+        }
+        if gone.load(Ordering::Acquire) {
+            break dropped("the other computer closed it".into());
+        }
         let picture = job.feed.next(Duration::from_millis(40));
         // The pointer's news goes first: it's small, and the reason it goes apart is to be quick.
         let news = job.feed.take_pointer();
@@ -661,95 +951,92 @@ fn run_host(job: &HostJob) -> Result<String, String> {
             }
         }
         if let Err(err) = sent {
-            why = format!("The connection dropped: {err}");
-            break;
+            break dropped(format!("The connection dropped: {err}"));
         }
-        if tallied.elapsed() >= TALLY_EVERY {
-            let text = job.feed.take_tally().line(tallied.elapsed().as_secs_f64());
-            tallied = Instant::now();
-            let _ = job.events.send(Event::Extend(ExtendEvent::Note { text }));
-        }
-        if checked.elapsed() >= CHECK_EVERY {
-            checked = Instant::now();
-            for text in job.feed.take_notes() {
-                let _ = job.events.send(Event::Extend(ExtendEvent::Note { text }));
-            }
-            while let Ok(at) = job.placed.try_recv() {
-                hosted.place(at);
-            }
-            let rect = hosted.rect();
-            if was != Some(rect) {
-                was = Some(rect);
-                let _ = job.events.send(Event::Extend(ExtendEvent::At { peer, serial, rect }));
-            }
-        }
-    }
-    if let Some(failed) = hosted.failed() {
-        why = failed;
-    }
-    let _ = sealer.down(&mut out, &Down::Bye).and_then(|()| out.flush());
+        upkeep.run(job, hosted);
+    };
     let _ = stream.shutdown(Shutdown::Both);
-    drop(hosted);
-    Ok(why)
+    ended
 }
 
 // ---------------------------------------------------------------- the lending side's threads
 
 /// Shows a stream that came in on the port for big clipboards, if this computer lent a screen
-/// to the session it names.
+/// to the session it names. A stream that drops leaves the window up, with its last picture,
+/// for the host's next stream to carry on in.
 pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> std::io::Result<()> {
     let (answer, granted) = mpsc::channel();
     events
         .send(Event::Extend(ExtendEvent::Stream { session: hello.session, answer }))
         .map_err(std::io::Error::other)?;
     let Ok(Some(grant)) = granted.recv_timeout(Duration::from_secs(2)) else { return Ok(()) };
-    stream.set_read_timeout(None)?;
+    // A still screen still sends a picture a second: hearing nothing for longer, it's gone.
+    stream.set_read_timeout(Some(QUIET))?;
     let _ = stream.set_nodelay(true);
-    if let Ok(mut slot) = grant.stream.lock() {
-        *slot = Some(stream.try_clone()?);
+    if let Ok(mut slot) = grant.stream.lock()
+        && let Some(old) = slot.replace(stream.try_clone()?)
+    {
+        // The stream before this one, if it's still hanging on.
+        let _ = old.shutdown(Shutdown::Both);
     }
     // What the person does over the screen goes back on its own thread, never holding up the
-    // window it comes from.
+    // window it comes from, by the newest stream.
     let (up, ups) = mpsc::channel::<Up>();
+    if let Ok(mut slot) = grant.up.lock() {
+        *slot = Some(up.clone());
+    }
     let writer = stream.try_clone()?;
     let mut sealer = Sealer::new(grant.keys.input, hello.stream);
     std::thread::Builder::new().name("roam-view-input".into()).spawn(move || {
         let mut writer = BufWriter::new(writer);
         while let Ok(message) = ups.recv() {
-            if sealer.up(&mut writer, &message).and_then(|()| writer.flush()).is_err() {
+            let bye = message == Up::Bye;
+            if sealer.up(&mut writer, &message).and_then(|()| writer.flush()).is_err() || bye {
                 break;
             }
         }
     })?;
     let mut opener = Opener::new(grant.keys.pictures, hello.stream);
     let mut reader = BufReader::with_capacity(256 * 1024, stream);
-    let mut showing: Option<Box<dyn display::Showing>> = None;
     let mut asked_key = Instant::now() - KEY_EVERY;
     let mut arrivals = Arrivals::default();
     let mut tallied = Instant::now();
-    let why = loop {
+    let shown = grant.shown.clone();
+    let with_shown = |what: &mut dyn FnMut(&mut Box<dyn Showing>)| {
+        if let Some(shown) = shown.lock().ok().as_mut().and_then(|s| s.as_mut()) {
+            what(&mut shown.showing);
+        }
+    };
+    let ended = loop {
         if tallied.elapsed() >= TALLY_EVERY {
-            arrivals.pointer_lag = showing.as_mut().and_then(|shown| shown.take_pointer_lag());
+            with_shown(&mut |shown| arrivals.pointer_lag = shown.take_pointer_lag());
             let text = std::mem::take(&mut arrivals).line(tallied.elapsed().as_secs_f64());
             tallied = Instant::now();
             let _ = events.send(Event::Extend(ExtendEvent::Note { text }));
         }
         match opener.down(&mut reader) {
             Ok(Down::Size(size)) => {
-                showing = None;
-                let up = up.clone();
+                let Ok(mut slot) = grant.shown.lock() else { break Some("Couldn't show the picture".to_owned()) };
+                if slot.as_ref().is_some_and(|s| s.size == size) {
+                    continue;
+                }
+                *slot = None;
+                let up = grant.up.clone();
                 let remote = Box::new(move |remote: Remote| {
-                    let _ = up.send(Up::Input(remote));
+                    if let Some(up) = up.lock().ok().as_ref().and_then(|up| up.as_ref()) {
+                        let _ = up.send(Up::Input(remote));
+                    }
                 });
                 match grant.displays.show(grant.rect, size, remote) {
-                    Ok(shown) => showing = Some(shown),
-                    Err(err) => break format!("Couldn't show the picture: {err}"),
+                    Ok(showing) => *slot = Some(Shown { size, showing }),
+                    Err(err) => break Some(format!("Couldn't show the picture: {err}")),
                 }
             }
             Ok(Down::Picture(picture)) => {
-                let Some(shown) = showing.as_mut() else { continue };
                 let came = Instant::now();
-                let result = shown.picture(&picture);
+                let mut result = None;
+                with_shown(&mut |shown| result = Some(shown.picture(&picture)));
+                let Some(result) = result else { continue };
                 arrivals.count(came, picture.data.len(), came.elapsed(), result.is_err());
                 if result.is_err() && asked_key.elapsed() >= KEY_EVERY {
                     asked_key = Instant::now();
@@ -757,23 +1044,21 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
                 }
             }
             Ok(Down::Pointer(at)) => {
-                if let Some(shown) = showing.as_mut() {
-                    arrivals.pointers += 1;
-                    shown.pointer(at);
-                }
+                arrivals.pointers += 1;
+                with_shown(&mut |shown| shown.pointer(at));
             }
-            Ok(Down::Shape(shape)) => {
-                if let Some(shown) = showing.as_mut() {
-                    shown.shape(&shape);
-                }
+            Ok(Down::Shape(shape)) => with_shown(&mut |shown| shown.shape(&shape)),
+            Ok(Down::Bye) => break Some("Stopped".to_owned()),
+            Err(err) => {
+                let text = format!("the picture stream from {} dropped ({err}): waiting for it again", grant.who);
+                let _ = events.send(Event::Extend(ExtendEvent::Note { text }));
+                break None;
             }
-            Ok(Down::Bye) => break "Stopped".to_owned(),
-            Err(err) => break format!("The connection ended: {err}"),
         }
     };
-    let _ = up.send(Up::Bye);
-    drop(showing);
-    let _ = events.send(Event::Extend(ExtendEvent::LendEnded { serial: grant.serial, why }));
+    if let Some(why) = ended {
+        let _ = events.send(Event::Extend(ExtendEvent::LendEnded { serial: grant.serial, why }));
+    }
     Ok(())
 }
 
