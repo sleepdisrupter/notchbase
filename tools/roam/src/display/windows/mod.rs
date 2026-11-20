@@ -39,6 +39,9 @@ const REFRESH_EVERY: Duration = Duration::from_secs(1);
 /// How long the screen is still sent at full rate after it stops changing: with a constant
 /// bitrate the last picture of a movement is a rough one, and these sharpen it.
 const SETTLE: Duration = Duration::from_millis(300);
+/// Capture may start again this many times within the window before the display gives up.
+const MOST_RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
 /// How long to keep looking often for a picture the encoder holds.
 const HELD_LOOK: Duration = Duration::from_millis(100);
 
@@ -144,21 +147,34 @@ fn capture(
     opened: &mpsc::Sender<Result<[u32; 2], String>>,
 ) -> Result<(), String> {
     media::start()?;
-    let started = Instant::now();
-    let mut duplicator = loop {
-        match duplicate::Duplicator::open(name) {
-            Ok(duplicator) => break duplicator,
-            Err(why) if started.elapsed() >= OPEN_WAIT => return Err(why),
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
-        }
-    };
-    let [width, height] = duplicator.size().map(|side| side as u32);
-    if width % 2 != 0 || height % 2 != 0 {
-        return Err(format!("The virtual display is an odd size ({width}x{height})"));
-    }
-    let size = [width, height];
-    let mut pictures = pictures::Pictures::new(&mut duplicator, size, HZ)?;
+    let (mut duplicator, mut pictures, size) = open_capture(name, None)?;
     let _ = opened.send(Ok(size));
+    // When capture last started again, so a hiccup costs a moment rather than the display,
+    // as game streaming recovers, while one that keeps failing still ends it.
+    let mut restarts: Vec<Instant> = Vec::new();
+    macro_rules! or_restart {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(why) => {
+                    for text in pictures.take_notes() {
+                        feed.note(text);
+                    }
+                    restarts.retain(|at| at.elapsed() < RESTART_WINDOW);
+                    if restarts.len() >= MOST_RESTARTS {
+                        return Err(why);
+                    }
+                    restarts.push(Instant::now());
+                    feed.note(format!("extended display capture starts again: {why}"));
+                    drop((duplicator, pictures));
+                    std::thread::sleep(Duration::from_millis(100));
+                    (duplicator, pictures, _) = open_capture(name, Some(size))?;
+                    feed.ask_key();
+                    continue;
+                }
+            }
+        };
+    }
     let every = Duration::from_secs(1) / HZ;
     let mut pace = Pace::new(every, Instant::now());
     let mut sent = Instant::now() - REFRESH_EVERY;
@@ -177,8 +193,8 @@ fn capture(
         let recent = pictures.held_since().is_some_and(|since| now.saturating_duration_since(since) < HELD_LOOK);
         let settling = last_change.elapsed() < SETTLE;
         let waiting = recent || settling || duplicator.changed;
-        duplicator.wait(pace.wait_until(now, waiting))?;
-        for data in pictures.drain(&mut duplicator)? {
+        or_restart!(duplicator.wait(pace.wait_until(now, waiting)));
+        for data in or_restart!(pictures.drain(&mut duplicator)) {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
         feed.count_delays(&pictures.take_delays());
@@ -209,7 +225,7 @@ fn capture(
         if changed {
             last_change = now;
         }
-        let step = pictures.encode(&mut duplicator, key)?;
+        let step = or_restart!(pictures.encode(&mut duplicator, key));
         for data in step.pictures {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
@@ -220,6 +236,31 @@ fn capture(
         sent = Instant::now();
     }
     Ok(())
+}
+
+/// Duplication of the display `name` and the way to encode it, once Windows has the display
+/// ready. When `size` is given, the display must still be that size.
+fn open_capture(
+    name: &[u16; 32],
+    size: Option<[u32; 2]>,
+) -> Result<(duplicate::Duplicator, pictures::Pictures, [u32; 2]), String> {
+    let started = Instant::now();
+    let mut duplicator = loop {
+        match duplicate::Duplicator::open(name) {
+            Ok(duplicator) => break duplicator,
+            Err(why) if started.elapsed() >= OPEN_WAIT => return Err(why),
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    };
+    let [width, height] = duplicator.size().map(|side| side as u32);
+    if width % 2 != 0 || height % 2 != 0 {
+        return Err(format!("The virtual display is an odd size ({width}x{height})"));
+    }
+    if size.is_some_and(|size| size != [width, height]) {
+        return Err(format!("The virtual display changed size, to {width}x{height}"));
+    }
+    let pictures = pictures::Pictures::new(&mut duplicator, [width, height], HZ)?;
+    Ok((duplicator, pictures, [width, height]))
 }
 
 /// The driver's monitor while it's in use. Dropping it stops the capture and turns the
