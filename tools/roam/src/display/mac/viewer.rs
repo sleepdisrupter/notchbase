@@ -84,7 +84,11 @@ impl Showing for Viewer {
         #[allow(deprecated)]
         // SAFETY: the layer is safe to feed from any one thread at a time.
         unsafe {
-            if self.layer.status() == AVQueuedSampleBufferRenderingStatus::Failed {
+            // A layer that failed, or stopped decoding (as after the Mac sleeps), starts again
+            // from a key picture.
+            if self.layer.status() == AVQueuedSampleBufferRenderingStatus::Failed
+                || self.layer.requiresFlushToResumeDecoding()
+            {
                 self.layer.flush();
                 if !picture.key {
                     return Err("The picture needs a key picture".into());

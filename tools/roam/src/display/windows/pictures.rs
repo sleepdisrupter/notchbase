@@ -12,6 +12,8 @@ use crate::display::nv12;
 
 /// How long the card route may take to give back its first picture before it gives way.
 const FIRST_PICTURE: Duration = Duration::from_secs(2);
+/// Set (to anything) to keep pictures off the graphics card, to compare the two routes.
+const OFF_CARD: &str = "NOTCHBASE_ROAM_OFF_CARD";
 
 enum Route {
     Card(Gpu),
@@ -41,7 +43,9 @@ pub struct Step {
 impl Pictures {
     pub fn new(duplicator: &mut Duplicator, size: [u32; 2], fps: u32) -> Result<Self, String> {
         let mut notes = Vec::new();
-        let on_card = {
+        let on_card = if std::env::var_os(OFF_CARD).is_some() {
+            Err(format!("{OFF_CARD} is set"))
+        } else {
             let (device, context) = duplicator.device();
             Gpu::new(device, context, size, fps)
                 .and_then(|gpu| Ok((gpu, Encoder::on_card(size, fps, device, duplicator.luid())?)))
@@ -62,6 +66,11 @@ impl Pictures {
 
     pub fn take_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
+    }
+
+    /// How long the encoder took over each picture that came out since the last call.
+    pub fn take_delays(&mut self) -> Vec<Duration> {
+        self.encoder.take_delays()
     }
 
     pub fn held_since(&self) -> Option<Instant> {

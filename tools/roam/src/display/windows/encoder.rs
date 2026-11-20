@@ -3,6 +3,7 @@
 //! otherwise. Tuned for a live picture: low latency, no B pictures, and a key picture only when
 //! one is asked for.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::LUID;
@@ -32,8 +33,9 @@ use windows::core::Interface;
 use super::media::{self, pack};
 use crate::display::h264;
 
-/// The longest between key pictures nobody asked for, for encoders that insist on some.
-const KEY_EVERY_SECONDS: u32 = 10 * 60;
+/// Key pictures come when the other side asks; this is only a backstop, should a stalled
+/// picture on the other side ever not ask.
+const KEY_EVERY_SECONDS: u32 = 30;
 /// How long to wait for an asynchronous encoder to hand a picture straight back. Most do within
 /// this; a slower one's picture is collected on the capture loop's next pass instead of holding
 /// up the next change.
@@ -49,6 +51,9 @@ pub struct Encoder {
     /// Pictures given to the encoder and not yet back, and since when the oldest has waited.
     pending: u32,
     held_since: Option<Instant>,
+    /// When each picture still in the encoder went in, and how long those that came out took.
+    given_at: VecDeque<Instant>,
+    delays: Vec<Duration>,
     provides: bool,
     output_size: u32,
     fps: u32,
@@ -138,19 +143,28 @@ impl Encoder {
                 transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize).map_err(err)?;
             }
             let codec = transform.cast::<ICodecAPI>().ok();
+            // What the encoder wouldn't take, for the log: it then does as it likes.
+            let mut refused = Vec::new();
             if let Some(codec) = &codec {
-                let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &uint(1));
-                let _ = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &uint(0));
-                let _ = codec.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &uint(bitrate));
+                let mut set = |what: &'static str, key: &windows::core::GUID, value: u32| {
+                    if codec.SetValue(key, &uint(value)).is_err() {
+                        refused.push(what);
+                    }
+                };
+                set("low latency", &CODECAPI_AVLowLatencyMode, 1);
+                set("no B pictures", &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+                set("the bitrate", &CODECAPI_AVEncCommonMeanBitRate, bitrate);
                 // As game streaming sets it: a constant rate with room for about one picture, so
                 // no picture is ever much bigger than its share and takes longer to go out.
-                let _ = codec
-                    .SetValue(&CODECAPI_AVEncCommonRateControlMode, &uint(eAVEncCommonRateControlMode_CBR.0 as u32));
-                let _ = codec.SetValue(&CODECAPI_AVEncCommonBufferSize, &uint(one_picture(bitrate, fps)));
-                // Key pictures only when the other side asks: one every few seconds is a burst
+                set("a constant rate", &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32);
+                set("a one-picture buffer", &CODECAPI_AVEncCommonBufferSize, one_picture(bitrate, fps));
+                // Key pictures mostly when the other side asks: one every few seconds is a burst
                 // the network has to catch up on, and the connection doesn't lose pictures.
-                let _ = codec.SetValue(&CODECAPI_AVEncMPVGOPSize, &uint(fps * KEY_EVERY_SECONDS));
+                set("rare key pictures", &CODECAPI_AVEncMPVGOPSize, fps * KEY_EVERY_SECONDS);
+            } else {
+                refused.push("any settings");
             }
+            let refused = if refused.is_empty() { String::new() } else { format!("; refused {}", refused.join(", ")) };
             let output: IMFMediaType = MFCreateMediaType().map_err(err)?;
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(err)?;
             output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).map_err(err)?;
@@ -183,13 +197,15 @@ impl Encoder {
                 wanted: 0,
                 pending: 0,
                 held_since: None,
+                given_at: VecDeque::new(),
+                delays: Vec::new(),
                 provides: info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0,
                 output_size: info.cbSize.max(size[0] * size[1]),
                 fps,
                 header,
                 time: 0,
                 about: format!(
-                    "{name} ({}{}), {}x{} at {fps} a second, {:.1} Mbit/s constant, key pictures when asked",
+                    "{name} ({}{}), {}x{} at {fps} a second, {:.1} Mbit/s constant, key pictures when asked or every {KEY_EVERY_SECONDS} s{refused}",
                     if asynchronous { "graphics card, asynchronous" } else { "synchronous" },
                     if manager.is_some() { ", pictures stay on the card" } else { "" },
                     size[0],
@@ -230,6 +246,11 @@ impl Encoder {
             let _ = unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &uint(1)) };
         }
         self.time(&sample);
+        self.given_at.push_back(Instant::now());
+        // A picture never coming out mustn't grow the list for good.
+        if self.given_at.len() > 64 {
+            self.given_at.pop_front();
+        }
         if self.events.is_some() {
             // Wait for the encoder to ask for input, taking what it hands back meanwhile.
             let deadline = Instant::now() + Duration::from_millis(250);
@@ -282,6 +303,11 @@ impl Encoder {
     fn given(&mut self) {
         self.pending += 1;
         self.held_since.get_or_insert_with(Instant::now);
+    }
+
+    /// How long each picture that came out since the last call took from going in.
+    pub fn take_delays(&mut self) -> Vec<Duration> {
+        std::mem::take(&mut self.delays)
     }
 
     /// Handles one waiting event of an asynchronous encoder. Answers whether there was one.
@@ -357,6 +383,9 @@ impl Encoder {
         }
         let Some(sample) = sample else { return Ok(None) };
         let picture = media::bytes(&sample)?;
+        if let Some(at) = self.given_at.pop_front() {
+            self.delays.push(at.elapsed());
+        }
         if self.events.is_some() {
             self.pending = self.pending.saturating_sub(1);
             self.held_since = if self.pending == 0 { None } else { Some(Instant::now()) };

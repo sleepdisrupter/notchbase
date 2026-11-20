@@ -36,6 +36,9 @@ const HZ: u32 = 60;
 const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// A still screen still sends a picture this often, so the other side knows it's alive.
 const REFRESH_EVERY: Duration = Duration::from_secs(1);
+/// How long the screen is still sent at full rate after it stops changing: with a constant
+/// bitrate the last picture of a movement is a rough one, and these sharpen it.
+const SETTLE: Duration = Duration::from_millis(300);
 /// How long to keep looking often for a picture the encoder holds.
 const HELD_LOOK: Duration = Duration::from_millis(100);
 
@@ -163,6 +166,7 @@ fn capture(
     let mut held_back = false;
     // Whether the encoder has been sent the screen again to push out a picture it holds.
     let mut nudged = false;
+    let mut last_change = Instant::now() - SETTLE;
     while !stop.load(Ordering::Acquire) && !feed.stopped() {
         let now = Instant::now();
         // Look again soon while a change waits for the network, or the encoder has had a
@@ -171,11 +175,13 @@ fn capture(
             feed.note(text);
         }
         let recent = pictures.held_since().is_some_and(|since| now.saturating_duration_since(since) < HELD_LOOK);
-        let waiting = recent || duplicator.changed;
+        let settling = last_change.elapsed() < SETTLE;
+        let waiting = recent || settling || duplicator.changed;
         duplicator.wait(pace.wait_until(now, waiting))?;
         for data in pictures.drain(&mut duplicator)? {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
+        feed.count_delays(&pictures.take_delays());
         let now = Instant::now();
         if !pace.may_encode(now) {
             continue;
@@ -185,7 +191,7 @@ fn capture(
         // movement on its way until the next change: give it the screen once more.
         let held =
             !nudged && pictures.held_since().is_some_and(|since| now.saturating_duration_since(since) >= every * 2);
-        if !(duplicator.changed || key || held || sent.elapsed() >= REFRESH_EVERY) {
+        if !(duplicator.changed || key || held || settling || sent.elapsed() >= REFRESH_EVERY) {
             continue;
         }
         if feed.busy() {
@@ -200,11 +206,15 @@ fn capture(
         }
         held_back = false;
         let changed = duplicator.changed;
+        if changed {
+            last_change = now;
+        }
         let step = pictures.encode(&mut duplicator, key)?;
         for data in step.pictures {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
         feed.count_encoded(step.ready, step.encode);
+        feed.count_delays(&pictures.take_delays());
         pace.encoded(now);
         nudged = held && !changed && !key;
         sent = Instant::now();

@@ -126,6 +126,10 @@ pub struct Tally {
     /// Time spent getting pictures ready for the encoder, and encoding them.
     pub convert: Duration,
     pub encode: Duration,
+    /// How long pictures took from going into the encoder to coming out, and the longest.
+    pub delayed: u32,
+    pub delay: Duration,
+    pub longest_delay: Duration,
     /// Pictures sent, the time sending took, and the longest one.
     pub sent: u32,
     pub send: Duration,
@@ -138,12 +142,14 @@ impl Tally {
         let seconds = seconds.max(0.001);
         let each = |total: Duration, count: u32| total.as_secs_f64() * 1000.0 / f64::from(count.max(1));
         format!(
-            "extended display, last {seconds:.0} s: {:.0} pictures a second ({} skipped while the network was busy), {:.1} Mbit/s; getting ready {:.1} ms, encoding {:.1} ms, sending {:.1} ms (longest {:.0} ms)",
+            "extended display, last {seconds:.0} s: {:.0} pictures a second ({} skipped while the network was busy), {:.1} Mbit/s; getting ready {:.1} ms, handing to the encoder {:.1} ms, in the encoder {:.1} ms (longest {:.0} ms), sending {:.1} ms (longest {:.0} ms)",
             f64::from(self.pictures) / seconds,
             self.skipped,
             self.bytes as f64 * 8.0 / seconds / 1_000_000.0,
             each(self.convert, self.pictures),
             each(self.encode, self.pictures),
+            each(self.delay, self.delayed),
+            self.longest_delay.as_secs_f64() * 1000.0,
             each(self.send, self.sent),
             self.longest_send.as_secs_f64() * 1000.0,
         )
@@ -242,6 +248,17 @@ impl Feed {
             t.pictures += 1;
             t.convert += convert;
             t.encode += encode;
+        });
+    }
+
+    /// Pictures came out of the encoder, these long after going in.
+    pub fn count_delays(&self, delays: &[Duration]) {
+        self.count(|t| {
+            for &delay in delays {
+                t.delayed += 1;
+                t.delay += delay;
+                t.longest_delay = t.longest_delay.max(delay);
+            }
         });
     }
 
@@ -457,13 +474,16 @@ mod tests {
             bytes: 7_500_000,
             convert: Duration::from_millis(600),
             encode: Duration::from_millis(900),
+            delayed: 300,
+            delay: Duration::from_millis(2400),
+            longest_delay: Duration::from_millis(14),
             sent: 300,
             send: Duration::from_millis(300),
             longest_send: Duration::from_millis(21),
         };
         assert_eq!(
             tally.line(5.0),
-            "extended display, last 5 s: 60 pictures a second (4 skipped while the network was busy), 12.0 Mbit/s; getting ready 2.0 ms, encoding 3.0 ms, sending 1.0 ms (longest 21 ms)"
+            "extended display, last 5 s: 60 pictures a second (4 skipped while the network was busy), 12.0 Mbit/s; getting ready 2.0 ms, handing to the encoder 3.0 ms, in the encoder 8.0 ms (longest 14 ms), sending 1.0 ms (longest 21 ms)"
         );
     }
 
@@ -474,11 +494,16 @@ mod tests {
         feed.count_skipped();
         feed.count_sent(Duration::from_millis(9));
         feed.count_sent(Duration::from_millis(4));
+        feed.count_delays(&[Duration::from_millis(6), Duration::from_millis(10)]);
         let tally = feed.take_tally();
         assert_eq!((tally.pictures, tally.skipped, tally.sent), (1, 1, 2));
         feed.note("encoder: software".into());
         assert_eq!(feed.take_notes(), ["encoder: software"]);
         assert!(feed.take_notes().is_empty());
         assert_eq!(tally.longest_send, Duration::from_millis(9));
+        assert_eq!(
+            (tally.delayed, tally.delay, tally.longest_delay),
+            (2, Duration::from_millis(16), Duration::from_millis(10))
+        );
     }
 }
