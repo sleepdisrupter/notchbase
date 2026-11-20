@@ -38,7 +38,14 @@ const REFRESH_EVERY: Duration = Duration::from_secs(1);
 pub struct Windows;
 
 impl Windows {
+    /// Turns off any driver screen left on: from a run that ended without tidying up, or the
+    /// driver's own at start-up. Roam only turns them on while one is in use.
     pub fn new() -> Self {
+        let _ = std::thread::Builder::new().name("roam-display-tidy".into()).spawn(|| {
+            if let Err(why) = monitor::detach_all() {
+                eprintln!("roam: couldn't turn off the virtual display: {why}");
+            }
+        });
         Self
     }
 }
@@ -51,9 +58,7 @@ impl Displays for Windows {
     fn install(&self) -> Result<(), String> {
         vdd::install()?;
         // The driver turns its monitor on as it starts; it stays off until it's wanted.
-        for source in monitor::virtual_sources().iter().filter(|s| s.attached) {
-            let _ = monitor::detach(source);
-        }
+        let _ = monitor::detach_all();
         Ok(())
     }
 
@@ -208,7 +213,10 @@ impl Drop for Virtual {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let _ = monitor::detach(&self.source);
+        // Every driver screen goes, in case Windows turned on another with this one.
+        if let Err(why) = monitor::detach(&self.source).and_then(|()| monitor::detach_all()) {
+            eprintln!("roam: couldn't turn off the virtual display: {why}");
+        }
     }
 }
 

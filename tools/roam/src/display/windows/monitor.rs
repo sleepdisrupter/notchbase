@@ -1,8 +1,13 @@
 //! Finding the driver's virtual monitors among Windows' displays, and turning one on at a size
 //! and place, or off again. Everything here works without administrator rights.
 
-use windows::Win32::Devices::Display::{SDC_APPLY, SDC_TOPOLOGY_EXTEND, SetDisplayConfig};
-use windows::Win32::Foundation::POINTL;
+use windows::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
+    QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
+};
+use windows::Win32::Foundation::{ERROR_SUCCESS, POINTL};
 use windows::Win32::Graphics::Gdi::{
     CDS_NORESET, CDS_TYPE, CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
     DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION,
@@ -141,7 +146,102 @@ pub fn place(source: &Source, at: [i32; 2]) -> Result<(), String> {
 }
 
 /// Turns the source off: it leaves the desktop, and its windows move to the other displays.
+/// Windows keeps it off from then on, even after a restart.
 pub fn detach(source: &Source) -> Result<(), String> {
+    // The display topology first, saved: turning it off the older way only lasts until
+    // Windows next sets up its displays, which brings the driver's screen back.
+    let topology = detach_path(source);
+    if !find(&source.name).is_some_and(|s| s.attached) {
+        return Ok(());
+    }
     let devmode = DEVMODEW { dmFields: DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT, ..Default::default() };
-    change(source, devmode)
+    change(source, devmode)?;
+    if find(&source.name).is_some_and(|s| s.attached) {
+        return Err(topology.err().unwrap_or_else(|| "Windows kept the virtual display on".into()));
+    }
+    Ok(())
+}
+
+/// Turns every driver screen off.
+pub fn detach_all() -> Result<(), String> {
+    let mut result = Ok(());
+    for source in virtual_sources().iter().filter(|s| s.attached) {
+        result = result.and(detach(source));
+    }
+    result
+}
+
+/// Takes the source's path out of the active display topology, and saves that.
+fn detach_path(source: &Source) -> Result<(), String> {
+    let (mut paths, modes) = active_paths()?;
+    let mut found = false;
+    for path in &mut paths {
+        if source_name(path).is_some_and(|name| text(&name) == text(&source.name)) {
+            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+            path.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            found = true;
+        }
+    }
+    if !found {
+        return Err("Windows has no path for the virtual display".into());
+    }
+    let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE;
+    // SAFETY: the arrays are as Windows answered them, with one path turned off.
+    let code = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+    if code != 0 {
+        return Err(format!("Windows couldn't turn the virtual display off (code {code})"));
+    }
+    Ok(())
+}
+
+/// `DISPLAYCONFIG_PATH_ACTIVE`, and the index for a path without a mode.
+const DISPLAYCONFIG_PATH_ACTIVE: u32 = 1;
+const DISPLAYCONFIG_PATH_MODE_IDX_INVALID: u32 = u32::MAX;
+
+/// The displays Windows has on now, as paths and their modes.
+fn active_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+    // The sizes can change between the two calls when a display comes or goes: try again.
+    for _ in 0..3 {
+        let (mut path_count, mut mode_count) = (0u32, 0u32);
+        // SAFETY: plain counts.
+        let sized = unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) };
+        if sized != ERROR_SUCCESS {
+            return Err(format!("Windows didn't list its displays (code {})", sized.0));
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: the arrays are as long as the counts say.
+        let listed = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if listed == ERROR_SUCCESS {
+            paths.truncate(path_count as usize);
+            modes.truncate(mode_count as usize);
+            return Ok((paths, modes));
+        }
+        if listed.0 != 122 {
+            // Anything but ERROR_INSUFFICIENT_BUFFER is final.
+            return Err(format!("Windows didn't list its displays (code {})", listed.0));
+        }
+    }
+    Err("Windows' displays kept changing".into())
+}
+
+/// The `\\.\DISPLAYn` name of a path's source.
+fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<[u16; 32]> {
+    let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+    name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    name.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+    name.header.adapterId = path.sourceInfo.adapterId;
+    name.header.id = path.sourceInfo.id;
+    // SAFETY: `name` is sized as its header says.
+    (unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } == 0).then_some(name.viewGdiDeviceName)
 }
