@@ -36,6 +36,10 @@ use crate::display::h264;
 /// Key pictures come when the other side asks; this is only a backstop, should a stalled
 /// picture on the other side ever not ask.
 const KEY_EVERY_SECONDS: u32 = 30;
+/// How long a picture waits for a busy asynchronous encoder to ask for it before it's skipped,
+/// and how long the encoder may go without asking before it counts as stuck.
+const INPUT_WAIT: Duration = Duration::from_millis(8);
+const STALLED: Duration = Duration::from_secs(1);
 /// How long to wait for an asynchronous encoder to hand a picture straight back. Most do within
 /// this; a slower one's picture is collected on the capture loop's next pass instead of holding
 /// up the next change.
@@ -54,6 +58,10 @@ pub struct Encoder {
     /// When each picture still in the encoder went in, and how long those that came out took.
     given_at: VecDeque<Instant>,
     delays: Vec<Duration>,
+    /// When an asynchronous encoder last asked for a picture, and whether a key picture was
+    /// skipped while it was busy.
+    asked_at: Instant,
+    key_owed: bool,
     provides: bool,
     output_size: u32,
     fps: u32,
@@ -199,6 +207,8 @@ impl Encoder {
                 held_since: None,
                 given_at: VecDeque::new(),
                 delays: Vec::new(),
+                asked_at: Instant::now(),
+                key_owed: false,
                 provides: info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0,
                 output_size: info.cbSize.max(size[0] * size[1]),
                 fps,
@@ -241,28 +251,27 @@ impl Encoder {
 
     fn encode_sample(&mut self, sample: IMFSample, key: bool) -> Result<Vec<Vec<u8>>, String> {
         let mut out = Vec::new();
-        if key && let Some(codec) = &self.codec {
-            // SAFETY: a value the encoder documents.
-            let _ = unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &uint(1)) };
-        }
-        self.time(&sample);
-        self.given_at.push_back(Instant::now());
-        // A picture never coming out mustn't grow the list for good.
-        if self.given_at.len() > 64 {
-            self.given_at.pop_front();
-        }
+        let key = key || std::mem::take(&mut self.key_owed);
         if self.events.is_some() {
-            // Wait for the encoder to ask for input, taking what it hands back meanwhile.
-            let deadline = Instant::now() + Duration::from_millis(250);
+            // Wait briefly for the encoder to ask for input, taking what it hands back
+            // meanwhile. One still busy skips this picture, as a game stream drops a frame,
+            // rather than holding up the next change; one that has stopped asking altogether
+            // fails, and capture starts again.
+            let deadline = Instant::now() + INPUT_WAIT;
             while self.wanted == 0 {
                 if !self.poll(&mut out)? {
                     if Instant::now() >= deadline {
-                        return Err("The encoder stopped asking for pictures".into());
+                        if self.asked_at.elapsed() >= STALLED {
+                            return Err("The encoder stopped asking for pictures".into());
+                        }
+                        self.key_owed |= key;
+                        return Ok(out.into_iter().map(|p| self.with_header(p)).collect());
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
             self.wanted -= 1;
+            self.stamp(&sample, key);
             // SAFETY: the encoder asked for this input.
             unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|err| err.message())?;
             self.given();
@@ -274,6 +283,7 @@ impl Encoder {
                 }
             }
         } else {
+            self.stamp(&sample, key);
             // SAFETY: a synchronous encoder takes input whenever its output has been drained.
             unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|err| err.message())?;
             while let Some(picture) = self.take_output()? {
@@ -323,12 +333,28 @@ impl Encoder {
         let kind = unsafe { event.GetType() }.map_err(|err| err.message())?;
         if kind == METransformNeedInput.0 as u32 {
             self.wanted += 1;
+            self.asked_at = Instant::now();
         } else if kind == METransformHaveOutput.0 as u32
             && let Some(picture) = self.take_output()?
         {
             out.push(picture);
         }
         Ok(true)
+    }
+
+    /// Readies a picture that's about to go in: a key picture when `key`, its time, and when
+    /// it went in.
+    fn stamp(&mut self, sample: &IMFSample, key: bool) {
+        if key && let Some(codec) = &self.codec {
+            // SAFETY: a value the encoder documents.
+            let _ = unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &uint(1)) };
+        }
+        self.time(sample);
+        self.given_at.push_back(Instant::now());
+        // A picture never coming out mustn't grow the list for good.
+        if self.given_at.len() > 64 {
+            self.given_at.pop_front();
+        }
     }
 
     fn time(&mut self, sample: &IMFSample) {
