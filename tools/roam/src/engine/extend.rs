@@ -27,6 +27,7 @@ use crate::display::stream::{self, Down, Hello, Keys, Opener, Sealer, Up};
 use crate::display::{self, Ability, Displays, Feed, Panel, Remote, Showing, Want};
 use crate::input::Play;
 use crate::layout::{self, Computer, Rect};
+use crate::priority::{self, Traffic};
 use crate::wire::{Id, Message};
 
 /// How long the other computer has to say yes to lending its screen.
@@ -614,9 +615,12 @@ impl Core {
     /// computer's cursor there.
     fn remote(&mut self, rect: Rect, remote: Remote) {
         match remote {
+            // Off the lent screen: an older lending computer also passes on moves its window
+            // hears elsewhere, such as the ones this computer plays on its other screens. Taken
+            // as the person's, they'd snap the cursor back to the virtual display's edge.
+            Remote::Move([x, y]) if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) => {}
             Remote::Move([x, y]) => {
-                let at =
-                    [rect.x + f64::from(x.clamp(0.0, 1.0)) * rect.w, rect.y + f64::from(y.clamp(0.0, 1.0)) * rect.h];
+                let at = [rect.x + f64::from(x) * rect.w, rect.y + f64::from(y) * rect.h];
                 if matches!(self.cursor, Cursor::Away { .. }) {
                     self.go_home(Some(at));
                 } else {
@@ -866,6 +870,10 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
     };
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // Wi-Fi's video queue: ahead of downloads, behind the mouse and keyboard.
+    if let Some(text) = priority::mark(socket2::SockRef::from(&stream), None, Traffic::Video) {
+        job.note(text);
+    }
     // A small send buffer, as game streaming keeps: pictures that can't go out yet wait in the
     // feed, where a newer one replaces them, rather than queueing in the network for seconds.
     let _ = socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER);
@@ -973,6 +981,10 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
     // A still screen still sends a picture a second: hearing nothing for longer, it's gone.
     stream.set_read_timeout(Some(QUIET))?;
     let _ = stream.set_nodelay(true);
+    // What goes back is this computer's mouse and keyboard: Wi-Fi's voice queue.
+    if let Some(text) = priority::mark(socket2::SockRef::from(&stream), None, Traffic::Voice) {
+        let _ = events.send(Event::Extend(ExtendEvent::Note { text }));
+    }
     if let Ok(mut slot) = grant.stream.lock()
         && let Some(old) = slot.replace(stream.try_clone()?)
     {

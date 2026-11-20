@@ -644,3 +644,25 @@ fn an_extended_display_waits_for_a_session_lost_to_silence() {
     still_extended(&a, &host, &viewer);
     b.until("still lending", |s| s.lending.as_ref().is_some_and(|l| l.display == 1));
 }
+
+#[test]
+fn moves_the_lent_window_hears_off_the_lent_screen_leave_the_cursor_where_it_is() {
+    use crate::display::Remote;
+
+    let (a, b, _host, viewer, _b_id) = lend_a_screen();
+    a.wait_for("listening", |s| s.sink.is_some());
+    assert!(a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [5.0, 0.0] }));
+    a.wait_for("the cursor over on the Mac's built-in screen", |s| s.captured);
+    settle();
+    for _ in 0..20 {
+        a.fake.input(Input::Move { at: [960.0, 540.0], delta: [20.0, 3.0] });
+        // The lent window, key now, hears the moves played on the built-in screen beside it.
+        displays::remote(&viewer.seen, Remote::Move([-0.4, 0.6]));
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(a.fake.state().captured, "still over on the Mac");
+    let last = b.fake.state().played.iter().rev().find_map(|p| if let Play::Move(at) = p { Some(*at) } else { None });
+    let last = last.unwrap();
+    assert!(last[0] > 300.0 && last[0] < 600.0, "the cursor went on toward the middle: {last:?}");
+}

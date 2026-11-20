@@ -601,7 +601,14 @@ impl LentView {
         let bounds = self.bounds();
         let (w, h) = (bounds.size.width.max(1.0), bounds.size.height.max(1.0));
         // Views count up from the bottom.
-        self.send(Remote::Move([(at.x / w) as f32, ((h - at.y) / h) as f32]));
+        let (x, y) = (at.x / w, (h - at.y) / h);
+        // Once this window is key, macOS sends it every move of the mouse, wherever it is: on
+        // this computer's other screens too, where Roam may be moving it for the host. Those
+        // aren't over the lent screen and would pull the host's cursor back onto it.
+        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+            return;
+        }
+        self.send(Remote::Move([x as f32, y as f32]));
     }
 
     fn key(&self, event: &NSEvent, down: bool) {

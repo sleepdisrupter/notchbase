@@ -29,6 +29,7 @@ use crate::input::{self, Copied, Input, Platform, Play, Swipe};
 use crate::keys;
 use crate::layout::{self, Computer, Rect, Step};
 use crate::link::Link;
+use crate::priority::{self, Traffic};
 use crate::smooth::{FRAME, Smoother};
 use crate::wire::{BUTTONS, Beacon, CLIP_CHUNK, Id, Key, Message, Os, Packet, Refusal};
 
@@ -1033,6 +1034,7 @@ impl Core {
         let motion = self.pending_motion.take();
         let here = self.here;
         let Some(socket) = self.socket.clone() else { return };
+        let mut notes = Vec::new();
         for (id, session) in &mut self.sessions {
             let addr = session.addr;
             let busy = away == Some(*id) || (here && session.side == Side::Controlled);
@@ -1060,6 +1062,7 @@ impl Core {
                     }
                     if send {
                         let packet = link.packet(now, moved);
+                        notes.extend(priority::mark(socket2::SockRef::from(&*socket), Some(addr), Traffic::Voice));
                         let _ = socket.send_to(&packet, addr);
                     }
                 }
@@ -1075,6 +1078,9 @@ impl Core {
                 }
                 _ => {}
             }
+        }
+        for note in notes {
+            self.note(&note);
         }
     }
 
@@ -2652,8 +2658,9 @@ fn open_socket(port: u16) -> std::io::Result<UdpSocket> {
     #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
     socket.set_broadcast(true)?;
-    // Expedited forwarding: Wi-Fi puts these packets in its voice queue, ahead of downloads.
-    let _ = socket.set_tos_v4(0xB8);
+    // Expedited forwarding: Wi-Fi puts these packets in its voice queue, ahead of downloads
+    // (where the system honours it; `priority` does the rest as each packet goes).
+    let _ = socket.set_tos_v4(Traffic::Voice.tos());
     let _ = socket.set_recv_buffer_size(1 << 20);
     socket.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).into())?;
     let socket: UdpSocket = socket.into();

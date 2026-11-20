@@ -13,6 +13,7 @@ pub mod input;
 pub mod keys;
 pub mod layout;
 pub mod link;
+pub mod priority;
 pub mod smooth;
 pub mod wire;
 
