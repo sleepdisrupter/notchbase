@@ -4,7 +4,9 @@
 //!
 //! For low latency, as game streaming apps do: the timer resolution goes to 1 ms and Wi-Fi is
 //! put in media streaming mode with background scans off while a session runs. Background scans
-//! are the usual cause of a Wi-Fi link stalling for a moment every minute or so.
+//! are the usual cause of a Wi-Fi link stalling for a moment every minute or so. The power
+//! plan's Wi-Fi power saving goes to maximum performance too (a laptop on battery otherwise
+//! lets its Wi-Fi doze between packets), and back to what it was when the session ends.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -117,6 +119,74 @@ pub struct Windows {
 
 struct Fast {
     wlan: HANDLE,
+    power: Option<WifiPower>,
+}
+
+/// The power plan's Wi-Fi power saving as it was, plugged in and on battery.
+struct WifiPower {
+    scheme: windows_sys::core::GUID,
+    ac: u32,
+    dc: u32,
+}
+
+/// The power plan's "Wireless Adapter Settings" group and its "Power Saving Mode".
+const WIFI_GROUP: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x19cbb8fa_5279_450e_9fac_8a3d5fedd0c1);
+const WIFI_POWER_SAVING: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0x12bbebe6_58d6_4636_95bb_3217ef867c1a);
+/// "Maximum Performance".
+const WIFI_FULL_POWER: u32 = 0;
+
+/// Sets the active power plan's Wi-Fi power saving to maximum performance, answering what it
+/// was. `None` when it couldn't be read or set (or was already there).
+fn wifi_full_power() -> Option<WifiPower> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::System::Power::{
+        PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex, PowerSetActiveScheme,
+        PowerWriteACValueIndex, PowerWriteDCValueIndex,
+    };
+    // SAFETY: the scheme GUID is allocated by the call and freed with LocalFree; the rest are
+    // plain reads and writes of one setting of that scheme.
+    unsafe {
+        let mut active: *mut windows_sys::core::GUID = std::ptr::null_mut();
+        if PowerGetActiveScheme(std::ptr::null_mut(), &mut active) != 0 || active.is_null() {
+            return None;
+        }
+        let scheme = *active;
+        LocalFree(active.cast());
+        let (mut ac, mut dc) = (u32::MAX, u32::MAX);
+        PowerReadACValueIndex(std::ptr::null_mut(), &scheme, &WIFI_GROUP, &WIFI_POWER_SAVING, &mut ac);
+        PowerReadDCValueIndex(std::ptr::null_mut(), &scheme, &WIFI_GROUP, &WIFI_POWER_SAVING, &mut dc);
+        if ac == u32::MAX || dc == u32::MAX || (ac == WIFI_FULL_POWER && dc == WIFI_FULL_POWER) {
+            return None;
+        }
+        let wrote =
+            PowerWriteACValueIndex(std::ptr::null_mut(), &scheme, &WIFI_GROUP, &WIFI_POWER_SAVING, WIFI_FULL_POWER)
+                == 0
+                && PowerWriteDCValueIndex(
+                    std::ptr::null_mut(),
+                    &scheme,
+                    &WIFI_GROUP,
+                    &WIFI_POWER_SAVING,
+                    WIFI_FULL_POWER,
+                ) == 0;
+        // Applying the plan again is what makes a changed setting take hold.
+        PowerSetActiveScheme(std::ptr::null_mut(), &scheme);
+        if !wrote {
+            restore_wifi_power(&WifiPower { scheme, ac, dc });
+            return None;
+        }
+        Some(WifiPower { scheme, ac, dc })
+    }
+}
+
+fn restore_wifi_power(power: &WifiPower) {
+    use windows_sys::Win32::System::Power::{PowerSetActiveScheme, PowerWriteACValueIndex, PowerWriteDCValueIndex};
+    // SAFETY: writes back one setting of the scheme it was read from.
+    unsafe {
+        PowerWriteACValueIndex(std::ptr::null_mut(), &power.scheme, &WIFI_GROUP, &WIFI_POWER_SAVING, power.ac);
+        PowerWriteDCValueIndex(std::ptr::null_mut(), &power.scheme, &WIFI_GROUP, &WIFI_POWER_SAVING, power.dc);
+        PowerSetActiveScheme(std::ptr::null_mut(), &power.scheme);
+    }
 }
 
 // The WLAN handle is only used and closed by the engine thread that owns this.
@@ -562,9 +632,12 @@ impl Platform for Windows {
                 if WlanOpenHandle(2, std::ptr::null(), &mut version, &mut wlan) == 0 {
                     set_wifi(wlan, FALSE, TRUE);
                 }
-                self.fast = Some(Fast { wlan });
+                self.fast = Some(Fast { wlan, power: wifi_full_power() });
             }
-        } else if !on && let Some(Fast { wlan }) = self.fast.take() {
+        } else if !on && let Some(Fast { wlan, power }) = self.fast.take() {
+            if let Some(power) = &power {
+                restore_wifi_power(power);
+            }
             // SAFETY: undoing the above.
             unsafe {
                 if !wlan.is_null() {
