@@ -81,10 +81,11 @@ impl Displays for Windows {
         let thread = {
             let (stop, failed, feed) = (stop.clone(), failed.clone(), feed.clone());
             let name = source.name;
+            let apart = want.pointer_apart;
             std::thread::Builder::new()
                 .name("roam-display-capture".into())
                 .spawn(move || {
-                    let result = capture(&name, &feed, &stop, &opened);
+                    let result = capture(&name, apart, &feed, &stop, &opened);
                     if let Err(why) = result {
                         if let Ok(mut slot) = failed.lock() {
                             *slot = Some(why.clone());
@@ -142,13 +143,17 @@ fn ready_source(want: [u32; 2]) -> Result<(monitor::Source, [u32; 2]), String> {
 /// on `opened` once it's going.
 fn capture(
     name: &[u16; 32],
+    apart: bool,
     feed: &Feed,
     stop: &AtomicBool,
     opened: &mpsc::Sender<Result<[u32; 2], String>>,
 ) -> Result<(), String> {
     media::start()?;
-    let (mut duplicator, mut pictures, size) = open_capture(name, None)?;
+    let (mut duplicator, mut pictures, size) = open_capture(name, None, apart)?;
     let _ = opened.send(Ok(size));
+    if apart {
+        feed.note("extended display: the pointer goes apart from the pictures, drawn by the lending computer".into());
+    }
     // When capture last started again, so a hiccup costs a moment rather than the display,
     // as game streaming recovers, while one that keeps failing still ends it.
     let mut restarts: Vec<Instant> = Vec::new();
@@ -168,7 +173,7 @@ fn capture(
                     feed.note(format!("extended display capture starts again: {why}"));
                     drop((duplicator, pictures));
                     std::thread::sleep(Duration::from_millis(100));
-                    (duplicator, pictures, _) = open_capture(name, Some(size))?;
+                    (duplicator, pictures, _) = open_capture(name, Some(size), apart)?;
                     feed.ask_key();
                     continue;
                 }
@@ -194,6 +199,9 @@ fn capture(
         let settling = last_change.elapsed() < SETTLE;
         let waiting = recent || settling || duplicator.changed;
         or_restart!(duplicator.wait(pace.wait_until(now, waiting)));
+        // The pointer, when it goes apart, goes the moment it moves: not a picture's work.
+        let (at, shape) = duplicator.take_pointer();
+        feed.pointer(at, shape);
         for data in or_restart!(pictures.drain(&mut duplicator)) {
             feed.push(Picture { key: h264::is_key(&data), data });
         }
@@ -239,10 +247,12 @@ fn capture(
 }
 
 /// Duplication of the display `name` and the way to encode it, once Windows has the display
-/// ready. When `size` is given, the display must still be that size.
+/// ready. When `size` is given, the display must still be that size. With `apart`, the
+/// pictures leave the pointer out, and it goes on its own.
 fn open_capture(
     name: &[u16; 32],
     size: Option<[u32; 2]>,
+    apart: bool,
 ) -> Result<(duplicate::Duplicator, pictures::Pictures, [u32; 2]), String> {
     let started = Instant::now();
     let mut duplicator = loop {
@@ -258,6 +268,9 @@ fn open_capture(
     }
     if size.is_some_and(|size| size != [width, height]) {
         return Err(format!("The virtual display changed size, to {width}x{height}"));
+    }
+    if apart {
+        duplicator.pointer_apart();
     }
     let pictures = pictures::Pictures::new(&mut duplicator, [width, height], HZ)?;
     Ok((duplicator, pictures, [width, height]))

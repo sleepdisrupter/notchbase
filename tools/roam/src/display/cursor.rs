@@ -65,6 +65,67 @@ impl Shape {
     }
 }
 
+impl Shape {
+    /// The pointer as straight RGBA, for a lending computer that draws it itself, with its
+    /// size. Pixels that invert what's under them can't be drawn that way: they come out
+    /// black with a white edge, which shows on any background (Windows' text cursor is all
+    /// of them).
+    pub fn rgba(&self) -> ([u32; 2], Vec<u8>) {
+        let [w, h] = [self.width, self.rows()];
+        let mut out = vec![0u8; w * h * BYTES_PER_PIXEL];
+        let mut inverts = vec![false; w * h];
+        for row in 0..h {
+            for column in 0..w {
+                let at = row * w + column;
+                let (pixel, invert) = self.straight(row, column);
+                out[at * BYTES_PER_PIXEL..][..BYTES_PER_PIXEL].copy_from_slice(&pixel);
+                inverts[at] = invert;
+            }
+        }
+        for row in 0..h {
+            for column in 0..w {
+                let at = row * w + column;
+                let pixel = &mut out[at * BYTES_PER_PIXEL..][..BYTES_PER_PIXEL];
+                if inverts[at] {
+                    pixel.copy_from_slice(&[0, 0, 0, 255]);
+                } else if pixel[3] == 0 && near_invert(&inverts, w, h, row, column) {
+                    pixel.copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        ([w as u32, h as u32], out)
+    }
+
+    /// One pixel as RGBA, or that it inverts what's under it.
+    fn straight(&self, row: usize, column: usize) -> ([u8; 4], bool) {
+        const CLEAR: ([u8; 4], bool) = ([0, 0, 0, 0], false);
+        match self.kind {
+            Kind::Monochrome => match (self.mask_bit(row, column), self.mask_bit(row + self.rows(), column)) {
+                (false, false) => ([0, 0, 0, 255], false),
+                (false, true) => ([255, 255, 255, 255], false),
+                (true, false) => CLEAR,
+                (true, true) => (CLEAR.0, true),
+            },
+            Kind::Color => match self.texel(row, column) {
+                Some(&[b, g, r, a]) => ([r, g, b, a], false),
+                _ => CLEAR,
+            },
+            Kind::MaskedColor => match self.texel(row, column) {
+                Some(&[b, g, r, 0]) => ([r, g, b, 255], false),
+                Some(&[0, 0, 0, _]) => CLEAR,
+                Some(_) => (CLEAR.0, true),
+                None => CLEAR,
+            },
+        }
+    }
+}
+
+/// Whether a pixel touches one that inverts, across or corner to corner.
+fn near_invert(inverts: &[bool], w: usize, h: usize, row: usize, column: usize) -> bool {
+    (row.saturating_sub(1)..(row + 2).min(h))
+        .any(|y| (column.saturating_sub(1)..(column + 2).min(w)).any(|x| inverts[y * w + x]))
+}
+
 #[derive(Default)]
 pub struct Pointer {
     pub shape: Option<Shape>,
@@ -170,6 +231,73 @@ mod tests {
         pointer(shape, [0, 0]).draw(&mut canvas, [2, 1], [0, 0]);
         assert_eq!(pixel(&canvas, 2, 0, 0), [1, 2, 3]);
         assert_eq!(pixel(&canvas, 2, 1, 0), [0xF0, 0x0F, 0x0F]);
+    }
+
+    /// RGBA laid over a BGRA background, as the lending computer draws it.
+    fn over(rgba: &[u8], background: [u8; 4]) -> [u8; 3] {
+        let alpha = u32::from(rgba[3]);
+        let blend =
+            |top: u8, under: u8| ((u32::from(top) * alpha + u32::from(under) * (255 - alpha) + 127) / 255) as u8;
+        [blend(rgba[2], background[0]), blend(rgba[1], background[1]), blend(rgba[0], background[2])]
+    }
+
+    #[test]
+    fn drawn_apart_a_pointer_looks_as_drawn_in() {
+        let shapes = [
+            Shape {
+                kind: Kind::Color,
+                width: 2,
+                height: 2,
+                pitch: 8,
+                pixels: [[0, 0, 255, 255], [255, 255, 255, 0], [0, 0, 0, 128], [9, 8, 7, 255]].concat(),
+            },
+            // Black, white and clear: everything but inverting.
+            Shape { kind: Kind::Monochrome, width: 3, height: 2, pitch: 1, pixels: vec![0b0010_0000, 0b0100_0000] },
+            Shape {
+                kind: Kind::MaskedColor,
+                width: 2,
+                height: 1,
+                pitch: 8,
+                pixels: [[1, 2, 3, 0], [0, 0, 0, 0xFF]].concat(),
+            },
+        ];
+        for background in [[10, 20, 30, 255], [250, 240, 230, 255]] {
+            for shape in &shapes {
+                let ([w, h], rgba) = shape.rgba();
+                let (w, h) = (w as usize, h as usize);
+                assert_eq!(rgba.len(), w * h * 4);
+                let mut canvas = frame(w, h, background);
+                pointer(Shape { pixels: shape.pixels.clone(), ..*shape }, [0, 0]).draw(&mut canvas, [w, h], [0, 0]);
+                for y in 0..h {
+                    for x in 0..w {
+                        let at = (y * w + x) * 4;
+                        assert_eq!(
+                            over(&rgba[at..at + 4], background),
+                            pixel(&canvas, w, x, y),
+                            "{:?} at {x},{y}",
+                            shape.kind
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inverting_pixels_come_out_black_edged_in_white() {
+        // A text cursor: one column of inverting pixels in the middle of three.
+        let and = [0b1110_0000; 3];
+        let xor = [0b0100_0000; 3];
+        let shape =
+            Shape { kind: Kind::Monochrome, width: 3, height: 6, pitch: 1, pixels: [and, xor].concat().to_vec() };
+        let ([w, h], rgba) = shape.rgba();
+        assert_eq!([w, h], [3, 3]);
+        for row in rgba.chunks(12) {
+            assert_eq!(row, [[255, 255, 255, 255], [0, 0, 0, 255], [255, 255, 255, 255]].concat());
+        }
+        let masked =
+            Shape { kind: Kind::MaskedColor, width: 1, height: 1, pitch: 4, pixels: vec![0xFF, 0xFF, 0xFF, 0xFF] };
+        assert_eq!(masked.rgba().1, [0, 0, 0, 255]);
     }
 
     #[test]

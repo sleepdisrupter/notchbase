@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-use super::{Picture, Remote};
+use super::{Picture, PointerAt, PointerShape, Remote};
 use crate::crypto::hash;
 
 pub const MAGIC: &[u8; 4] = b"RDS1";
@@ -23,6 +23,10 @@ const PICTURE: u8 = 2;
 const BYE: u8 = 3;
 const INPUT: u8 = 4;
 const KEY_PLEASE: u8 = 5;
+// Only to a lending computer that says it draws the pointer: an older one ends the stream at
+// a kind it doesn't know.
+const POINTER: u8 = 6;
+const SHAPE: u8 = 7;
 
 /// The clear start of the connection: the session, and a number for this stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +71,10 @@ pub enum Down {
     /// The pictures that follow are this many pixels.
     Size([u32; 2]),
     Picture(Picture),
+    /// The host's pointer moved.
+    Pointer(PointerAt),
+    /// The host's pointer changed shape.
+    Shape(PointerShape),
     Bye,
 }
 
@@ -123,6 +131,12 @@ impl Sealer {
                 plain.push(u8::from(picture.key));
                 plain.extend_from_slice(&picture.data);
                 plain
+            }
+            Down::Pointer(PointerAt { at: [x, y], visible }) => {
+                [&[POINTER][..], &x.to_le_bytes(), &y.to_le_bytes(), &[u8::from(*visible)]].concat()
+            }
+            Down::Shape(PointerShape { size: [w, h], rgba }) => {
+                [&[SHAPE][..], &w.to_le_bytes(), &h.to_le_bytes(), rgba].concat()
             }
             Down::Bye => vec![BYE],
         };
@@ -198,6 +212,19 @@ impl Opener {
         Ok(match plain[0] {
             SIZE => Down::Size([word(1).ok_or_else(|| invalid("short"))?, word(5).ok_or_else(|| invalid("short"))?]),
             PICTURE if plain.len() >= 2 => Down::Picture(Picture { key: plain[1] != 0, data: plain[2..].to_vec() }),
+            POINTER => {
+                let short = || invalid("short");
+                let at = |at: usize| word(at).map(|w| w as i32).ok_or_else(short);
+                Down::Pointer(PointerAt { at: [at(1)?, at(5)?], visible: *plain.get(9).ok_or_else(short)? != 0 })
+            }
+            SHAPE => {
+                let size = [word(1).ok_or_else(|| invalid("short"))?, word(5).ok_or_else(|| invalid("short"))?];
+                let shape = PointerShape { size, rgba: plain.get(9..).unwrap_or_default().to_vec() };
+                if !shape.sound() {
+                    return Err(invalid("a pointer that doesn't add up"));
+                }
+                Down::Shape(shape)
+            }
             BYE => Down::Bye,
             _ => return Err(invalid("an unknown message")),
         })
@@ -252,6 +279,9 @@ mod tests {
             Down::Size([2560, 1440]),
             Down::Picture(Picture { key: true, data: vec![0, 0, 0, 1, 0x67, 9, 9] }),
             Down::Picture(Picture { key: false, data: vec![] }),
+            Down::Pointer(PointerAt { at: [-3, 1079], visible: true }),
+            Down::Pointer(PointerAt { at: [0, 0], visible: false }),
+            Down::Shape(PointerShape { size: [2, 1], rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] }),
             Down::Bye,
         ];
         for down in &downs {
@@ -280,6 +310,15 @@ mod tests {
         for up in &ups {
             assert_eq!(&opener.up(&mut reading).unwrap(), up);
         }
+    }
+
+    #[test]
+    fn a_pointer_shape_short_of_its_pixels_is_refused() {
+        let keys = keys([3; 32]);
+        let mut wire = Vec::new();
+        let mut sealer = Sealer::new(keys.pictures, 5);
+        sealer.send(&mut wire, &[&[SHAPE][..], &4u32.to_le_bytes(), &4u32.to_le_bytes(), &[0; 63]].concat()).unwrap();
+        assert!(Opener::new(keys.pictures, 5).down(&mut &wire[..]).is_err());
     }
 
     #[test]

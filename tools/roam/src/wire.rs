@@ -71,6 +71,8 @@ pub struct Beacon {
     pub busy: bool,
     /// Can lend its screens to another computer as extended displays.
     pub lends: bool,
+    /// Draws the host's pointer itself on a screen it lends, from news sent apart.
+    pub draws_pointer: bool,
     pub ppu: f32,
     pub displays: Vec<Rect>,
     pub name: String,
@@ -153,7 +155,10 @@ impl Packet {
                 out.bytes(&beacon.key);
                 out.u16(beacon.port);
                 out.u8(beacon.os.code());
-                out.u8(u8::from(beacon.open) | (u8::from(beacon.busy) << 1) | (u8::from(beacon.lends) << 2));
+                out.u8(u8::from(beacon.open)
+                    | (u8::from(beacon.busy) << 1)
+                    | (u8::from(beacon.lends) << 2)
+                    | (u8::from(beacon.draws_pointer) << 3));
                 out.f32(beacon.ppu);
                 let displays = &beacon.displays[..beacon.displays.len().min(16)];
                 out.u8(displays.len() as u8);
@@ -229,6 +234,7 @@ impl Packet {
                     open: flags & 1 != 0,
                     busy: flags & 2 != 0,
                     lends: flags & 4 != 0,
+                    draws_pointer: flags & 8 != 0,
                     ppu,
                     displays,
                     name,
@@ -622,6 +628,7 @@ mod tests {
                 open: true,
                 busy: false,
                 lends: true,
+                draws_pointer: true,
                 ppu: 1.5,
                 displays: vec![Rect::new(-1920.0, 0.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
                 name: "Desk PC".into(),
@@ -685,6 +692,7 @@ mod tests {
             open: false,
             busy: true,
             lends: false,
+            draws_pointer: false,
             ppu: 1.0,
             displays: vec![],
             name: "é".repeat(40),

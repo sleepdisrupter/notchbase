@@ -56,7 +56,39 @@ pub struct Want {
     pub panel: Panel,
     /// Where its top left goes, in the host's own units.
     pub at: [i32; 2],
+    /// The lending computer draws the pointer itself: a host that can sends it with
+    /// `Feed::pointer` and leaves it out of the pictures, so it moves without waiting for them.
+    pub pointer_apart: bool,
 }
+
+/// Where the host's pointer is on its pictures: the top left of its shape, in their pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerAt {
+    pub at: [i32; 2],
+    pub visible: bool,
+}
+
+/// What the host's pointer looks like: straight (not premultiplied) RGBA, row by row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointerShape {
+    pub size: [u32; 2],
+    pub rgba: Vec<u8>,
+}
+
+impl PointerShape {
+    /// The biggest pointer that goes, a side.
+    pub const MOST: u32 = 512;
+
+    /// Whether the pixels are as many as the size says, and the size is one that goes.
+    pub fn sound(&self) -> bool {
+        let [w, h] = self.size;
+        w > 0 && h > 0 && w <= Self::MOST && h <= Self::MOST && self.rgba.len() == w as usize * h as usize * 4
+    }
+}
+
+/// Set (to anything) on the host to keep the pointer in the pictures even for a lending
+/// computer that could draw it.
+pub const POINTER_IN_PICTURE: &str = "NOTCHBASE_ROAM_POINTER_IN_PICTURE";
 
 /// One encoded picture: an H.264 access unit in Annex B, with parameter sets before each key
 /// picture.
@@ -107,12 +139,33 @@ pub struct Feed(Arc<FeedInner>);
 
 #[derive(Default)]
 struct FeedInner {
-    waiting: Mutex<VecDeque<Picture>>,
+    waiting: Mutex<Waiting>,
     changed: Condvar,
     stopped: AtomicBool,
     key_wanted: AtomicBool,
     tally: Mutex<Tally>,
     notes: Mutex<Vec<String>>,
+}
+
+/// What waits to go out: pictures in order, and only the latest of the pointer's news.
+#[derive(Default)]
+struct Waiting {
+    pictures: VecDeque<Picture>,
+    pointer: Option<PointerAt>,
+    shape: Option<PointerShape>,
+}
+
+impl Waiting {
+    fn any(&self) -> bool {
+        !self.pictures.is_empty() || self.pointer.is_some() || self.shape.is_some()
+    }
+}
+
+/// The pointer's news, taken from the feed: a new shape (first), then where it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PointerNews {
+    pub shape: Option<PointerShape>,
+    pub at: Option<PointerAt>,
 }
 
 /// How the pictures went since the last look, for the log.
@@ -202,15 +255,41 @@ impl Feed {
 
     /// The network is behind: skip this picture and take the next.
     pub fn busy(&self) -> bool {
-        self.0.waiting.lock().map_or(true, |w| w.len() >= MOST_WAITING)
+        self.0.waiting.lock().map_or(true, |w| w.pictures.len() >= MOST_WAITING)
     }
 
     pub fn push(&self, picture: Picture) {
         self.count(|t| t.bytes += picture.data.len() as u64);
         if let Ok(mut waiting) = self.0.waiting.lock() {
-            waiting.push_back(picture);
+            waiting.pictures.push_back(picture);
         }
         self.0.changed.notify_all();
+    }
+
+    /// The pointer moved or changed shape: it goes out ahead of any picture, and news not yet
+    /// sent gives way to newer.
+    pub fn pointer(&self, at: Option<PointerAt>, shape: Option<PointerShape>) {
+        if at.is_none() && shape.is_none() {
+            return;
+        }
+        if let Ok(mut waiting) = self.0.waiting.lock() {
+            if at.is_some() {
+                waiting.pointer = at;
+            }
+            if shape.is_some() {
+                waiting.shape = shape;
+            }
+        }
+        self.0.changed.notify_all();
+    }
+
+    /// The pointer's news since the last call.
+    pub fn take_pointer(&self) -> PointerNews {
+        self.0
+            .waiting
+            .lock()
+            .map(|mut w| PointerNews { shape: w.shape.take(), at: w.pointer.take() })
+            .unwrap_or_default()
     }
 
     /// Whether the next picture should be a key picture (and forgets the wish).
@@ -292,12 +371,13 @@ impl Feed {
         self.0.tally.lock().map(|mut t| std::mem::take(&mut *t)).unwrap_or_default()
     }
 
-    /// The next picture to send, waiting at most `wait`.
+    /// The next picture to send, waiting at most `wait`, and coming back early (perhaps with
+    /// no picture) when the pointer has news.
     pub fn next(&self, wait: Duration) -> Option<Picture> {
         let waiting = self.0.waiting.lock().ok()?;
         let (mut waiting, _) =
-            self.0.changed.wait_timeout_while(waiting, wait, |w| w.is_empty() && !self.stopped()).ok()?;
-        waiting.pop_front()
+            self.0.changed.wait_timeout_while(waiting, wait, |w| !w.any() && !self.stopped()).ok()?;
+        waiting.pictures.pop_front()
     }
 }
 
@@ -320,6 +400,14 @@ pub trait Hosted: Send {
 pub trait Showing: Send {
     /// Shows the next picture. An error asks the host for a key picture.
     fn picture(&mut self, picture: &Picture) -> Result<(), String>;
+    /// The host's pointer moved, for a screen that draws it itself.
+    fn pointer(&mut self, _at: PointerAt) {}
+    /// The host's pointer changed shape.
+    fn shape(&mut self, _shape: &PointerShape) {}
+    /// The longest the pointer waited to be drawn since the last call.
+    fn take_pointer_lag(&mut self) -> Option<Duration> {
+        None
+    }
 }
 
 pub type RemoteSink = Box<dyn Fn(Remote) + Send + Sync>;
@@ -330,6 +418,10 @@ pub trait Displays: Send + Sync {
     /// Whether this computer can lend its screens to another.
     fn lends(&self) -> bool {
         lends()
+    }
+    /// Whether a screen this computer lends draws the host's pointer itself.
+    fn draws_pointer(&self) -> bool {
+        false
     }
     /// Installs what making virtual displays needs, asking the system for permission. Blocks
     /// until done.
@@ -464,6 +556,46 @@ mod tests {
         assert!(!pace.may_encode(soon));
         assert_eq!(pace.wait_until(soon, false), start + every);
         assert!(pace.may_encode(start + every));
+    }
+
+    #[test]
+    fn pointer_news_goes_ahead_and_only_the_latest() {
+        let feed = Feed::new();
+        assert_eq!(feed.take_pointer(), PointerNews::default());
+        let start = Instant::now();
+        assert_eq!(feed.next(Duration::from_millis(30)), None);
+        assert!(start.elapsed() >= Duration::from_millis(25), "nothing to send: it waits");
+        feed.push(Picture { key: true, data: vec![1] });
+        let shape = PointerShape { size: [1, 1], rgba: vec![1, 2, 3, 4] };
+        feed.pointer(None, Some(shape.clone()));
+        feed.pointer(Some(PointerAt { at: [1, 2], visible: true }), None);
+        feed.pointer(Some(PointerAt { at: [3, 4], visible: false }), None);
+        feed.pointer(None, None);
+        assert!(feed.busy(), "the pointer's news doesn't hold up pictures, nor count as one");
+        let news = feed.take_pointer();
+        assert_eq!(news, PointerNews { shape: Some(shape), at: Some(PointerAt { at: [3, 4], visible: false }) });
+        assert_eq!(feed.take_pointer(), PointerNews::default(), "taken once");
+        // News wakes a wait at once, even with no picture.
+        assert_eq!(feed.next(Duration::ZERO).map(|p| p.data), Some(vec![1]));
+        let waker = feed.clone();
+        let woke = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            waker.pointer(Some(PointerAt { at: [0, 0], visible: true }), None);
+        });
+        let start = Instant::now();
+        assert_eq!(feed.next(Duration::from_secs(5)), None);
+        assert!(start.elapsed() < Duration::from_secs(4), "woken by the pointer");
+        woke.join().unwrap();
+        assert!(feed.take_pointer().at.is_some());
+    }
+
+    #[test]
+    fn a_pointer_shape_must_hold_its_pixels() {
+        let shape = |size: [u32; 2], len: usize| PointerShape { size, rgba: vec![0; len] };
+        assert!(shape([32, 32], 32 * 32 * 4).sound());
+        assert!(!shape([32, 32], 32 * 32 * 4 - 1).sound(), "short");
+        assert!(!shape([0, 32], 0).sound(), "empty");
+        assert!(!shape([513, 1], 513 * 4).sound(), "too big");
     }
 
     #[test]

@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::Interface;
 
 use crate::display::cursor::{Kind, Pointer, Shape};
+use crate::display::{PointerAt, PointerShape};
 
 const BYTES_PER_PIXEL: usize = 4;
 const RECONNECT_EVERY: Duration = Duration::from_millis(250);
@@ -41,6 +42,13 @@ pub struct Duplicator {
     pub changed: bool,
     pointer: Pointer,
     shape: Vec<u8>,
+    /// Whether the pointer goes apart from the pictures, which then leave it out, and what's
+    /// new about it since the last `take_pointer`.
+    apart: bool,
+    moved: bool,
+    reshaped: bool,
+    /// A pointer never drawn, for the pictures when it goes apart.
+    none: Pointer,
     /// Whether the desktop stays on the graphics card, in `desk`, instead of coming off it.
     on_card: bool,
     desk: Option<ID3D11Texture2D>,
@@ -72,6 +80,10 @@ impl Duplicator {
             changed: true,
             pointer: Pointer::default(),
             shape: Vec::new(),
+            apart: false,
+            moved: false,
+            reshaped: false,
+            none: Pointer::default(),
             on_card: false,
             desk: None,
             luid,
@@ -80,6 +92,33 @@ impl Duplicator {
 
     pub fn size(&self) -> [usize; 2] {
         self.size
+    }
+
+    /// Sends the pointer apart from the pictures from now on: they leave it out, and a move
+    /// alone is no change to encode.
+    pub fn pointer_apart(&mut self) {
+        self.apart = true;
+        self.moved = true;
+        self.reshaped = self.pointer.shape.is_some();
+        self.changed = true;
+    }
+
+    /// What's new about the pointer since the last call, when it goes apart: where it is on
+    /// the display, and its shape when that changed.
+    pub fn take_pointer(&mut self) -> (Option<PointerAt>, Option<PointerShape>) {
+        if !self.apart {
+            return (None, None);
+        }
+        let shape = std::mem::take(&mut self.reshaped)
+            .then(|| self.pointer.shape.as_ref().map(Shape::rgba))
+            .flatten()
+            .map(|(size, rgba)| PointerShape { size, rgba })
+            .filter(PointerShape::sound);
+        let at = std::mem::take(&mut self.moved).then(|| PointerAt {
+            at: [self.pointer.at[0] - self.origin[0], self.pointer.at[1] - self.origin[1]],
+            visible: self.pointer.visible && self.pointer.shape.is_some(),
+        });
+        (at, shape)
     }
 
     /// Takes updates until something changes or `deadline` comes: a change goes to the encoder
@@ -99,7 +138,7 @@ impl Duplicator {
                     let taken = self.take(&duplication, &info, resource);
                     let _ = unsafe { duplication.ReleaseFrame() };
                     taken?;
-                    if self.changed {
+                    if self.changed || self.moved {
                         return Ok(());
                     }
                 }
@@ -142,7 +181,8 @@ impl Duplicator {
     /// pointer and where the display is. Nothing until it has a first picture.
     pub fn on_card(&mut self) -> Option<(&ID3D11Texture2D, &Pointer, [i32; 2])> {
         self.changed = false;
-        Some((self.desk.as_ref()?, &self.pointer, self.origin))
+        let pointer = if self.apart { &self.none } else { &self.pointer };
+        Some((self.desk.as_ref()?, pointer, self.origin))
     }
 
     fn staging(&mut self) -> Result<ID3D11Texture2D, String> {
@@ -170,7 +210,9 @@ impl Duplicator {
         }
         if std::mem::take(&mut self.changed) {
             self.composed.copy_from_slice(&self.clean);
-            self.pointer.draw(&mut self.composed, self.size, self.origin);
+            if !self.apart {
+                self.pointer.draw(&mut self.composed, self.size, self.origin);
+            }
         }
         &self.composed
     }
@@ -215,13 +257,24 @@ impl Duplicator {
             self.pointer.visible = position.Visible.as_bool();
             // Relative to the output; `draw` takes away the output's origin.
             self.pointer.at = [position.Position.x + self.origin[0], position.Position.y + self.origin[1]];
-            self.changed = true;
+            self.pointer_changed();
         }
         if info.PointerShapeBufferSize > 0 {
             self.read_shape(duplication, info.PointerShapeBufferSize);
-            self.changed = true;
+            self.reshaped = true;
+            self.pointer_changed();
         }
         Ok(())
+    }
+
+    /// The pointer moved or changed: news to send when it goes apart, else a change to the
+    /// picture.
+    fn pointer_changed(&mut self) {
+        if self.apart {
+            self.moved = true;
+        } else {
+            self.changed = true;
+        }
     }
 
     fn read_shape(&mut self, duplication: &IDXGIOutputDuplication, bytes: u32) {

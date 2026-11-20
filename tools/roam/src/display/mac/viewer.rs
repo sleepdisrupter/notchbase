@@ -2,13 +2,16 @@
 //! pictures with an `AVSampleBufferDisplayLayer` (which decodes in hardware), and handing what
 //! the mouse and keyboard do over it to the host. AppKit's parts live on the main thread;
 //! pictures go to the layer from the stream's thread.
+//!
+//! A host that sends its pointer apart has it drawn here, on a layer above the pictures, so it
+//! moves as soon as its news comes rather than with the next picture.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
@@ -19,14 +22,18 @@ use objc2_app_kit::{
     NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_av_foundation::{AVLayerVideoGravityResize, AVQueuedSampleBufferRenderingStatus, AVSampleBufferDisplayLayer};
-use objc2_core_foundation::{CFBoolean, CFMutableDictionary, CFRetained, CFString};
+use objc2_core_foundation::{CFBoolean, CFData, CFMutableDictionary, CFRetained, CFString, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::{
+    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo, kCGColorSpaceSRGB,
+};
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMVideoFormatDescriptionCreateFromH264ParameterSets,
     kCMBlockBufferAssureMemoryNowFlag, kCMSampleAttachmentKey_DisplayImmediately,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_quartz_core::{CAAutoresizingMask, CALayer, CATransaction};
 
-use crate::display::{Picture, Remote, RemoteSink, Showing, h264};
+use crate::display::{Picture, PointerAt, PointerShape, Remote, RemoteSink, Showing, h264};
 use crate::keys;
 use crate::layout::Rect;
 
@@ -50,11 +57,33 @@ unsafe extern "C" {
 struct Sendable<T>(T);
 // SAFETY: as above.
 unsafe impl<T> Send for Sendable<T> {}
+// SAFETY: as above: shared only to be handed to the main thread.
+unsafe impl<T> Sync for Sendable<T> {}
 
 pub struct Viewer {
     window: Option<Sendable<Retained<LentWindow>>>,
     layer: Retained<AVSampleBufferDisplayLayer>,
     format: Option<CFRetained<CMFormatDescription>>,
+    /// The host's pointer, drawn above the pictures: only touched on the main thread.
+    pointer_layer: Arc<Sendable<Retained<CALayer>>>,
+    /// What's new about the pointer, for the main thread to draw.
+    pointer: Arc<Mutex<PointerState>>,
+    /// The size of the pictures, in pixels.
+    size: [u32; 2],
+}
+
+/// The pointer's news between the stream's thread and the main thread: the newest only, and
+/// one drawing on its way at a time, so a busy main thread never draws stale places.
+#[derive(Default)]
+struct PointerState {
+    at: Option<PointerAt>,
+    /// A shape not yet drawn, and the size of the one drawn.
+    shape: Option<PointerShape>,
+    shape_size: Option<[u32; 2]>,
+    /// When the news on its way to the main thread came.
+    pending: Option<Instant>,
+    /// The longest news waited to be drawn since the last look.
+    longest: Option<Duration>,
 }
 
 // SAFETY: the layer takes sample buffers from any thread; the window is only passed back to
@@ -62,16 +91,110 @@ pub struct Viewer {
 unsafe impl Send for Viewer {}
 
 impl Viewer {
-    pub fn open(rect: Rect, _size: [u32; 2], remote: RemoteSink) -> Result<Self, String> {
+    pub fn open(rect: Rect, size: [u32; 2], remote: RemoteSink) -> Result<Self, String> {
         let (made, wait) = mpsc::channel();
         DispatchQueue::main().exec_async(move || {
             let Some(mtm) = MainThreadMarker::new() else { return };
             let _ = made.send(Sendable(make_window(mtm, rect, remote)));
         });
-        let Ok(Sendable((window, layer))) = wait.recv_timeout(OPEN_WAIT) else {
+        let Ok(Sendable((window, layer, pointer_layer))) = wait.recv_timeout(OPEN_WAIT) else {
             return Err("The window for the picture didn't open".into());
         };
-        Ok(Self { window: Some(Sendable(window)), layer, format: None })
+        Ok(Self {
+            window: Some(Sendable(window)),
+            layer,
+            format: None,
+            pointer_layer: Arc::new(Sendable(pointer_layer)),
+            pointer: Arc::default(),
+            size,
+        })
+    }
+
+    /// Has the main thread draw the pointer's news, unless a drawing is already on its way.
+    fn draw_pointer(&self, news: impl FnOnce(&mut PointerState)) {
+        let Ok(mut state) = self.pointer.lock() else { return };
+        news(&mut state);
+        if state.pending.is_some() {
+            return;
+        }
+        state.pending = Some(Instant::now());
+        drop(state);
+        let (layer, pointer, size) = (self.pointer_layer.clone(), self.pointer.clone(), self.size);
+        DispatchQueue::main().exec_async(move || {
+            if let Ok(mut state) = pointer.lock() {
+                draw_pointer(&layer.0, &mut state, size);
+            }
+        });
+    }
+}
+
+/// On the main thread: the pointer as `state` has it now.
+fn draw_pointer(layer: &CALayer, state: &mut PointerState, size: [u32; 2]) {
+    if let Some(came) = state.pending.take() {
+        let waited = came.elapsed();
+        state.longest = Some(state.longest.map_or(waited, |longest| longest.max(waited)));
+    }
+    CATransaction::begin();
+    // Straight there: a layer would otherwise glide to each new place.
+    CATransaction::setDisableActions(true);
+    if let Some(shape) = state.shape.take() {
+        let image = pointer_image(&shape);
+        let contents: Option<&AnyObject> = image.as_ref().map(|image| {
+            // SAFETY: a CGImage is an object a layer takes as its contents.
+            unsafe { &*CFRetained::as_ptr(image).as_ptr().cast::<AnyObject>() }
+        });
+        // SAFETY: the layer keeps its own reference to the image.
+        unsafe { layer.setContents(contents) };
+        state.shape_size = image.is_some().then_some(shape.size);
+    }
+    let bounds = layer.superlayer().map(|root| root.bounds().size);
+    match (state.at, state.shape_size, bounds) {
+        (Some(at), Some(shape), Some(bounds)) if at.visible => {
+            let [x, y, w, h] = pointer_frame(at.at, shape, size, [bounds.width, bounds.height]);
+            layer.setFrame(CGRect::new(CGPoint::new(x, y), CGSize::new(w, h)));
+            layer.setHidden(false);
+        }
+        _ => layer.setHidden(true),
+    }
+    CATransaction::commit();
+}
+
+/// Where the pointer's layer goes, as x, y, width and height in the layer above it (`bounds`
+/// points, counting up from the bottom), for a `shape`-sized pointer with its top left `at`
+/// on `picture`-sized pictures, which are stretched to fill.
+fn pointer_frame(at: [i32; 2], shape: [u32; 2], picture: [u32; 2], bounds: [f64; 2]) -> [f64; 4] {
+    let scale = [0, 1].map(|axis| bounds[axis] / f64::from(picture[axis].max(1)));
+    let [w, h] = [0, 1].map(|axis| f64::from(shape[axis]) * scale[axis]);
+    let x = f64::from(at[0]) * scale[0];
+    let y = bounds[1] - f64::from(at[1]) * scale[1] - h;
+    [x, y, w, h]
+}
+
+/// The pointer's picture, from its straight RGBA.
+fn pointer_image(shape: &PointerShape) -> Option<CFRetained<CGImage>> {
+    if !shape.sound() {
+        return None;
+    }
+    let [w, h] = shape.size.map(|side| side as usize);
+    let data = CFData::from_bytes(&shape.rgba);
+    let provider = CGDataProvider::with_cf_data(Some(&data))?;
+    // SAFETY: a constant CoreGraphics defines.
+    let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))?;
+    // SAFETY: the provider holds w * h pixels of four bytes, as `sound` checked.
+    unsafe {
+        CGImage::new(
+            w,
+            h,
+            8,
+            32,
+            w * 4,
+            Some(&space),
+            CGBitmapInfo(CGImageAlphaInfo::Last.0),
+            Some(&provider),
+            std::ptr::null(),
+            true,
+            CGColorRenderingIntent::RenderingIntentDefault,
+        )
     }
 }
 
@@ -98,6 +221,19 @@ impl Showing for Viewer {
             self.layer.enqueueSampleBuffer(&sample);
         }
         Ok(())
+    }
+
+    fn pointer(&mut self, at: PointerAt) {
+        self.draw_pointer(|state| state.at = Some(at));
+    }
+
+    fn shape(&mut self, shape: &PointerShape) {
+        let shape = shape.clone();
+        self.draw_pointer(|state| state.shape = Some(shape));
+    }
+
+    fn take_pointer_lag(&mut self) -> Option<Duration> {
+        self.pointer.lock().ok().and_then(|mut state| state.longest.take())
     }
 }
 
@@ -188,12 +324,12 @@ unsafe fn sample(avcc: &[u8], format: &CMFormatDescription) -> Result<CFRetained
 }
 
 /// The window over the screen at `rect` (in points, top left at the top), with the layer
-/// that shows the pictures.
+/// that shows the pictures and the one above it for the host's pointer.
 fn make_window(
     mtm: MainThreadMarker,
     rect: Rect,
     remote: RemoteSink,
-) -> (Retained<LentWindow>, Retained<AVSampleBufferDisplayLayer>) {
+) -> (Retained<LentWindow>, Retained<AVSampleBufferDisplayLayer>, Retained<CALayer>) {
     // AppKit counts up from the bottom of the first screen.
     let first = NSScreen::screens(mtm).firstObject().map_or(rect.h, |screen| screen.frame().size.height);
     let frame = NSRect::new(NSPoint::new(rect.x, first - rect.y - rect.h), NSSize::new(rect.w, rect.h));
@@ -231,8 +367,18 @@ fn make_window(
         }
         layer
     };
+    // The pictures and the pointer side by side under a plain layer, the pointer on top.
+    let (root, pointer) = (CALayer::layer(), CALayer::layer());
+    let bounds = CGRect::new(CGPoint::ZERO, CGSize::new(rect.w, rect.h));
+    root.setFrame(bounds);
+    layer.setFrame(bounds);
+    layer.setAutoresizingMask(CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable);
+    root.addSublayer(&layer);
+    pointer.setHidden(true);
+    pointer.setZPosition(1.0);
+    root.addSublayer(&pointer);
     let view = LentView::new(mtm, remote);
-    view.setLayer(Some(&layer));
+    view.setLayer(Some(&root));
     view.setWantsLayer(true);
     // SAFETY: a tracking area the view owns, over all of it.
     unsafe {
@@ -253,7 +399,7 @@ fn make_window(
     window.setContentView(Some(&view));
     window.orderFrontRegardless();
     window.makeFirstResponder(Some(&view));
-    (window, layer)
+    (window, layer, pointer)
 }
 
 define_class!(
@@ -464,7 +610,7 @@ impl LentView {
         }
     }
 
-    /// The host draws its own pointer into the picture.
+    /// The host's pointer is in the picture, or drawn over it.
     fn hide_cursor(&self) {
         if self.ivars().hidden.replace(true) {
             return;
@@ -485,5 +631,76 @@ impl LentView {
             // SAFETY: balances the hide above.
             unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_core_graphics::{CGContext, CGImageByteOrderInfo};
+
+    use super::*;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *const CGColorSpace,
+            bitmap_info: u32,
+        ) -> *mut CGContext;
+        fn CGContextRelease(context: *mut CGContext);
+    }
+
+    #[test]
+    fn the_pointer_lands_where_the_host_has_it() {
+        // A 1920x1080 picture stretched over a 960x600 screen: half across, 5/9 down.
+        let [x, y, w, h] = pointer_frame([960, 540], [32, 36], [1920, 1080], [960.0, 600.0]);
+        assert_eq!([x, w], [480.0, 16.0]);
+        assert!((h - 20.0).abs() < 1e-9 && (y - (600.0 - 300.0 - 20.0)).abs() < 1e-9, "{y} {h}");
+        assert_eq!(pointer_frame([0, 0], [10, 10], [100, 100], [100.0, 100.0]), [0.0, 90.0, 10.0, 10.0], "top left");
+    }
+
+    /// Drawn for real, off screen: the pointer's top left pixel lands at the top left of where
+    /// the host put it, the right way up.
+    #[test]
+    fn the_pointer_draws_upright_at_its_place() {
+        let (width, height) = (100usize, 80usize);
+        let root = CALayer::layer();
+        root.setFrame(CGRect::new(CGPoint::ZERO, CGSize::new(width as f64, height as f64)));
+        let layer = CALayer::layer();
+        root.addSublayer(&layer);
+        // Red at the top left, blue everywhere else, on a 4x4 pointer.
+        let mut rgba = [0u8, 0, 255, 255].repeat(16);
+        rgba[..4].copy_from_slice(&[255, 0, 0, 255]);
+        let mut state = PointerState {
+            at: Some(PointerAt { at: [20, 10], visible: true }),
+            shape: Some(PointerShape { size: [4, 4], rgba }),
+            ..PointerState::default()
+        };
+        draw_pointer(&layer, &mut state, [width as u32, height as u32]);
+        assert!(!layer.isHidden());
+        let mut pixels = vec![0u8; width * height * 4];
+        let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })).unwrap();
+        let info = CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0;
+        // SAFETY: a context over `pixels`, released before they go.
+        unsafe {
+            let context = CGBitmapContextCreate(pixels.as_mut_ptr().cast(), width, height, 8, width * 4, &*space, info);
+            assert!(!context.is_null());
+            root.renderInContext(&*context);
+            CGContextRelease(context);
+        }
+        // The context's first row is its top.
+        let pixel = |x: usize, y: usize| <[u8; 4]>::try_from(&pixels[(y * width + x) * 4..][..4]).unwrap();
+        assert_eq!(pixel(20, 10), [255, 0, 0, 255], "the top left pixel, at the top left");
+        assert_eq!(pixel(23, 13), [0, 0, 255, 255]);
+        assert_eq!(pixel(21, 10)[2], 255, "blue beside it");
+        assert_eq!(pixel(19, 10)[3], 0, "nothing outside");
+        assert_eq!(pixel(20, 14)[3], 0, "nothing below");
+        state.at = Some(PointerAt { at: [20, 10], visible: false });
+        draw_pointer(&layer, &mut state, [width as u32, height as u32]);
+        assert!(layer.isHidden());
     }
 }

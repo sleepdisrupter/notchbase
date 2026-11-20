@@ -37,6 +37,10 @@ impl Displays for Mac {
         screen::panel(rect)
     }
 
+    fn draws_pointer(&self) -> bool {
+        true
+    }
+
     fn show(&self, rect: Rect, size: [u32; 2], remote: RemoteSink) -> Result<Box<dyn Showing>, String> {
         Ok(Box::new(viewer::Viewer::open(rect, size, remote)?))
     }

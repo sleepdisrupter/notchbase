@@ -246,6 +246,10 @@ impl Core {
         };
         let at = self.virtual_at(peer, display).unwrap_or_default();
         let name = self.who(peer);
+        // The other computer draws the pointer itself, where it can: it then moves without
+        // waiting for the pictures.
+        let pointer_apart = self.peers.get(&peer).is_some_and(|p| p.draws_pointer)
+            && std::env::var_os(display::POINTER_IN_PICTURE).is_none();
         let Some(session) = self.sessions.get_mut(&peer) else { return };
         let addr = session.addr;
         let session_id = session.id;
@@ -257,7 +261,7 @@ impl Core {
         let job = HostJob {
             peer,
             serial,
-            want: Want { name: name.clone(), panel, at },
+            want: Want { name: name.clone(), panel, at, pointer_apart },
             addr,
             hello: Hello { session: session_id, stream: u32::from_le_bytes(crypto::random::<4>()) },
             keys,
@@ -635,14 +639,30 @@ fn run_host(job: &HostJob) -> Result<String, String> {
     let mut tallied = Instant::now();
     let _ = job.feed.take_tally();
     while !job.feed.stopped() {
-        if let Some(picture) = job.feed.next(Duration::from_millis(40)) {
+        let picture = job.feed.next(Duration::from_millis(40));
+        // The pointer's news goes first: it's small, and the reason it goes apart is to be quick.
+        let news = job.feed.take_pointer();
+        let pointed = news.shape.is_some() || news.at.is_some();
+        let mut sent = Ok(());
+        if let Some(shape) = news.shape {
+            sent = sealer.down(&mut out, &Down::Shape(shape));
+        }
+        if let Some(at) = news.at.filter(|_| sent.is_ok()) {
+            sent = sealer.down(&mut out, &Down::Pointer(at));
+        }
+        if pointed && sent.is_ok() {
+            sent = out.flush();
+        }
+        if let Some(picture) = picture.filter(|_| sent.is_ok()) {
             let started = Instant::now();
-            let sent = sealer.down(&mut out, &Down::Picture(picture)).and_then(|()| out.flush());
-            if let Err(err) = sent {
-                why = format!("The connection dropped: {err}");
-                break;
+            sent = sealer.down(&mut out, &Down::Picture(picture)).and_then(|()| out.flush());
+            if sent.is_ok() {
+                job.feed.count_sent(started.elapsed());
             }
-            job.feed.count_sent(started.elapsed());
+        }
+        if let Err(err) = sent {
+            why = format!("The connection dropped: {err}");
+            break;
         }
         if tallied.elapsed() >= TALLY_EVERY {
             let text = job.feed.take_tally().line(tallied.elapsed().as_secs_f64());
@@ -709,6 +729,7 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
     let mut tallied = Instant::now();
     let why = loop {
         if tallied.elapsed() >= TALLY_EVERY {
+            arrivals.pointer_lag = showing.as_mut().and_then(|shown| shown.take_pointer_lag());
             let text = std::mem::take(&mut arrivals).line(tallied.elapsed().as_secs_f64());
             tallied = Instant::now();
             let _ = events.send(Event::Extend(ExtendEvent::Note { text }));
@@ -735,6 +756,17 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
                     let _ = up.send(Up::KeyPlease);
                 }
             }
+            Ok(Down::Pointer(at)) => {
+                if let Some(shown) = showing.as_mut() {
+                    arrivals.pointers += 1;
+                    shown.pointer(at);
+                }
+            }
+            Ok(Down::Shape(shape)) => {
+                if let Some(shown) = showing.as_mut() {
+                    shown.shape(&shape);
+                }
+            }
             Ok(Down::Bye) => break "Stopped".to_owned(),
             Err(err) => break format!("The connection ended: {err}"),
         }
@@ -755,6 +787,9 @@ struct Arrivals {
     longest_gap: Duration,
     longest_show: Duration,
     last: Option<Instant>,
+    /// Pointer moves the host sent apart from the pictures, and the longest one waited to be drawn.
+    pointers: u32,
+    pointer_lag: Option<Duration>,
 }
 
 impl Arrivals {
@@ -778,7 +813,17 @@ impl Arrivals {
             self.longest_gap.as_secs_f64() * 1000.0,
             self.longest_show.as_secs_f64() * 1000.0,
             self.failed,
-        )
+        ) + &self.pointer_line(seconds)
+    }
+
+    fn pointer_line(&self, seconds: f64) -> String {
+        if self.pointers == 0 {
+            return String::new();
+        }
+        let lag = self
+            .pointer_lag
+            .map_or(String::new(), |lag| format!(", longest to draw {:.1} ms", lag.as_secs_f64() * 1000.0));
+        format!("; the pointer drawn here, {:.0} moves a second{lag}", f64::from(self.pointers) / seconds)
     }
 }
 
@@ -796,6 +841,13 @@ mod tests {
         assert_eq!(
             arrivals.line(1.0),
             "lent screen, last 1 s: 3 pictures a second, 6.0 Mbit/s, longest gap 43 ms, longest to show 2.0 ms, 1 not shown"
+        );
+        arrivals.pointers = 240;
+        arrivals.pointer_lag = Some(Duration::from_micros(1500));
+        assert!(
+            arrivals
+                .line(2.0)
+                .ends_with("1 not shown; the pointer drawn here, 120 moves a second, longest to draw 1.5 ms")
         );
     }
 
