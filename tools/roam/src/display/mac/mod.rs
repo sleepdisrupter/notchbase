@@ -3,10 +3,13 @@
 //! covered by a window that shows the host's pictures.
 
 mod capture;
+mod keep_off;
 mod screen;
 mod viewer;
 
-use super::{Ability, Displays, Feed, Hosted, Panel, RemoteSink, Showing, Want};
+use std::time::Duration;
+
+use super::{Ability, Displays, Feed, Hosted, Panel, Picture, PointerAt, PointerShape, RemoteSink, Showing, Want};
 use crate::layout::Rect;
 
 /// Virtual displays run at this rate: what every screen shows, and what the encoder keeps up with.
@@ -42,7 +45,32 @@ impl Displays for Mac {
     }
 
     fn show(&self, rect: Rect, size: [u32; 2], remote: RemoteSink) -> Result<Box<dyn Showing>, String> {
-        Ok(Box::new(viewer::Viewer::open(rect, size, remote)?))
+        let viewer = viewer::Viewer::open(rect, size, remote)?;
+        Ok(Box::new(Lent { viewer, _keep_off: keep_off::KeepOff::start(rect) }))
+    }
+}
+
+/// A lent screen: the host's pictures over it, and this Mac's own windows kept off it.
+struct Lent {
+    viewer: viewer::Viewer,
+    _keep_off: keep_off::KeepOff,
+}
+
+impl Showing for Lent {
+    fn picture(&mut self, picture: &Picture) -> Result<(), String> {
+        self.viewer.picture(picture)
+    }
+
+    fn pointer(&mut self, at: PointerAt) {
+        self.viewer.pointer(at);
+    }
+
+    fn shape(&mut self, shape: &PointerShape) {
+        self.viewer.shape(shape);
+    }
+
+    fn take_pointer_lag(&mut self) -> Option<Duration> {
+        self.viewer.take_pointer_lag()
     }
 }
 
