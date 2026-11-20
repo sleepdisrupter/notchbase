@@ -699,3 +699,24 @@ fn the_pointer_over_an_extended_display_goes_the_quick_way() {
             == Some(&crate::display::PointerAt { at: [178, 47], visible: false })
     });
 }
+
+#[test]
+fn with_roaming_off_the_cursor_stays_but_the_extended_display_works() {
+    let (a, _b, _host, viewer, _b_id) = lend_a_screen();
+    a.wait_for("listening", |s| s.sink.is_some());
+    let mut off = prefs(a.port + 1);
+    off.roam = false;
+    a.engine.send(Control::Prefs(off));
+    std::thread::sleep(Duration::from_millis(50));
+    for _ in 0..5 {
+        a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [5.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!a.fake.state().captured, "the cursor stayed on the PC");
+    // Its own virtual display still shows the pointer on the Mac.
+    a.fake.input(Input::Move { at: [3432.0 + 300.0, 200.0], delta: [1.0, 0.0] });
+    displays::wait("the pointer drawn on the Mac", || {
+        viewer.seen.lock().unwrap().pointers.contains(&crate::display::PointerAt { at: [298, 197], visible: true })
+    });
+}

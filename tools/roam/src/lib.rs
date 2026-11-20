@@ -36,6 +36,7 @@ const NAME: &str = "name";
 const SMOOTHING: &str = "smoothing";
 const CLIPBOARD: &str = "clipboard";
 const FAST_WIFI: &str = "fast_wifi";
+const ROAM: &str = "roam";
 const MODIFIERS: &str = "modifiers";
 const CORNERS: &str = "corners";
 const ADDRESSES: &str = "addresses";
@@ -223,6 +224,7 @@ fn prefs(settings: &Settings) -> Prefs {
         corners: settings.bool(CORNERS),
         clipboard: settings.bool(CLIPBOARD),
         fast_wifi: settings.bool(FAST_WIFI),
+        roam: settings.bool(ROAM),
         modifiers: match settings.text(MODIFIERS) {
             "position" => keys::Modifiers::Position,
             "shortcuts" => keys::Modifiers::Shortcuts,
@@ -244,6 +246,11 @@ impl<B: Backend> Tool for Roam<B> {
             .setting(
                 SettingSpec::toggle(OPEN, "Let nearby computers use this one", true)
                     .detail("Shows this computer to others on the network so they can share their keyboard and mouse"),
+            )
+            .setting(
+                SettingSpec::toggle(ROAM, "Move the mouse and keyboard to other computers", true).detail(
+                    "Turn off to keep the mouse and keyboard on this computer while extended displays stay on",
+                ),
             )
             .setting(SettingSpec::text(NAME, "Name shown to other computers", "").placeholder("This computer's name"))
             .setting(

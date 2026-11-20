@@ -91,6 +91,9 @@ pub struct Prefs {
     pub modifiers: keys::Modifiers,
     pub addresses: Vec<String>,
     pub fast_wifi: bool,
+    /// Whether the cursor crosses to other computers. Off, the mouse and keyboard stay on this
+    /// one, and extended displays (this computer's own screens) still work.
+    pub roam: bool,
 }
 
 impl Default for Prefs {
@@ -104,6 +107,7 @@ impl Default for Prefs {
             modifiers: keys::Modifiers::Same,
             addresses: Vec::new(),
             fast_wifi: true,
+            roam: true,
         }
     }
 }
@@ -1852,6 +1856,9 @@ impl Core {
             Cursor::Home => {
                 let Input::Move { at, delta } = input else { return };
                 self.quick_pointer(Some(at));
+                if !self.prefs.roam {
+                    return;
+                }
                 // Only the left button may be held across, and only while dragging files.
                 let dragging = self.held_buttons == 1;
                 if (self.held_buttons != 0 && !dragging) || self.locked {
@@ -2311,6 +2318,10 @@ impl Core {
         match control {
             Control::Prefs(prefs) => {
                 let closed = self.prefs.open && !prefs.open;
+                if !prefs.roam && matches!(self.cursor, Cursor::Away { .. }) {
+                    self.note("roaming turned off: the cursor comes home");
+                    self.go_home(None);
+                }
                 self.smoother.set_on(prefs.smoothing);
                 let retype = self.prefs.addresses != prefs.addresses || self.prefs.name != prefs.name;
                 self.prefs = prefs;
