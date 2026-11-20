@@ -206,6 +206,24 @@ impl Sealer {
     }
 }
 
+/// Fills `buf`, waiting out read timeouts while `alive` says to.
+fn read_all(input: &mut impl Read, mut buf: &mut [u8], alive: &mut dyn FnMut() -> bool) -> io::Result<()> {
+    while !buf.is_empty() {
+        match input.read(buf) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => buf = &mut buf[n..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                if !alive() {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 /// Opens messages in order: a message out of place or tampered with ends the stream.
 pub struct Opener {
     aead: ChaCha20Poly1305,
@@ -218,15 +236,15 @@ impl Opener {
         Self { aead: ChaCha20Poly1305::new(&key.into()), stream, count: 0 }
     }
 
-    fn open(&mut self, input: &mut impl Read) -> io::Result<Vec<u8>> {
+    fn open(&mut self, input: &mut impl Read, alive: &mut dyn FnMut() -> bool) -> io::Result<Vec<u8>> {
         let mut length = [0u8; 4];
-        input.read_exact(&mut length)?;
+        read_all(input, &mut length, alive)?;
         let length = u32::from_le_bytes(length) as usize;
         if length > MOST + 64 {
             return Err(invalid("a message too big"));
         }
         let mut sealed = vec![0u8; length];
-        input.read_exact(&mut sealed)?;
+        read_all(input, &mut sealed, alive)?;
         let plain = self
             .aead
             .decrypt(&nonce(self.stream, self.count), Payload { msg: &sealed, aad: MAGIC })
@@ -239,7 +257,14 @@ impl Opener {
     }
 
     pub fn down(&mut self, input: &mut impl Read) -> io::Result<Down> {
-        let plain = self.open(input)?;
+        self.down_waiting(input, &mut || false)
+    }
+
+    /// The next message, riding out the connection's read timeouts for as long as `alive` says
+    /// the stream is still worth waiting for: a timeout midway through a message would
+    /// otherwise lose its place in the stream.
+    pub fn down_waiting(&mut self, input: &mut impl Read, alive: &mut dyn FnMut() -> bool) -> io::Result<Down> {
+        let plain = self.open(input, alive)?;
         let word = |at: usize| plain.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
         Ok(match plain[0] {
             SIZE => Down::Size([word(1).ok_or_else(|| invalid("short"))?, word(5).ok_or_else(|| invalid("short"))?]),
@@ -265,7 +290,7 @@ impl Opener {
     }
 
     pub fn up(&mut self, input: &mut impl Read) -> io::Result<Up> {
-        let plain = self.open(input)?;
+        let plain = self.open(input, &mut || false)?;
         let float = |at: usize| plain.get(at..at + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
         let short = || invalid("short");
         Ok(match plain[0] {
@@ -370,6 +395,53 @@ mod tests {
         let mut sealer = Sealer::new(keys.pictures, 5);
         sealer.send(&mut wire, &[&[SHAPE][..], &4u32.to_le_bytes(), &4u32.to_le_bytes(), &[0; 63]].concat()).unwrap();
         assert!(Opener::new(keys.pictures, 5).down(&mut &wire[..]).is_err());
+    }
+
+    /// Hands out its bytes a few at a time, timing out between them.
+    struct Halting {
+        bytes: Vec<u8>,
+        at: usize,
+        stalled: bool,
+    }
+
+    impl Read for Halting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.stalled = !self.stalled;
+            if self.stalled {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(3).min(self.bytes.len() - self.at);
+            buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_stall_midway_through_a_message_keeps_its_place() {
+        let keys = keys([3; 32]);
+        let mut wire = Vec::new();
+        let mut sealer = Sealer::new(keys.pictures, 5);
+        let picture = Down::Picture(Picture { key: true, data: (0..200).collect() });
+        sealer.down(&mut wire, &picture).unwrap();
+        sealer.down(&mut wire, &Down::Alive).unwrap();
+        let mut halting = Halting { bytes: wire.clone(), at: 0, stalled: false };
+        let mut opener = Opener::new(keys.pictures, 5);
+        let mut waits = 0;
+        assert_eq!(
+            opener
+                .down_waiting(&mut halting, &mut || {
+                    waits += 1;
+                    true
+                })
+                .unwrap(),
+            picture
+        );
+        assert_eq!(opener.down_waiting(&mut halting, &mut || true).unwrap(), Down::Alive);
+        assert!(waits > 10);
+        // Not worth waiting for: the stall ends it.
+        let mut halting = Halting { bytes: wire, at: 0, stalled: false };
+        assert!(Opener::new(keys.pictures, 5).down_waiting(&mut halting, &mut || false).is_err());
     }
 
     #[test]

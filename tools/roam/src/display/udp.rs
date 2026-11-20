@@ -111,8 +111,9 @@ impl Sender {
         self.picture = self.picture.wrapping_add(1);
         let data = &picture.data;
         let blocks = data.len().div_ceil(BLOCK_BYTES).max(1);
-        let mut packets = Vec::new();
+        let mut by_block: Vec<Vec<Vec<u8>>> = Vec::with_capacity(blocks);
         for block in 0..blocks {
+            let mut packets = Vec::new();
             let bytes = &data[(block * BLOCK_BYTES).min(data.len())..((block + 1) * BLOCK_BYTES).min(data.len())];
             let shards = bytes.len().div_ceil(SHARD).max(1);
             let width = bytes.len().div_ceil(shards).max(1);
@@ -143,6 +144,18 @@ impl Sender {
                 plain.push(index as u8);
                 plain.extend_from_slice(shard);
                 packets.push(self.seal(&plain));
+            }
+            by_block.push(packets);
+        }
+        // The blocks' packets take turns: Wi-Fi loses packets in runs, and a run spread over
+        // several blocks leaves each one few enough losses to rebuild.
+        let mut packets = Vec::with_capacity(by_block.iter().map(Vec::len).sum());
+        let most = by_block.iter().map(Vec::len).max().unwrap_or(0);
+        for turn in 0..most {
+            for block in &mut by_block {
+                if let Some(packet) = block.get_mut(turn) {
+                    packets.push(std::mem::take(packet));
+                }
             }
         }
         packets

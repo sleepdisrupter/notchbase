@@ -452,9 +452,15 @@ mod displays {
                 feed.set_cursor(crate::display::Cursor { hotspot: [2, 3], visible: true, size });
             }
             let sending = feed.clone();
+            let apart = want.pointer_apart;
             std::thread::spawn(move || {
                 let mut n = 0u8;
                 while !sending.stopped() {
+                    // As a real capture does, it says where the pointer is as it moves.
+                    if apart {
+                        let at = crate::display::PointerAt { at: [i32::from(n), 7], visible: true };
+                        sending.pointer(Some(at), None);
+                    }
                     if !sending.busy() {
                         let key = sending.key_wanted();
                         sending.push(Picture { key, data: vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, n] });
@@ -732,4 +738,23 @@ fn an_extended_displays_pictures_go_over_udp() {
     // One to start from, and one more to start the new way from.
     assert!(seen.pictures.iter().filter(|p| p.key).count() >= 2, "a key picture to start the new way from");
     assert!(!log_of(&a).contains("go over TCP"), "{}", log_of(&a));
+}
+
+#[test]
+fn dragging_over_an_extended_display_keeps_its_stream() {
+    let (a, _b, _host, viewer, _) = lend_a_screen();
+    a.wait_for("listening", |s| s.sink.is_some());
+    displays::wait("the pictures going over UDP", || log_of(&a).contains("pictures go over UDP"));
+    // The cursor keeps moving over the virtual display, at (3432, 0), for longer than a stream
+    // may go quiet: as dragging a selection box does.
+    let until = std::time::Instant::now() + Duration::from_secs(7);
+    let mut x = 100.0;
+    while std::time::Instant::now() < until {
+        a.fake.input(Input::Move { at: [3432.0 + x, 50.0], delta: [1.0, 0.0] });
+        x = if x > 2000.0 { 100.0 } else { x + 3.0 };
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let shown = viewer.seen.lock().unwrap().pictures.len();
+    displays::wait("pictures still coming", || viewer.seen.lock().unwrap().pictures.len() > shown + 10);
+    assert!(!log_of(&a).contains("picture stream dropped"), "{}", log_of(&a));
 }
