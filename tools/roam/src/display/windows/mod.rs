@@ -34,6 +34,8 @@ const HZ: u32 = 60;
 const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// A still screen still sends a picture this often, so the other side knows it's alive.
 const REFRESH_EVERY: Duration = Duration::from_secs(1);
+/// How long to keep looking often for a picture the encoder holds.
+const HELD_LOOK: Duration = Duration::from_millis(100);
 
 pub struct Windows;
 
@@ -152,6 +154,7 @@ fn capture(
     let size = [width, height];
     let mut converter = nv12::Converter::new(size, size);
     let mut encoder = encoder::Encoder::new(size, HZ)?;
+    feed.note(format!("extended display encoder: {}", encoder.about));
     let _ = opened.send(Ok(size));
     let every = Duration::from_secs(1) / HZ;
     let mut pace = Pace::new(every, Instant::now());
@@ -162,7 +165,10 @@ fn capture(
     let mut nudged = false;
     while !stop.load(Ordering::Acquire) && !feed.stopped() {
         let now = Instant::now();
-        let waiting = encoder.held_since().is_some() || duplicator.changed;
+        // Look again soon while a change waits for the network, or the encoder has had a
+        // picture only a short while; one it keeps for good mustn't keep the loop spinning.
+        let recent = encoder.held_since().is_some_and(|since| now.saturating_duration_since(since) < HELD_LOOK);
+        let waiting = recent || duplicator.changed;
         duplicator.wait(pace.wait_until(now, waiting))?;
         for data in encoder.drain()? {
             feed.push(Picture { key: h264::is_key(&data), data });
@@ -174,7 +180,8 @@ fn capture(
         let key = feed.key_wanted();
         // An encoder that keeps the last picture until another comes would leave the end of a
         // movement on its way until the next change: give it the screen once more.
-        let held = !nudged && encoder.held_since().is_some_and(|since| now - since >= every * 2);
+        let held =
+            !nudged && encoder.held_since().is_some_and(|since| now.saturating_duration_since(since) >= every * 2);
         if !(duplicator.changed || key || held || sent.elapsed() >= REFRESH_EVERY) {
             continue;
         }

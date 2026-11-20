@@ -112,6 +112,7 @@ struct FeedInner {
     stopped: AtomicBool,
     key_wanted: AtomicBool,
     tally: Mutex<Tally>,
+    notes: Mutex<Vec<String>>,
 }
 
 /// How the pictures went since the last look, for the log.
@@ -256,6 +257,17 @@ impl Feed {
             t.send += took;
             t.longest_send = t.longest_send.max(took);
         });
+    }
+
+    /// A line for the log, from the thread making the pictures.
+    pub fn note(&self, text: String) {
+        if let Ok(mut notes) = self.0.notes.lock() {
+            notes.push(text);
+        }
+    }
+
+    pub fn take_notes(&self) -> Vec<String> {
+        self.0.notes.lock().map(|mut notes| std::mem::take(&mut *notes)).unwrap_or_default()
     }
 
     /// What happened since the last call.
@@ -464,6 +476,9 @@ mod tests {
         feed.count_sent(Duration::from_millis(4));
         let tally = feed.take_tally();
         assert_eq!((tally.pictures, tally.skipped, tally.sent), (1, 1, 2));
+        feed.note("encoder: software".into());
+        assert_eq!(feed.take_notes(), ["encoder: software"]);
+        assert!(feed.take_notes().is_empty());
         assert_eq!(tally.longest_send, Duration::from_millis(9));
     }
 }

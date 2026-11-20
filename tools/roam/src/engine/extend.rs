@@ -651,6 +651,9 @@ fn run_host(job: &HostJob) -> Result<String, String> {
         }
         if checked.elapsed() >= CHECK_EVERY {
             checked = Instant::now();
+            for text in job.feed.take_notes() {
+                let _ = job.events.send(Event::Extend(ExtendEvent::Note { text }));
+            }
             while let Ok(at) = job.placed.try_recv() {
                 hosted.place(at);
             }
@@ -702,7 +705,14 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
     let mut reader = BufReader::with_capacity(256 * 1024, stream);
     let mut showing: Option<Box<dyn display::Showing>> = None;
     let mut asked_key = Instant::now() - KEY_EVERY;
+    let mut arrivals = Arrivals::default();
+    let mut tallied = Instant::now();
     let why = loop {
+        if tallied.elapsed() >= TALLY_EVERY {
+            let text = std::mem::take(&mut arrivals).line(tallied.elapsed().as_secs_f64());
+            tallied = Instant::now();
+            let _ = events.send(Event::Extend(ExtendEvent::Note { text }));
+        }
         match opener.down(&mut reader) {
             Ok(Down::Size(size)) => {
                 showing = None;
@@ -717,7 +727,10 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
             }
             Ok(Down::Picture(picture)) => {
                 let Some(shown) = showing.as_mut() else { continue };
-                if shown.picture(&picture).is_err() && asked_key.elapsed() >= KEY_EVERY {
+                let came = Instant::now();
+                let result = shown.picture(&picture);
+                arrivals.count(came, picture.data.len(), came.elapsed(), result.is_err());
+                if result.is_err() && asked_key.elapsed() >= KEY_EVERY {
                     asked_key = Instant::now();
                     let _ = up.send(Up::KeyPlease);
                 }
@@ -732,9 +745,59 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
     Ok(())
 }
 
+/// How a lent screen's pictures came in since the last look, for the log.
+#[derive(Default)]
+struct Arrivals {
+    pictures: u32,
+    bytes: u64,
+    failed: u32,
+    /// The longest time between two pictures, and the longest one took to hand to the screen.
+    longest_gap: Duration,
+    longest_show: Duration,
+    last: Option<Instant>,
+}
+
+impl Arrivals {
+    fn count(&mut self, at: Instant, bytes: usize, show: Duration, failed: bool) {
+        self.pictures += 1;
+        self.bytes += bytes as u64;
+        self.failed += u32::from(failed);
+        if let Some(last) = self.last {
+            self.longest_gap = self.longest_gap.max(at.saturating_duration_since(last));
+        }
+        self.last = Some(at);
+        self.longest_show = self.longest_show.max(show);
+    }
+
+    fn line(&self, seconds: f64) -> String {
+        let seconds = seconds.max(0.001);
+        format!(
+            "lent screen, last {seconds:.0} s: {:.0} pictures a second, {:.1} Mbit/s, longest gap {:.0} ms, longest to show {:.1} ms, {} not shown",
+            f64::from(self.pictures) / seconds,
+            self.bytes as f64 * 8.0 / seconds / 1_000_000.0,
+            self.longest_gap.as_secs_f64() * 1000.0,
+            self.longest_show.as_secs_f64() * 1000.0,
+            self.failed,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lent_screen_counts_what_came_in() {
+        let start = Instant::now();
+        let mut arrivals = Arrivals::default();
+        arrivals.count(start, 250_000, Duration::from_micros(500), false);
+        arrivals.count(start + Duration::from_millis(17), 250_000, Duration::from_millis(2), false);
+        arrivals.count(start + Duration::from_millis(60), 250_000, Duration::from_micros(300), true);
+        assert_eq!(
+            arrivals.line(1.0),
+            "lent screen, last 1 s: 3 pictures a second, 6.0 Mbit/s, longest gap 43 ms, longest to show 2.0 ms, 1 not shown"
+        );
+    }
 
     #[test]
     fn screens_left_on_the_lending_computer_never_sit_on_the_hosts() {

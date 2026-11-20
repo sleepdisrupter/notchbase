@@ -13,10 +13,10 @@ use windows::Win32::Media::MediaFoundation::{
     MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
     MF_TRANSFORM_ASYNC_UNLOCK, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::{VARIANT, VT_UI4};
@@ -46,6 +46,8 @@ pub struct Encoder {
     /// The parameter sets, put before key pictures that come without them.
     header: Vec<u8>,
     time: i64,
+    /// Which encoder this is and how it's set, for the log.
+    pub about: String,
 }
 
 impl Encoder {
@@ -54,9 +56,10 @@ impl Encoder {
         let bitrate = bitrate(size, fps);
         let mut why = String::new();
         for activate in hardware_encoders() {
+            let name = friendly_name(&activate);
             // SAFETY: plain COM activation; a failure tries the next one.
             let Ok(transform) = (unsafe { activate.ActivateObject::<IMFTransform>() }) else { continue };
-            match Self::set_up(transform, size, fps, bitrate) {
+            match Self::set_up(transform, size, fps, bitrate, &name) {
                 Ok(encoder) => return Ok(encoder),
                 Err(err) => {
                     why = err;
@@ -67,10 +70,10 @@ impl Encoder {
         // SAFETY: Windows' own software encoder.
         let transform: IMFTransform = unsafe { CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER) }
             .map_err(|err| format!("No H.264 encoder: {} {why}", err.message()))?;
-        Self::set_up(transform, size, fps, bitrate)
+        Self::set_up(transform, size, fps, bitrate, "Windows' software H.264 encoder")
     }
 
-    fn set_up(transform: IMFTransform, size: [u32; 2], fps: u32, bitrate: u32) -> Result<Self, String> {
+    fn set_up(transform: IMFTransform, size: [u32; 2], fps: u32, bitrate: u32, name: &str) -> Result<Self, String> {
         let err = |err: windows::core::Error| err.message();
         unsafe {
             let attributes = transform.GetAttributes().ok();
@@ -126,6 +129,13 @@ impl Encoder {
                 fps,
                 header,
                 time: 0,
+                about: format!(
+                    "{name} ({}), {}x{} at {fps} a second, {:.1} Mbit/s",
+                    if asynchronous { "graphics card, asynchronous" } else { "synchronous" },
+                    size[0],
+                    size[1],
+                    f64::from(bitrate) / 1_000_000.0
+                ),
             })
         }
     }
@@ -164,7 +174,6 @@ impl Encoder {
         } else {
             // SAFETY: a synchronous encoder takes input whenever its output has been drained.
             unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|err| err.message())?;
-            self.given();
             while let Some(picture) = self.take_output()? {
                 out.push(picture);
             }
@@ -177,17 +186,14 @@ impl Encoder {
     /// than when the next change comes along.
     pub fn drain(&mut self) -> Result<Vec<Vec<u8>>, String> {
         let mut out = Vec::new();
+        // A synchronous encoder hands back all it can as each picture goes in.
         if self.events.is_some() {
             while self.poll(&mut out)? {}
-        } else if self.pending > 0 {
-            while let Some(picture) = self.take_output()? {
-                out.push(picture);
-            }
         }
         Ok(out.into_iter().map(|p| self.with_header(p)).collect())
     }
 
-    /// Since when the encoder has held a picture it was given, if it has one.
+    /// Since when an asynchronous encoder has held a picture it was given, if it has one.
     pub fn held_since(&self) -> Option<Instant> {
         self.held_since
     }
@@ -272,8 +278,10 @@ impl Encoder {
         }
         let Some(sample) = sample else { return Ok(None) };
         let picture = media::bytes(&sample)?;
-        self.pending = self.pending.saturating_sub(1);
-        self.held_since = if self.pending == 0 { None } else { Some(Instant::now()) };
+        if self.events.is_some() {
+            self.pending = self.pending.saturating_sub(1);
+            self.held_since = if self.pending == 0 { None } else { Some(Instant::now()) };
+        }
         Ok(Some(picture))
     }
 
@@ -326,6 +334,22 @@ fn sequence_header(transform: &IMFTransform) -> Vec<u8> {
             return Vec::new();
         }
         blob
+    }
+}
+
+/// An encoder's name, as its maker gives it.
+fn friendly_name(activate: &IMFActivate) -> String {
+    let mut name = windows::core::PWSTR::null();
+    let mut length = 0;
+    // SAFETY: Media Foundation allocates the string, freed below once copied.
+    unsafe {
+        if activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut name, &mut length).is_err() || name.is_null()
+        {
+            return "A graphics card's H.264 encoder".into();
+        }
+        let text = name.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(name.0.cast()));
+        text
     }
 }
 
