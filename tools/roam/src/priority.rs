@@ -101,8 +101,8 @@ mod platform {
 
     use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
     use windows_sys::Win32::NetworkManagement::QoS::{
-        QOS_TRAFFIC_TYPE, QOS_VERSION, QOSAddSocketToFlow, QOSCreateHandle, QOSTrafficTypeAudioVideo,
-        QOSTrafficTypeVoice,
+        QOS_NON_ADAPTIVE_FLOW, QOS_TRAFFIC_TYPE, QOS_VERSION, QOSAddSocketToFlow, QOSCreateHandle,
+        QOSTrafficTypeAudioVideo, QOSTrafficTypeVoice,
     };
     use windows_sys::Win32::Networking::WinSock::{SOCKADDR, SOCKET};
 
@@ -137,17 +137,21 @@ mod platform {
             };
             let address = to.map(socket2::SockAddr::from);
             let destination = address.as_ref().map_or(std::ptr::null(), |a| a.as_ptr().cast::<SOCKADDR>());
-            let mut flow = 0u32;
             // SAFETY: a live socket, a destination that outlives the call (or none for a
-            // connected socket), and a flow id starting at 0 as the call requires. Without
-            // QOS_NON_ADAPTIVE_FLOW, so that Windows also tags the packets for Wi-Fi's queues
-            // on the local network.
-            let ok = unsafe { QOSAddSocketToFlow(handle as HANDLE, raw as SOCKET, destination, kind, 0, &mut flow) };
-            if ok == 0 {
-                // SAFETY: plain query.
-                return Err(format!("error {}", unsafe { GetLastError() }));
+            // connected socket), and a flow id starting at 0 as the call requires. First as an
+            // adaptive flow, which also learns the path; a network that can't be probed refuses
+            // that (error 50, not supported), and a plain flow, as video calls use, still tags the
+            // packets for Wi-Fi's queues.
+            for flags in [0, QOS_NON_ADAPTIVE_FLOW] {
+                let mut flow = 0u32;
+                if unsafe { QOSAddSocketToFlow(handle as HANDLE, raw as SOCKET, destination, kind, flags, &mut flow) }
+                    != 0
+                {
+                    return Ok(());
+                }
             }
-            Ok(())
+            // SAFETY: plain query.
+            Err(format!("error {}", unsafe { GetLastError() }))
         });
         first(traffic, result)
     }

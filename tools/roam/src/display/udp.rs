@@ -56,10 +56,17 @@ fn nonce(stream: u32, count: u64) -> Nonce {
     nonce.into()
 }
 
-/// The repair shards a block of `data` shards gets: a fifth, at least one.
-fn repairs(data: usize) -> usize {
-    data.div_ceil(5).max(1)
+/// The repair shards a block of `data` shards gets: a fifth, at least one, and for a key picture
+/// two fifths. A lost key picture costs another one, bigger than any other, into a network that
+/// is already losing packets.
+fn repairs(data: usize, key: bool) -> usize {
+    if key { (data * 2).div_ceil(5).max(1) } else { data.div_ceil(5).max(1) }
 }
+
+/// A picture's packets go out this many at a time, a moment apart: a key picture sent all at
+/// once can overflow the Wi-Fi's queue and lose its own packets.
+const BURST: usize = 48;
+const BURST_GAP: Duration = Duration::from_micros(500);
 
 /// Reed-Solomon codecs by shape, which are costly to make.
 #[derive(Default)]
@@ -109,7 +116,7 @@ impl Sender {
             let bytes = &data[(block * BLOCK_BYTES).min(data.len())..((block + 1) * BLOCK_BYTES).min(data.len())];
             let shards = bytes.len().div_ceil(SHARD).max(1);
             let width = bytes.len().div_ceil(shards).max(1);
-            let parity = repairs(shards);
+            let parity = repairs(shards, picture.key);
             let mut all: Vec<Vec<u8>> = (0..shards + parity)
                 .map(|i| {
                     let mut shard = vec![0u8; width];
@@ -156,8 +163,11 @@ impl Sender {
     /// Sends `picture`. A full send buffer drops the rest of it: the network is behind, and
     /// the lending computer asks for a fresh start.
     pub fn send(&mut self, picture: &Picture) -> io::Result<()> {
-        for packet in self.packets(picture) {
-            match self.socket.send_to(&packet, self.to) {
+        for (index, packet) in self.packets(picture).iter().enumerate() {
+            if index > 0 && index % BURST == 0 {
+                std::thread::sleep(BURST_GAP);
+            }
+            match self.socket.send_to(packet, self.to) {
                 Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => return Err(err),

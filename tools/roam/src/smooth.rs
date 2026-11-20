@@ -9,16 +9,19 @@
 //! frames instead of jumping. A packet with no movement in it means the mouse stopped, and the
 //! cursor stops with it.
 
-/// Nothing heard for this long while moving: Wi-Fi went quiet, keep the cursor going.
-const LATE: u64 = 9_000;
+/// Nothing heard for this long while moving: Wi-Fi went quiet, keep the cursor going. Packets
+/// come every few milliseconds while the mouse moves, so shorter gaps are only jitter, and
+/// guessing through them made the cursor feel floaty.
+const LATE: u64 = 14_000;
 /// Positions arriving closer together than this came in one burst.
 const BURST: u64 = 1_000;
 /// Never guess further ahead than this; past it the cursor waits.
-const FURTHEST: u64 = 90_000;
-/// How quickly a guess eases off: the cursor never runs more than this long at full speed.
-const EASE: f64 = 25_000.0;
-/// How quickly a wrong guess is blended away.
-const BLEND: f64 = 30_000.0;
+const FURTHEST: u64 = 40_000;
+/// How quickly a guess eases off: the cursor never runs more than this long at full speed, so
+/// a hand that turns back never sees the cursor sail on the old way.
+const EASE: f64 = 8_000.0;
+/// How quickly a wrong guess is blended away: within a frame or two, not a drift.
+const BLEND: f64 = 8_000.0;
 /// A position more than this much older than the last one means the sender's clock started
 /// over (it restarted Roam), not a late packet.
 const RESTART: u64 = 250_000;
@@ -273,8 +276,8 @@ mod tests {
             }
         }
         let furthest = *shown.last().unwrap();
-        assert!(furthest > 115.0, "kept going through the gap: {furthest}");
-        assert!(furthest < 158.0, "eased off rather than running on: {furthest}");
+        assert!(furthest > 102.0, "kept going through the gap: {furthest}");
+        assert!(furthest < 110.0, "eased off rather than running on: {furthest}");
         // Then everything that was held up arrives together.
         for i in 50..80u32 {
             if let Some([x, _]) = smoother.push(i * 2_000, now, [i as f32 * 2.0, 0.0]) {

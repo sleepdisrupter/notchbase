@@ -51,20 +51,27 @@ const RETRY_EVERY: Duration = Duration::from_millis(700);
 /// A stream that lasted this long reached the other computer, which would have turned it away
 /// within two seconds: trying again starts the wait over.
 const LASTED: Duration = Duration::from_millis(2_500);
-/// A lent screen that hears nothing for this long takes the stream as gone (a still screen still
-/// sends a picture a second).
-const QUIET: Duration = Duration::from_secs(5);
+/// A lent screen that hears nothing for this long takes the stream as gone and waits for the
+/// host's next one, rather than sitting on a frozen picture (a still screen still sends a
+/// picture a second, and a newer host says it's there twice a second).
+const QUIET: Duration = Duration::from_millis(2_500);
+/// How long the host waits for a connection, or for the network to take what it sends, before
+/// it takes the stream as dropped and starts a new one.
+const CONNECT_FOR: Duration = Duration::from_secs(2);
+const WRITE_FOR: Duration = Duration::from_secs(2);
 /// Set on the host, the pictures always go over the TCP stream, never UDP.
 pub const TCP_PICTURES: &str = "NOTCHBASE_ROAM_TCP_PICTURES";
-/// While the pictures go over UDP, the stream says it's still up this often.
-const ALIVE_EVERY: Duration = Duration::from_secs(1);
+/// With nothing else to send, the stream says it's still up this often (to a lending computer
+/// that knows the word).
+const ALIVE_EVERY: Duration = Duration::from_millis(500);
 /// How often the host tries UDP before the other computer has heard it, and for how long.
 const PROBE_EVERY: Duration = Duration::from_millis(200);
 const PROBE_FOR: Duration = Duration::from_secs(3);
 /// Pictures over UDP that stop coming this long, though the stream is up, go back to TCP.
 const UDP_SILENT: Duration = Duration::from_secs(3);
-/// A key picture is asked for at most this often after pictures are lost over UDP.
-const LOST_KEY_EVERY: Duration = Duration::from_millis(150);
+/// A key picture is asked for at most this often after pictures are lost over UDP: asking again
+/// sooner sends one big picture after another into a network already losing them.
+const LOST_KEY_EVERY: Duration = Duration::from_millis(400);
 /// The least share of its bitrate the encoder steps down to, and the clean seconds before it
 /// steps back up.
 const LEAST_RATE: u32 = 40;
@@ -928,6 +935,8 @@ fn run_host(job: &HostJob) -> Result<String, String> {
 /// What the lending computer said about the pictures over UDP, from the host's input thread.
 #[derive(Default)]
 struct UdpWord {
+    /// When the other computer last said anything, once the pictures go over UDP.
+    heard_at: Option<Instant>,
     port: Option<u16>,
     heard: bool,
     tcp_please: bool,
@@ -985,6 +994,14 @@ impl UdpHost {
             self.rate = 100;
             job.feed.set_rate(100);
         }
+    }
+
+    /// Whether the other computer, taking pictures over UDP, stopped saying anything. It says
+    /// how they went every second, so its silence means the window is gone or frozen, and only
+    /// a new stream brings it back.
+    fn deaf(&self) -> bool {
+        matches!(self.out, UdpOut::On(_))
+            && self.word.lock().is_ok_and(|word| word.heard_at.is_some_and(|at| at.elapsed() >= UDP_SILENT))
     }
 
     /// Moves things on from what the other computer said.
@@ -1067,7 +1084,9 @@ impl UdpHost {
 fn udp_socket(to: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let domain = if to.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
+    // Room for a key picture or two and no more: after Wi-Fi stalls, seconds of old pictures
+    // queued here would go out ahead of the new ones.
+    let _ = socket.set_send_buffer_size(512 * 1024);
     let any: SocketAddr = if to.is_ipv4() {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
@@ -1081,12 +1100,12 @@ fn udp_socket(to: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted>, upkeep: &mut Upkeep) -> Streamed {
     let started = Instant::now();
     let dropped = |why: String| Streamed::Dropped { why, lasted: started.elapsed() >= LASTED };
-    let stream = match TcpStream::connect_timeout(&route.addr, Duration::from_secs(4)) {
+    let stream = match TcpStream::connect_timeout(&route.addr, CONNECT_FOR) {
         Ok(stream) => stream,
         Err(err) => return dropped(format!("Couldn't reach {}: {err}", job.want.name)),
     };
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(WRITE_FOR));
     // Wi-Fi's video queue: ahead of downloads, behind the mouse and keyboard.
     if let Some(text) = priority::mark(socket2::SockRef::from(&stream), None, Traffic::Video) {
         job.note(text);
@@ -1127,7 +1146,13 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
         std::thread::Builder::new().name("roam-host-input".into()).spawn(move || {
             let mut reader = BufReader::new(reader);
             loop {
-                match opener.up(&mut reader) {
+                let message = opener.up(&mut reader);
+                if message.is_ok()
+                    && let Ok(mut word) = word.lock()
+                {
+                    word.heard_at = Some(Instant::now());
+                }
+                match message {
                     Ok(Up::Input(remote)) => {
                         let _ = events.send(Event::Extend(ExtendEvent::Remote { peer, serial, remote }));
                     }
@@ -1183,6 +1208,9 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
             break dropped("the other computer closed it".into());
         }
         udp.step(job, &route, hello.stream);
+        if udp.deaf() {
+            break dropped("the other computer stopped answering".into());
+        }
         let picture = job.feed.next(Duration::from_millis(40));
         // The pointer's news goes first: it's small, and the reason it goes apart is to be quick.
         let news = job.feed.take_pointer();
@@ -1223,7 +1251,7 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
             if sent.is_ok() {
                 job.feed.count_sent(started.elapsed());
             }
-        } else if sent.is_ok() && udp.sender().is_some() && wrote.elapsed() >= ALIVE_EVERY {
+        } else if sent.is_ok() && job.udp && wrote.elapsed() >= ALIVE_EVERY {
             sent = sealer.down(&mut out, &Down::Alive).and_then(|()| out.flush());
             wrote = Instant::now();
         }
@@ -1377,6 +1405,9 @@ pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> s
         }
     };
     udp_over.store(true, Ordering::Release);
+    // Closed for the host to hear: a copy of the connection is kept for cutting it, and while
+    // that lives the host would hear nothing and carry on sending to a frozen window.
+    let _ = reader.get_ref().shutdown(Shutdown::Both);
     if let Some(why) = ended {
         let _ = events.send(Event::Extend(ExtendEvent::LendEnded { serial: grant.serial, why }));
     }
