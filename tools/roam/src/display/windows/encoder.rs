@@ -21,8 +21,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFDXGIDeviceManager, MF_SA_D3D11_AWARE, MFCreateAttributes, MFCreateDXGIDeviceManager,
-    MFCreateDXGISurfaceBuffer, MFT_ENUM_ADAPTER_LUID, MFT_MESSAGE_SET_D3D_MANAGER, MFTEnum2,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonRateControlMode, IMF2DBuffer, IMFDXGIDeviceManager,
+    MF_SA_D3D11_AWARE, MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFT_ENUM_ADAPTER_LUID,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFTEnum2, eAVEncCommonRateControlMode_CBR,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::{VARIANT, VT_UI4};
@@ -31,6 +32,8 @@ use windows::core::Interface;
 use super::media::{self, pack};
 use crate::display::h264;
 
+/// The longest between key pictures nobody asked for, for encoders that insist on some.
+const KEY_EVERY_SECONDS: u32 = 10 * 60;
 /// How long to wait for an asynchronous encoder to hand a picture straight back. Most do within
 /// this; a slower one's picture is collected on the capture loop's next pass instead of holding
 /// up the next change.
@@ -139,8 +142,14 @@ impl Encoder {
                 let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &uint(1));
                 let _ = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &uint(0));
                 let _ = codec.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &uint(bitrate));
-                // A key picture now and then, so a lost one is never lost for long.
-                let _ = codec.SetValue(&CODECAPI_AVEncMPVGOPSize, &uint(fps * 4));
+                // As game streaming sets it: a constant rate with room for about one picture, so
+                // no picture is ever much bigger than its share and takes longer to go out.
+                let _ = codec
+                    .SetValue(&CODECAPI_AVEncCommonRateControlMode, &uint(eAVEncCommonRateControlMode_CBR.0 as u32));
+                let _ = codec.SetValue(&CODECAPI_AVEncCommonBufferSize, &uint(one_picture(bitrate, fps)));
+                // Key pictures only when the other side asks: one every few seconds is a burst
+                // the network has to catch up on, and the connection doesn't lose pictures.
+                let _ = codec.SetValue(&CODECAPI_AVEncMPVGOPSize, &uint(fps * KEY_EVERY_SECONDS));
             }
             let output: IMFMediaType = MFCreateMediaType().map_err(err)?;
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(err)?;
@@ -180,7 +189,7 @@ impl Encoder {
                 header,
                 time: 0,
                 about: format!(
-                    "{name} ({}{}), {}x{} at {fps} a second, {:.1} Mbit/s",
+                    "{name} ({}{}), {}x{} at {fps} a second, {:.1} Mbit/s constant, key pictures when asked",
                     if asynchronous { "graphics card, asynchronous" } else { "synchronous" },
                     if manager.is_some() { ", pictures stay on the card" } else { "" },
                     size[0],
@@ -380,6 +389,11 @@ impl Drop for Encoder {
 fn bitrate([width, height]: [u32; 2], fps: u32) -> u32 {
     let wanted = f64::from(width) * f64::from(height) * f64::from(fps) * 0.12;
     wanted.clamp(8_000_000.0, 40_000_000.0) as u32
+}
+
+/// The encoder's buffer, in bytes: one picture's share of the rate.
+fn one_picture(bitrate: u32, fps: u32) -> u32 {
+    (bitrate / 8 / fps.max(1)).max(1)
 }
 
 fn uint(value: u32) -> VARIANT {
