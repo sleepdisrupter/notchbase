@@ -906,10 +906,11 @@ fn crosses_and_stays(a: &Machine, at: [f64; 2], push: [f64; 2]) -> bool {
 
 #[test]
 fn the_lending_computers_other_screen_stays_beside_the_pc_while_one_is_lent() {
-    // The PC on the left: right from anywhere along its edge that faces the built-in screen.
+    // The PC on the left: right from anywhere along its edge that faces the built-in screen
+    // (clear of the corner, which a Mac running this keeps for hot corners).
     let (a, _b, virtual_display) = lend_the_screen_above(true);
     assert_eq!(virtual_display, Rect::new(1830.0, -1080.0, 1920.0, 1080.0), "where Windows puts it");
-    for y in [100.0, 600.0, 1070.0] {
+    for y in [100.0, 600.0, 1040.0] {
         assert!(crosses_and_stays(&a, [1919.0, y], [6.0, 0.0]), "right from the PC at {y}\n{}", log_of(&a));
     }
     // And down from the virtual display, as from the monitor above the built-in screen.
@@ -920,7 +921,7 @@ fn the_lending_computers_other_screen_stays_beside_the_pc_while_one_is_lent() {
     // screen is still across from the PC's left edge.
     let (a, _b, virtual_display) = lend_the_screen_above(false);
     assert_eq!(virtual_display, Rect::new(-1919.0, -1080.0, 1920.0, 1080.0), "where Windows puts it");
-    for y in [100.0, 600.0, 1070.0] {
+    for y in [100.0, 600.0, 1040.0] {
         assert!(crosses_and_stays(&a, [0.0, y], [-6.0, 0.0]), "left from the PC at {y}\n{}", log_of(&a));
     }
     let below = virtual_display.bottom() - 1.0;
