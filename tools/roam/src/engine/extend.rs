@@ -200,18 +200,21 @@ impl Core {
     }
 
     /// This computer on the desk, with the virtual displays it hosts among its own, placed so its
-    /// own displays stay where they are.
+    /// own displays stay where they are: `at` is where they are, and a virtual display above or
+    /// to the left of them takes the whole computer's top left further up or left.
     pub(super) fn me_on_desk(&self, at: [f64; 2]) -> Computer {
         let (all, ppu) = self.screens.clone();
         let (real, _) = self.real_screens();
         let shift = shift(&real, &all, ppu);
-        Computer::new("me", all, ppu, [at[0] + shift[0], at[1] + shift[1]])
+        Computer::new("me", all, ppu, [at[0] - shift[0], at[1] - shift[1]])
     }
 
-    /// A computer on the desk, without the screen it lends here. Its other screens keep their
-    /// place beside that screen, now the virtual display on `me`: the virtual display is as many
-    /// points as the system makes it, which needn't be the size the lent screen has on the desk.
-    /// `None` when it lends every screen it has.
+    /// A computer on the desk, without the screen it lends here. Its other screens stay where
+    /// they are on the desk, so the cursor reaches them the way it always did. Only where they'd
+    /// sit on this computer's screens (the virtual display among them), or face none of them,
+    /// do they go beside the virtual display instead: that is as many points as the system makes
+    /// it, and where the system puts it, which needn't be the size or place the lent screen has
+    /// on the desk. `None` when it lends every screen it has.
     pub(super) fn peer_on_desk(
         &self,
         id: Id,
@@ -231,19 +234,24 @@ impl Core {
         if left.is_empty() {
             return None;
         }
-        let rest =
-            layout::bounds(&desk.iter().enumerate().filter(|(i, _)| *i != lent).map(|(_, d)| *d).collect::<Vec<_>>());
+        let rest_on_desk: Vec<Rect> = desk.iter().enumerate().filter(|(i, _)| *i != lent).map(|(_, d)| *d).collect();
+        let rest = layout::bounds(&rest_on_desk);
         let [vx, vy] = me.to_desk([rect.x, rect.y]);
         let virtual_on_desk = Rect::new(vx, vy, rect.w / me.ppu, rect.h / me.ppu);
+        let mine = me.desk_displays();
+        let shift = shift(&left, &displays, ppu);
+        let stays = [at[0] + shift[0], at[1] + shift[1]];
+        if rest_on_desk.iter().all(|d| !covers_any(d, &mine)) && rest_on_desk.iter().any(|d| faces_any(d, &mine)) {
+            return Some(Computer::new(name, left, ppu, stays));
+        }
         let [dx, dy] = follow(lent_on_desk, rest, virtual_on_desk);
         let moved = Rect::new(rest.x + dx, rest.y + dy, rest.w, rest.h);
         // The system puts the virtual display against this computer's others, which can land
         // the rest where this computer's screens are: then they go beside it instead.
         let beside = rest.right() <= lent_on_desk.x + 0.5 || rest.x >= lent_on_desk.right() - 0.5;
-        let clear = clear_of(moved, virtual_on_desk, &me.desk_displays(), beside);
-        let shift = shift(&left, &displays, ppu);
+        let clear = clear_of(moved, virtual_on_desk, &mine, beside);
         let [cx, cy] = [clear[0] - moved.x, clear[1] - moved.y];
-        Some(Computer::new(name, left, ppu, [at[0] + shift[0] + dx + cx, at[1] + shift[1] + dy + cy]))
+        Some(Computer::new(name, left, ppu, [stays[0] + dx + cx, stays[1] + dy + cy]))
     }
 
     /// Where the virtual display for `display` of `peer` goes: its top left where that screen
@@ -695,7 +703,8 @@ impl Core {
             // Off the lent screen: an older lending computer also passes on moves its window
             // hears elsewhere, such as the ones this computer plays on its other screens. Taken
             // as the person's, they'd snap the cursor back to the virtual display's edge.
-            Remote::Move([x, y]) if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) => {}
+            // The far edges are the next screen's first row or column, not the lent screen's.
+            Remote::Move([x, y]) if !(0.0..1.0).contains(&x) || !(0.0..1.0).contains(&y) => {}
             Remote::Move([x, y]) => {
                 let at = [rect.x + f64::from(x) * rect.w, rect.y + f64::from(y) * rect.h];
                 if matches!(self.cursor, Cursor::Away { .. }) {
@@ -788,6 +797,23 @@ fn clear_of(rest: Rect, virtual_on_desk: Rect, mine: &[Rect], beside: bool) -> [
         spots.into_iter().filter(|[sx, sy]| free(*sx, *sy)).min_by(|a, b| far(*a).total_cmp(&far(*b)))
     };
     nearest(first).or_else(|| nearest(then)).unwrap_or([rest.x, rest.y])
+}
+
+/// Whether `screen` sits on any of `mine` (all on the desk), past the half point of slack that
+/// hand-placed screens have.
+fn covers_any(screen: &Rect, mine: &[Rect]) -> bool {
+    let inside = Rect::new(screen.x + 0.5, screen.y + 0.5, screen.w - 1.0, screen.h - 1.0);
+    mine.iter().any(|d| d.overlaps(&inside))
+}
+
+/// Whether `screen` is across from any of `mine` (all on the desk), side by side or one above
+/// the other, so the cursor can cross between them.
+fn faces_any(screen: &Rect, mine: &[Rect]) -> bool {
+    mine.iter().any(|d| {
+        let rows = screen.y < d.bottom() - 0.5 && d.y < screen.bottom() - 0.5;
+        let columns = screen.x < d.right() - 0.5 && d.x < screen.right() - 0.5;
+        rows || columns
+    })
 }
 
 /// How far, in points, the top left of `part`'s bounds is from the top left of `all`'s.

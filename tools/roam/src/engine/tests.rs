@@ -399,11 +399,13 @@ mod displays {
     pub struct Pretend {
         pub fake: Fake,
         pub seen: Arc<Mutex<Seen>>,
+        /// Puts a virtual display where Windows would: touching another screen.
+        pub snap: bool,
     }
 
     impl Pretend {
         pub fn new(fake: Fake) -> Self {
-            Self { fake, seen: Arc::default() }
+            Self { fake, seen: Arc::default(), snap: false }
         }
     }
 
@@ -478,6 +480,7 @@ mod displays {
                 f64::from(want.panel.pixels[0]),
                 f64::from(want.panel.pixels[1]),
             );
+            let rect = if self.snap { snap_like_windows(rect, &self.fake.state().screens) } else { rect };
             self.fake.state().screens.push(rect);
             if want.pointer_apart {
                 let size = [rect.w as u32, rect.h as u32];
@@ -505,6 +508,10 @@ mod displays {
         }
 
         fn panel(&self, rect: Rect) -> Option<Panel> {
+            // A Full HD monitor shows its points as pixels; smaller ones here are Retina.
+            if rect.w >= 1920.0 {
+                return Some(Panel { pixels: [rect.w as u32, rect.h as u32], hz: 75, scale: 1.0 });
+            }
             Some(Panel { pixels: [rect.w as u32 * 2, rect.h as u32 * 2], hz: 60, scale: 2.0 })
         }
 
@@ -516,8 +523,44 @@ mod displays {
         }
     }
 
+    /// Windows keeps every screen touching another: one placed apart moves the least way that
+    /// makes it touch one.
+    fn snap_like_windows(rect: Rect, screens: &[Rect]) -> Rect {
+        let touches = |r: &Rect| {
+            screens.iter().any(|s| {
+                let beside = (r.right() == s.x || r.x == s.right()) && r.y < s.bottom() && s.y < r.bottom();
+                let over = (r.bottom() == s.y || r.y == s.bottom()) && r.x < s.right() && s.x < r.right();
+                beside || over
+            })
+        };
+        if touches(&rect) {
+            return rect;
+        }
+        let mut best: Option<(Rect, f64)> = None;
+        for s in screens {
+            let x = rect.x.clamp(s.x - rect.w + 1.0, s.right() - 1.0);
+            let y = rect.y.clamp(s.y - rect.h + 1.0, s.bottom() - 1.0);
+            let spots = [[x, s.y - rect.h], [x, s.bottom()], [s.x - rect.w, y], [s.right(), y]];
+            for [sx, sy] in spots {
+                let spot = Rect::new(sx, sy, rect.w, rect.h);
+                if screens.iter().any(|o| o.overlaps(&spot)) {
+                    continue;
+                }
+                let far = (sx - rect.x).abs() + (sy - rect.y).abs();
+                if best.is_none_or(|(_, nearest)| far < nearest) {
+                    best = Some((spot, far));
+                }
+            }
+        }
+        best.map_or(rect, |(spot, _)| spot)
+    }
+
     pub fn start(data: PathBuf, fake: Fake, port: u16, other: u16) -> (Machine, Pretend) {
-        let pretend = Pretend::new(fake.clone());
+        start_snapping(data, fake, port, other, false)
+    }
+
+    pub fn start_snapping(data: PathBuf, fake: Fake, port: u16, other: u16, snap: bool) -> (Machine, Pretend) {
+        let pretend = Pretend { snap, ..Pretend::new(fake.clone()) };
         let (engine, status) = Engine::start_with(
             data.clone(),
             Box::new(fake.clone()),
@@ -809,4 +852,93 @@ fn dragging_over_an_extended_display_keeps_its_stream() {
     let shown = viewer.seen.lock().unwrap().pictures.len();
     displays::wait("pictures still coming", || viewer.seen.lock().unwrap().pictures.len() > shown + 10);
     assert!(!log_of(&a).contains("picture stream dropped"), "{}", log_of(&a));
+}
+
+/// The Mac lends its Full HD monitor, which sits above its built-in screen, to a PC at 150%
+/// beside the built-in screen. Windows puts the virtual display against the PC's own screen,
+/// not where the monitor is on the desk, and it's smaller there than the monitor is.
+fn lend_the_screen_above(pc_on_the_left: bool) -> (Machine, Machine, Rect) {
+    let a_port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
+    let b_port = a_port + 1;
+    let pc = Fake::new(vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], 1.5);
+    let mac = Fake::new(vec![Rect::new(0.0, 0.0, 1470.0, 956.0), Rect::new(-60.0, -1080.0, 1920.0, 1080.0)], 1.0);
+    let (mut a, _host) = displays::start_snapping(folder(), pc, a_port, b_port, true);
+    let (mut b, _viewer) = displays::start(folder(), mac, b_port, a_port);
+    let (a_id, b_id) = (a.id(), b.id());
+    a.until("seeing the Mac", |s| s.peers.iter().any(|p| p.id == b_id && p.displays.len() == 2 && p.lends));
+    // The PC's screen is 1280 by 720 points; the built-in screen's top lines up with its top.
+    let mac_at = if pc_on_the_left { [1280.0 - 60.0, -1080.0] } else { [-1470.0 - 60.0, -1080.0] };
+    a.engine.send(Control::Desk(vec![
+        Placement { id: a_id.clone(), at: [0.0, 0.0], scroll: 1.0 },
+        Placement { id: b_id.clone(), at: mac_at, scroll: 1.0 },
+    ]));
+    a.until("the code to check", |s| !s.asks.is_empty());
+    b.until("the request to allow", |s| !s.asks.is_empty());
+    a.engine.send(Control::Allow(b_id.clone()));
+    b.engine.send(Control::Allow(a_id.clone()));
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+    a.engine.send(Control::Extend { id: b_id.clone(), display: 1 });
+    a.until("the extended display up", |s| s.extended.iter().any(|e| e.id == b_id && e.running));
+    a.wait_for("listening", |s| s.sink.is_some());
+    let virtual_display = a.fake.state().screens.iter().copied().find(|s| s.x != 0.0 || s.y != 0.0).unwrap();
+    (a, b, virtual_display)
+}
+
+/// Pushes from `at` by `push`, then keeps going: whether the cursor went over and stayed.
+fn crosses_and_stays(a: &Machine, at: [f64; 2], push: [f64; 2]) -> bool {
+    a.fake.input(Input::Move { at, delta: push });
+    std::thread::sleep(Duration::from_millis(60));
+    if !a.fake.state().captured {
+        return false;
+    }
+    settle();
+    for _ in 0..10 {
+        a.fake.input(Input::Move { at: [960.0, 540.0], delta: push });
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let stayed = a.fake.state().captured;
+    a.engine.send(Control::Home);
+    std::thread::sleep(Duration::from_millis(60));
+    stayed
+}
+
+#[test]
+fn the_lending_computers_other_screen_stays_beside_the_pc_while_one_is_lent() {
+    // The PC on the left: right from anywhere along its edge that faces the built-in screen.
+    let (a, _b, virtual_display) = lend_the_screen_above(true);
+    assert_eq!(virtual_display, Rect::new(1830.0, -1080.0, 1920.0, 1080.0), "where Windows puts it");
+    for y in [100.0, 600.0, 1070.0] {
+        assert!(crosses_and_stays(&a, [1919.0, y], [6.0, 0.0]), "right from the PC at {y}\n{}", log_of(&a));
+    }
+    // And down from the virtual display, as from the monitor above the built-in screen.
+    let below = virtual_display.bottom() - 1.0;
+    assert!(crosses_and_stays(&a, [virtual_display.x + 300.0, below], [0.0, 6.0]), "{}", log_of(&a));
+
+    // The PC on the right: Windows puts the virtual display above its screen, and the built-in
+    // screen is still across from the PC's left edge.
+    let (a, _b, virtual_display) = lend_the_screen_above(false);
+    assert_eq!(virtual_display, Rect::new(-1919.0, -1080.0, 1920.0, 1080.0), "where Windows puts it");
+    for y in [100.0, 600.0, 1070.0] {
+        assert!(crosses_and_stays(&a, [0.0, y], [-6.0, 0.0]), "left from the PC at {y}\n{}", log_of(&a));
+    }
+    let below = virtual_display.bottom() - 1.0;
+    assert!(crosses_and_stays(&a, [virtual_display.x + 300.0, below], [0.0, 6.0]), "{}", log_of(&a));
+}
+
+#[test]
+fn a_move_on_the_lent_screens_far_edge_leaves_the_cursor_on_the_screen_below() {
+    use crate::display::Remote;
+
+    let (a, _b, _host, viewer, _b_id) = lend_a_screen();
+    a.wait_for("listening", |s| s.sink.is_some());
+    assert!(a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [5.0, 0.0] }));
+    a.wait_for("the cursor over on the Mac's built-in screen", |s| s.captured);
+    settle();
+    // The first row of a screen right below the lent one is the lent window's bottom edge.
+    displays::remote(&viewer.seen, Remote::Move([0.5, 1.0]));
+    displays::remote(&viewer.seen, Remote::Move([1.0, 0.5]));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(a.fake.state().captured, "still over on the Mac");
 }
