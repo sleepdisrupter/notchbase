@@ -752,7 +752,7 @@ impl Core {
 }
 
 /// Whether two rectangles are the same display, give or take rounding.
-fn same(a: &Rect, b: &Rect) -> bool {
+pub(super) fn same(a: &Rect, b: &Rect) -> bool {
     (a.x - b.x).abs() < 1.5 && (a.y - b.y).abs() < 1.5 && (a.w - b.w).abs() < 1.5 && (a.h - b.h).abs() < 1.5
 }
 

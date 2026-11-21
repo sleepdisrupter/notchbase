@@ -5,6 +5,7 @@
 //! cursor glides from one to the next at the edges. Keys, clicks, scrolling and copied text go
 //! with it.
 
+pub mod align;
 pub mod bulk;
 pub mod crypto;
 pub mod display;
@@ -174,6 +175,8 @@ pub struct Roam<B: Backend = Native> {
     hover: Option<String>,
     /// Earlier arrangements, newest last, for Undo.
     history: Vec<Vec<Spot>>,
+    /// The computer last nudged, so a run of nudges is one step of Undo.
+    nudged: Option<String>,
     backend: PhantomData<B>,
 }
 
@@ -207,6 +210,58 @@ pub enum Msg {
     StopLending,
     /// Put the desk back the way it was before the last change.
     Undo,
+    /// Put line-up guides over every screen on the desk, or take them down.
+    LineUp(bool),
+    /// Move a computer on the desk by this many points.
+    Nudge(String, [f64; 2]),
+    /// Line a computer's screen up with the one it sits against: their starts, middles or ends.
+    Level(String, Level),
+    /// Take down the line-up guides another computer put on this one's screens.
+    HideGuides,
+}
+
+/// Which edges of two screens side by side (or one above the other) to line up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// Tops, or left edges.
+    Start,
+    Middle,
+    /// Bottoms, or right edges.
+    End,
+}
+
+/// The screen of another computer that a computer's screen sits against, the longest such edge.
+#[derive(Clone, Debug, PartialEq)]
+struct Facing {
+    name: String,
+    /// Both screens on the desk: the computer's, and the one it sits against.
+    mine: Rect,
+    theirs: Rect,
+    /// Side by side (so they line up up and down), rather than one above the other.
+    beside: bool,
+}
+
+impl Facing {
+    /// How far the computer's screen is past the other's along their shared edge, at their
+    /// starts: down, or right.
+    fn offset(&self) -> f64 {
+        if self.beside { self.mine.y - self.theirs.y } else { self.mine.x - self.theirs.x }
+    }
+
+    /// The move that lines them up at `level`.
+    fn move_for(&self, level: Level) -> [f64; 2] {
+        let (mine, theirs) = if self.beside {
+            ((self.mine.y, self.mine.h), (self.theirs.y, self.theirs.h))
+        } else {
+            ((self.mine.x, self.mine.w), (self.theirs.x, self.theirs.w))
+        };
+        let by = match level {
+            Level::Start => theirs.0 - mine.0,
+            Level::Middle => (theirs.0 + theirs.1 / 2.0) - (mine.0 + mine.1 / 2.0),
+            Level::End => (theirs.0 + theirs.1) - (mine.0 + mine.1),
+        };
+        if self.beside { [0.0, by] } else { [by, 0.0] }
+    }
 }
 
 fn prefs(settings: &Settings) -> Prefs {
@@ -315,6 +370,7 @@ impl<B: Backend> Tool for Roam<B> {
             menu: None,
             hover: None,
             history: Vec::new(),
+            nudged: None,
             backend: PhantomData,
         };
         (roam, pump)
@@ -443,7 +499,22 @@ impl<B: Backend> Tool for Roam<B> {
                 self.control(Control::StopLending);
                 Command::none()
             }
+            Msg::LineUp(on) => {
+                self.control(Control::LineUp(on));
+                Command::none()
+            }
+            Msg::Nudge(id, by) => self.nudge(&id, by),
+            Msg::HideGuides => {
+                self.control(Control::HideGuides);
+                Command::none()
+            }
+            Msg::Level(id, level) => {
+                let Some(facing) = self.facing(&id) else { return Command::none() };
+                self.nudged = None;
+                self.nudge(&id, facing.move_for(level))
+            }
             Msg::Undo => {
+                self.nudged = None;
                 let Some(before) = self.history.pop() else { return Command::none() };
                 self.desk = before;
                 if self.selected.as_ref().is_some_and(|id| !self.desk.iter().any(|s| &s.id == id)) {
@@ -509,6 +580,15 @@ impl<B: Backend> Tool for Roam<B> {
                 format!("{} is using this computer's {which} as a display", lending.to),
                 Some("Your mouse and keyboard work on it as usual".into()),
                 ("Stop", Msg::StopLending),
+            ));
+        }
+        if let Some(name) = &self.status.guided_by {
+            parts.push(banner(
+                Icon::Viewfinder,
+                Tone::Blue,
+                format!("{name} is lining up the screens"),
+                Some("Its guides are on this computer's screens until it's done there".into()),
+                ("Hide", Msg::HideGuides),
             ));
         }
         if !self.prefs.open && self.status.controller.is_none() {
@@ -789,6 +869,7 @@ impl<B: Backend> Roam<B> {
 
     /// Keeps the desk as it is now, for Undo.
     fn remember(&mut self) {
+        self.nudged = None;
         self.history.push(self.desk.clone());
         if self.history.len() > UNDO_DEPTH {
             self.history.remove(0);
@@ -860,11 +941,68 @@ impl<B: Backend> Roam<B> {
         if drag.before == self.desk {
             return Command::none();
         }
+        self.nudged = None;
         self.history.push(drag.before);
         if self.history.len() > UNDO_DEPTH {
             self.history.remove(0);
         }
         self.desk_changed()
+    }
+
+    /// Moves computer `id` by `by` points: a run of nudges to the same one is one step of Undo.
+    fn nudge(&mut self, id: &str, by: [f64; 2]) -> Command<Msg> {
+        if by.iter().all(|v| v.abs() < 1e-9) || !self.desk.iter().any(|s| s.id == id) {
+            return Command::none();
+        }
+        if self.nudged.as_deref() != Some(id) {
+            self.remember();
+            self.nudged = Some(id.to_owned());
+        }
+        if let Some(spot) = self.desk.iter_mut().find(|s| s.id == id) {
+            spot.at = [spot.at[0] + by[0], spot.at[1] + by[1]];
+        }
+        self.desk_changed()
+    }
+
+    /// The screen of another computer that computer `id` sits against: of the pairs of their
+    /// screens that touch, the one sharing the longest edge.
+    fn facing(&self, id: &str) -> Option<Facing> {
+        const TOUCH: f64 = 1.0;
+        let spot = self.desk.iter().find(|s| s.id == id)?;
+        let mine = spot.computer().desk_displays();
+        let mut best: Option<(f64, Facing)> = None;
+        for other in self.desk.iter().filter(|s| s.id != id) {
+            for theirs in other.computer().desk_displays() {
+                for a in &mine {
+                    let beside = (a.right() - theirs.x).abs() < TOUCH || (theirs.right() - a.x).abs() < TOUCH;
+                    let stacked = (a.bottom() - theirs.y).abs() < TOUCH || (theirs.bottom() - a.y).abs() < TOUCH;
+                    for (touches, beside) in [(beside, true), (stacked, false)] {
+                        if !touches {
+                            continue;
+                        }
+                        let shared = if beside {
+                            a.bottom().min(theirs.bottom()) - a.y.max(theirs.y)
+                        } else {
+                            a.right().min(theirs.right()) - a.x.max(theirs.x)
+                        };
+                        if shared > 0.0 && best.as_ref().is_none_or(|(most, _)| shared > *most) {
+                            let facing = Facing { name: other.name.clone(), mine: *a, theirs, beside };
+                            best = Some((shared, facing));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, facing)| facing)
+    }
+
+    /// The colour a screen has in the line-up guides, while they're up.
+    fn guide_colour(&self, id: &str, display: usize) -> Option<[u8; 3]> {
+        if !self.status.lining_up {
+            return None;
+        }
+        let found = self.status.coloured.iter().find(|c| c.id == id && usize::from(c.display) == display)?;
+        Some(align::colour(found.colour))
     }
 
     /// The computer with a screen at `at` on the desk, the top-most one.
@@ -904,11 +1042,14 @@ impl<B: Backend> Roam<B> {
         for (index, spot) in self.desk.iter().enumerate() {
             canvas = canvas.extend(self.spot_shapes(spot, view, &me, dragging == Some(index)));
         }
+        canvas = canvas.extend(self.crossings(view));
         if let Some(index) = dragging {
             canvas = canvas.extend(guides(&self.desk, index, view));
         }
         let hint = if self.drag.as_ref().is_some_and(|d| d.moved) {
             "Lines show where edges line up"
+        } else if self.status.lining_up {
+            "Every screen shows its colour · the bands are where the cursor crosses"
         } else if matches!(self.status.ability, Ability::No(_)) {
             "Drag the screens to match your desk"
         } else {
@@ -924,7 +1065,70 @@ impl<B: Backend> Roam<B> {
             );
             footer.push(button("Undo").plain().on_press(Msg::Undo).into());
         }
-        column![canvas, row(footer).spacing(6.0).align(Align::Center)].spacing(4.0).into()
+        let line_up: Element<Msg> = if self.status.lining_up {
+            button("Done").icon(Icon::Checkmark).filled().on_press(Msg::LineUp(false)).into()
+        } else {
+            button("Line up screens").icon(Icon::Viewfinder).on_press(Msg::LineUp(true)).into()
+        };
+        footer.push(line_up);
+        let mut parts: Vec<Element<Msg>> = vec![canvas.into(), row(footer).spacing(6.0).align(Align::Center).into()];
+        if let Some(controller) = &self.status.controller {
+            parts.push(
+                text(format!(
+                    "{controller}'s mouse crosses by the arrangement in Roam on {controller}: line the screens up there"
+                ))
+                .caption()
+                .secondary()
+                .wrap()
+                .into(),
+            );
+        }
+        column(parts).spacing(4.0).into()
+    }
+
+    /// Where the cursor crosses from one computer to another: a line along each stretch of
+    /// edge that leads over, in the colour of the screen it leads to while lining up.
+    fn crossings(&self, view: View) -> Vec<Shape> {
+        let computers: Vec<Computer> = self.desk.iter().map(Spot::computer).collect();
+        let mut shapes = Vec::new();
+        for (on, computer) in computers.iter().enumerate() {
+            for (index, display) in computer.desk_displays().iter().enumerate() {
+                for edge in layout::Edge::ALL {
+                    for span in align::spans(&computers, on, index, edge) {
+                        if span.computer == on {
+                            continue;
+                        }
+                        let [r, g, b] =
+                            self.guide_colour(&self.desk[span.computer].id, span.display).unwrap_or([255, 255, 255]);
+                        let colour = Color::rgba(r, g, b, if self.status.lining_up { 255 } else { 200 });
+                        // Just inside the screen's edge, as drawn.
+                        let inset = 2.5 / view.scale;
+                        let (from, to) = (span.from, span.to);
+                        let [a, b] = match edge {
+                            layout::Edge::Left => [
+                                [display.x + inset, display.y + from * display.h],
+                                [display.x + inset, display.y + to * display.h],
+                            ],
+                            layout::Edge::Right => [
+                                [display.right() - inset, display.y + from * display.h],
+                                [display.right() - inset, display.y + to * display.h],
+                            ],
+                            layout::Edge::Top => [
+                                [display.x + from * display.w, display.y + inset],
+                                [display.x + to * display.w, display.y + inset],
+                            ],
+                            layout::Edge::Bottom => [
+                                [display.x + from * display.w, display.bottom() - inset],
+                                [display.x + to * display.w, display.bottom() - inset],
+                            ],
+                        };
+                        let (a, b) = (view.to_canvas(a), view.to_canvas(b));
+                        shapes.push(draw::line([(a[0], a[1]), (b[0], b[1])]).stroke(2.0, colour));
+                    }
+                }
+            }
+        }
+        shapes
     }
 
     /// One computer on the desk: each of its screens, its name on its main one, and where the
@@ -953,8 +1157,9 @@ impl<B: Backend> Roam<B> {
             let [x, y, w, h] = [x + 1.0, y + 1.0, (w - 2.0).max(2.0), (h - 2.0).max(2.0)];
             // A screen lent here as a display is drawn as one of this computer's.
             let lent = self.extended(&spot.id, index).is_some_and(|e| e.failed.is_none());
-            let [r, g, b] = if lent { [90, 150, 255] } else { tint };
-            let strength = if connected || lent { 1.0 } else { 0.45 };
+            let guided = self.guide_colour(&spot.id, index);
+            let [r, g, b] = guided.unwrap_or(if lent { [90, 150, 255] } else { tint });
+            let strength = if connected || lent || guided.is_some() { 1.0 } else { 0.45 };
             let alpha = |a: f32| (a * strength) as u8;
             let fill = draw::linear(Color::rgba(r, g, b, alpha(175.0)), Color::rgba(r, g, b, alpha(120.0)), 90.0);
             let (width, edge) = if selected {
@@ -1148,6 +1353,8 @@ impl<B: Backend> Roam<B> {
                 .push(text("Right-click one of its screens to use it as a display").caption().tertiary().wrap().into());
         }
         parts.push(divider());
+        parts.push(self.position(&id));
+        parts.push(divider());
         parts.push(
             row![
                 text("Scroll speed").callout(),
@@ -1162,6 +1369,60 @@ impl<B: Backend> Roam<B> {
             .into(),
         );
         Some(card(column(parts).spacing(10.0)))
+    }
+
+    /// Where the selected computer sits against its neighbour, and buttons to move it a point
+    /// at a time or line their edges up.
+    fn position(&self, id: &str) -> Element<Msg> {
+        let Some(facing) = self.facing(id) else {
+            return text("Drag it against another screen, then line their edges up here")
+                .caption()
+                .secondary()
+                .wrap()
+                .into();
+        };
+        let offset = facing.offset();
+        let points = offset.abs().round() as i64;
+        let words = if points == 0 {
+            if facing.beside {
+                format!("Its top is level with the top of {}'s screen", facing.name)
+            } else {
+                format!("Its left edge is level with {}'s screen", facing.name)
+            }
+        } else if facing.beside {
+            let way = if offset > 0.0 { "below" } else { "above" };
+            format!("Its top is {points} pt {way} the top of {}'s screen", facing.name)
+        } else {
+            let way = if offset > 0.0 { "right of" } else { "left of" };
+            format!("Its left edge is {points} pt {way} {}'s", facing.name)
+        };
+        let nudge = |icon_for: Icon, by: f64, label: &str| -> Element<Msg> {
+            let by = if facing.beside { [0.0, by] } else { [by, 0.0] };
+            button(label).icon(icon_for).on_press(Msg::Nudge(id.to_owned(), by)).into()
+        };
+        let (back, ahead) =
+            if facing.beside { (Icon::ChevronUp, Icon::ChevronDown) } else { (Icon::ChevronLeft, Icon::ChevronRight) };
+        let (start, end) = if facing.beside { ("Tops", "Bottoms") } else { ("Lefts", "Rights") };
+        let level = |label: &str, level: Level| -> Element<Msg> {
+            button(label).plain().on_press(Msg::Level(id.to_owned(), level)).into()
+        };
+        column![
+            text("Line up").callout(),
+            text(words).caption().secondary().wrap(),
+            row![nudge(back, -10.0, "10"), nudge(back, -1.0, "1"), nudge(ahead, 1.0, "1"), nudge(ahead, 10.0, "10")]
+                .spacing(6.0)
+                .align(Align::Center),
+            row![
+                text("Line up").caption().secondary(),
+                level(start, Level::Start),
+                level("Middles", Level::Middle),
+                level(end, Level::End),
+            ]
+            .spacing(6.0)
+            .align(Align::Center),
+        ]
+        .spacing(6.0)
+        .into()
     }
 
     fn nearby(&self) -> Element<Msg> {

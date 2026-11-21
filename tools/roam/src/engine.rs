@@ -18,9 +18,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 mod extend;
+mod line_up;
 
 use extend::{ExtendEvent, Extended, Lending};
 pub use extend::{ExtendedView, LendingView};
+pub use line_up::Coloured;
 
 use crate::bulk::{self, Arrived, Content, Hello};
 use crate::crypto::{self, Ephemeral, Handshake, Identity, commit, hex, unhex};
@@ -154,6 +156,11 @@ pub enum Control {
     Unextend(String),
     /// Stop lending this computer's screen to the computer controlling it.
     StopLending,
+    /// Put line-up guides over every screen on the desk, or take them down.
+    LineUp(bool),
+    /// Take down the line-up guides another computer put on this one's screens, until it
+    /// lines up again.
+    HideGuides,
     /// Tests: stop hearing the network, as if Wi-Fi dropped out.
     #[cfg(test)]
     Deaf(bool),
@@ -308,6 +315,11 @@ pub struct Status {
     pub extended: Vec<ExtendedView>,
     /// This computer's screen, lent to another computer as its extended display.
     pub lending: Option<LendingView>,
+    /// Line-up guides are up on every screen on the desk, coloured like this.
+    pub lining_up: bool,
+    pub coloured: Vec<Coloured>,
+    /// Another computer's line-up guides are up on this one's screens.
+    pub guided_by: Option<String>,
 }
 
 /// A running engine. Dropping it stops everything and gives the mouse and keyboard back.
@@ -370,6 +382,7 @@ struct Peer {
     draws_pointer: bool,
     fast_pointer: bool,
     udp_pictures: bool,
+    aligns: bool,
     displays: Vec<Rect>,
     ppu: f64,
     seen: u64,
@@ -601,6 +614,9 @@ struct Core {
     /// The extended display this computer's cursor is over, whose lending computer is told
     /// where the pointer is the quick way, and where it was last said to be.
     pointer_over: Option<(Id, [i32; 2])>,
+    /// Lining the screens up: this computer leading, or following another's.
+    leading: Option<line_up::Leading>,
+    following: Option<line_up::Following>,
     #[cfg(test)]
     deaf: bool,
     /// Tests: see `Control::LoseDirect`.
@@ -695,6 +711,8 @@ impl Core {
             lending: None,
             extend_serial: 0,
             pointer_over: None,
+            leading: None,
+            following: None,
             #[cfg(test)]
             deaf: false,
             lose_direct: false,
@@ -802,6 +820,8 @@ impl Core {
     }
 
     fn shut_down(&mut self) {
+        self.line_up(false);
+        self.unfollow(None);
         self.shut_down_displays();
         self.go_home(None);
         self.release_played();
@@ -887,6 +907,9 @@ impl Core {
         if matches!(self.cursor, Cursor::Away { .. }) || self.here {
             next = next.min(now + BUSY_EVERY / 2);
         }
+        if let Some(line_up) = self.line_up_deadline() {
+            next = next.min(line_up.max(now + 100));
+        }
         next
     }
 
@@ -944,6 +967,7 @@ impl Core {
                         link.queue(Message::Screens { ppu: ppu as f32, displays: displays.clone() });
                     }
                 }
+                self.followed_screens_changed();
             }
         }
         let away = matches!(self.cursor, Cursor::Away { .. });
@@ -966,6 +990,7 @@ impl Core {
             self.ability = self.displays.ability();
         }
         self.check_extended(now);
+        self.line_up_tick(now);
         if matches!(self.cursor, Cursor::Away { .. }) {
             // Tell the mouse and keyboard Roam is still here, and notice if they let go.
             self.platform.alive();
@@ -1150,6 +1175,7 @@ impl Core {
             draws_pointer: self.displays.draws_pointer(),
             fast_pointer: self.displays.draws_pointer(),
             udp_pictures: self.displays.lends(),
+            aligns: self.displays.aligns(),
             ppu: ppu as f32,
             displays,
             name: self.name(),
@@ -1214,6 +1240,7 @@ impl Core {
             draws_pointer: beacon.draws_pointer,
             fast_pointer: beacon.fast_pointer,
             udp_pictures: beacon.udp_pictures,
+            aligns: beacon.aligns,
             displays: beacon.displays,
             ppu: f64::from(beacon.ppu),
             seen: now,
@@ -1493,6 +1520,7 @@ impl Core {
                     draws_pointer: false,
                     fast_pointer: false,
                     udp_pictures: false,
+                    aligns: false,
                     displays: Vec::new(),
                     ppu: 1.0,
                     seen: now,
@@ -1623,6 +1651,11 @@ impl Core {
                         self.note(&format!("{}'s screens: {words}", self.who(id)));
                     }
                 }
+            }
+            message @ (Message::Guide { .. } | Message::Guided { .. } | Message::Marks(_))
+                if side == Side::Controlled && live =>
+            {
+                self.guide_message(id, message);
             }
             _ if !live => {}
             // From here on: the controlled side, hearing its controller.
@@ -1757,6 +1790,7 @@ impl Core {
             self.go_home(None);
         }
         self.session_ended_displays(id);
+        self.line_up_session_ended(id);
         let Some(mut session) = self.sessions.remove(&id) else { return };
         if session.side == Side::Controlled {
             self.stalled = false;
@@ -1921,6 +1955,7 @@ impl Core {
             Cursor::Home => {
                 let Input::Move { at, delta } = input else { return };
                 self.quick_pointer(Some(at));
+                self.line_up_marks(None, at, now);
                 if !self.prefs.roam {
                     return;
                 }
@@ -2021,6 +2056,7 @@ impl Core {
                 };
                 match step {
                     Step::Stay(next) => {
+                        self.line_up_marks(Some(peer), next, now);
                         self.cursor = Cursor::Away { peer, at: next, left_from };
                         if next != at {
                             // Sent as soon as the pacing allows (see `flush`).
@@ -2482,6 +2518,8 @@ impl Core {
                 let why = format!("Stopped on {}", self.name());
                 self.stop_lending(Some(&why));
             }
+            Control::LineUp(on) => self.line_up(on),
+            Control::HideGuides => self.hide_followed(),
             Control::AskPermission => {
                 self.platform.ask_permission();
                 self.listen_at = 0;
@@ -2607,6 +2645,9 @@ impl Core {
             ability: self.ability.clone(),
             extended: self.extended_views(),
             lending: self.lending_view(),
+            lining_up: self.lining_up(),
+            coloured: self.coloured(),
+            guided_by: self.guided_by(),
         }
     }
 }

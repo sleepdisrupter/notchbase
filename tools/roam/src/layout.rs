@@ -76,7 +76,7 @@ pub enum Edge {
 }
 
 impl Edge {
-    fn step(self) -> [f64; 2] {
+    pub(crate) fn step(self) -> [f64; 2] {
         match self {
             Edge::Left => [-1.0, 0.0],
             Edge::Right => [1.0, 0.0],
@@ -85,8 +85,33 @@ impl Edge {
         }
     }
 
-    fn horizontal(self) -> bool {
+    pub fn horizontal(self) -> bool {
         matches!(self, Edge::Left | Edge::Right)
+    }
+
+    /// The edge facing this one across a crossing.
+    pub fn opposite(self) -> Edge {
+        match self {
+            Edge::Left => Edge::Right,
+            Edge::Right => Edge::Left,
+            Edge::Top => Edge::Bottom,
+            Edge::Bottom => Edge::Top,
+        }
+    }
+
+    pub const ALL: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+
+    pub fn code(self) -> u8 {
+        match self {
+            Edge::Left => 0,
+            Edge::Right => 1,
+            Edge::Top => 2,
+            Edge::Bottom => 3,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Edge> {
+        Edge::ALL.get(usize::from(code)).copied()
     }
 }
 
@@ -144,7 +169,7 @@ impl Computer {
         nearest.map_or(point, |display| display.clamp(point))
     }
 
-    fn on_display(&self, point: [f64; 2]) -> bool {
+    pub(crate) fn on_display(&self, point: [f64; 2]) -> bool {
         self.displays.iter().any(|d| d.contains(point))
     }
 }
@@ -248,7 +273,7 @@ fn crossed(computer: &Computer, from: [f64; 2], to: [f64; 2]) -> Option<Edge> {
 
 /// The computer past `edge` of computer `on` at the point `at` (its units), and where the
 /// cursor lands on it.
-fn beyond(desk: &[Computer], on: usize, at: [f64; 2], edge: Edge, corner: f64) -> Option<Step> {
+pub(crate) fn beyond(desk: &[Computer], on: usize, at: [f64; 2], edge: Edge, corner: f64) -> Option<Step> {
     let computer = desk.get(on)?;
     if corner > 0.0 && near_corner(computer, at, corner) {
         return None;

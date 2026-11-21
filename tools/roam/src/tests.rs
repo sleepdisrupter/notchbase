@@ -362,6 +362,71 @@ fn a_screen_coming_or_going_leaves_the_others_where_they_were() {
     assert_eq!(desk(&harness)[1].computer().desk_displays()[0], main_before);
 }
 
+#[test]
+fn a_screen_can_be_nudged_a_point_at_a_time_and_lined_up_with_its_neighbour() {
+    let mut harness = Harness::<Tool>::start();
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]))));
+    harness.click("Add");
+    harness.send(Msg::Select(Some("pc".into())));
+    assert!(harness.shows("Its top is level with the top of MacBook's screen"), "{:?}", harness.texts());
+    // Up 10, up 1, down 1, down 10.
+    harness.click_nth("1", 1);
+    assert_eq!(desk(&harness)[1].at, [1512.0, 1.0]);
+    harness.click_nth("10", 1);
+    assert_eq!(desk(&harness)[1].at, [1512.0, 11.0]);
+    assert!(harness.shows("Its top is 11 pt below the top of MacBook's screen"));
+    harness.click_nth("10", 0);
+    harness.click_nth("1", 0);
+    harness.click_nth("1", 0);
+    assert!(harness.shows("Its top is 1 pt above the top of MacBook's screen"));
+    // A run of nudges is one step back.
+    harness.click("Undo");
+    assert_eq!(desk(&harness)[1].at, [1512.0, 0.0]);
+    // The PC is 960 points tall beside the Mac's 982.
+    harness.click("Middles");
+    assert_eq!(desk(&harness)[1].at, [1512.0, 11.0]);
+    harness.click("Bottoms");
+    assert_eq!(desk(&harness)[1].at, [1512.0, 22.0]);
+    harness.click("Tops");
+    assert_eq!(desk(&harness)[1].at, [1512.0, 0.0]);
+    assert_eq!(placements(&harness.model().desk)[1].at, [1512.0, 0.0], "the engine gets it too");
+}
+
+#[test]
+fn where_the_cursor_crosses_is_drawn_on_the_desk() {
+    let mut harness = Harness::<Tool>::start();
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]))));
+    harness.click("Add");
+    let lines = shapes(&mut harness).into_iter().filter(|s| s["type"] == "line").count();
+    assert_eq!(lines, 2, "one on each side of the edge the two share");
+}
+
+#[test]
+fn lining_up_colours_each_screen_as_its_guide() {
+    let mut harness = Harness::<Tool>::start();
+    let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]);
+    harness.send(Msg::Status(Box::new(update.clone())));
+    harness.click("Add");
+    harness.click("Line up screens");
+    update.lining_up = true;
+    update.coloured = vec![
+        engine::Coloured { id: "me".into(), display: 0, colour: 0 },
+        engine::Coloured { id: "pc".into(), display: 0, colour: 2 },
+    ];
+    harness.send(Msg::Status(Box::new(update.clone())));
+    assert!(harness.shows("Every screen shows its colour · the bands are where the cursor crosses"));
+    let drawn = serde_json::to_string(&shapes(&mut harness)).unwrap();
+    let [r, g, b] = align::colour(2);
+    assert!(drawn.contains(&format!("{r}")) && drawn.contains(&format!("{g}")) && drawn.contains(&format!("{b}")));
+    harness.click("Done");
+    // Another computer's guides on this one can be taken down here.
+    update.lining_up = false;
+    update.guided_by = Some("Desk PC".into());
+    harness.send(Msg::Status(Box::new(update)));
+    assert!(harness.shows("Desk PC is lining up the screens"));
+    harness.click("Hide");
+}
+
 /// Writes the desk's shapes to ROAM_PREVIEW, for looking at the editor while working on it.
 #[test]
 #[ignore = "a preview, not a check"]

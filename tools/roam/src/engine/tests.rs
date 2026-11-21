@@ -393,6 +393,9 @@ mod displays {
         pub gone: bool,
         pub remote: Option<RemoteSink>,
         pub pointers: Vec<crate::display::PointerAt>,
+        /// Each set of line-up guides put up, and of marks.
+        pub guides: Vec<Vec<crate::align::Shown>>,
+        pub marks: Vec<Vec<crate::align::Marked>>,
     }
 
     #[derive(Clone)]
@@ -470,6 +473,18 @@ mod displays {
 
         fn draws_pointer(&self) -> bool {
             true
+        }
+
+        fn aligns(&self) -> bool {
+            true
+        }
+
+        fn guide(&self, shown: Vec<crate::align::Shown>) {
+            self.seen.lock().unwrap().guides.push(shown);
+        }
+
+        fn mark(&self, marks: Vec<crate::align::Marked>) {
+            self.seen.lock().unwrap().marks.push(marks);
         }
 
         fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
@@ -942,4 +957,67 @@ fn a_move_on_the_lent_screens_far_edge_leaves_the_cursor_on_the_screen_below() {
     displays::remote(&viewer.seen, Remote::Move([1.0, 0.5]));
     std::thread::sleep(Duration::from_millis(150));
     assert!(a.fake.state().captured, "still over on the Mac");
+}
+
+#[test]
+fn lining_up_puts_guides_on_every_screen_and_marks_where_the_cursor_crosses() {
+    use crate::layout::Edge;
+
+    let (mut a, mut b, host, viewer, b_id) = lend_a_screen();
+    let a_id = a.id();
+    a.engine.send(Control::LineUp(true));
+    let status = a.until("lining up", |s| s.lining_up && s.coloured.len() == 3);
+    // The lent screen is coloured as the virtual display that stands in for it.
+    assert!(status.coloured.iter().any(|c| c.id == b_id && c.display == 1), "{:?}", status.coloured);
+    assert!(status.coloured.iter().any(|c| c.id == b_id && c.display == 0));
+    assert!(status.coloured.iter().any(|c| c.id == a_id && c.display == 0));
+
+    // The PC's own screen and the virtual display get guides here.
+    displays::wait("guides on the PC", || host.seen.lock().unwrap().guides.last().is_some_and(|g| g.len() == 2));
+    {
+        let seen = host.seen.lock().unwrap();
+        let guides = seen.guides.last().unwrap();
+        let own = guides.iter().find(|g| g.rect == Rect::new(0.0, 0.0, 1920.0, 1080.0)).expect("the PC's screen");
+        // Its right edge leads to the Mac's built-in screen.
+        assert!(own.guide.bands.iter().any(|band| band.edge == Edge::Right), "{own:?}");
+        let virtual_one = guides.iter().find(|g| g.rect.x > 3000.0).expect("the virtual display");
+        assert!(virtual_one.guide.title.ends_with("'s screen"), "{virtual_one:?}");
+        assert!(virtual_one.guide.bands.iter().any(|band| band.edge == Edge::Left));
+    }
+    // The Mac shows one on its built-in screen only: the lent one shows the PC's.
+    displays::wait("guides on the Mac", || viewer.seen.lock().unwrap().guides.last().is_some_and(|g| !g.is_empty()));
+    {
+        let seen = viewer.seen.lock().unwrap();
+        let guides = seen.guides.last().unwrap();
+        assert_eq!(guides.len(), 1, "{guides:?}");
+        assert_eq!(guides[0].rect, Rect::new(0.0, 0.0, 1512.0, 982.0));
+        let edges: Vec<Edge> = guides[0].guide.bands.iter().map(|b| b.edge).collect();
+        assert!(edges.contains(&Edge::Left) && edges.contains(&Edge::Right), "{edges:?}");
+    }
+    b.until("following the PC's guides", |s| s.guided_by.is_some());
+
+    // Near the PC's right edge, the Mac marks where the cursor comes in.
+    a.fake.input(Input::Move { at: [1850.0, 540.0], delta: [1.0, 0.0] });
+    displays::wait("the arrival marked on the Mac", || {
+        viewer.seen.lock().unwrap().marks.last().is_some_and(|m| m.iter().any(|m| m.mark.arrives))
+    });
+    {
+        let seen = viewer.seen.lock().unwrap();
+        let marked = seen.marks.last().unwrap();
+        let arrive = marked.iter().find(|m| m.mark.arrives).unwrap();
+        assert_eq!(arrive.mark.edge, Edge::Left);
+        assert!((arrive.mark.along - 540.0 / 982.0).abs() < 0.01, "{arrive:?}");
+    }
+    displays::wait("the leaving spot marked on the PC", || {
+        host.seen.lock().unwrap().marks.last().is_some_and(|m| m.iter().any(|m| !m.mark.arrives))
+    });
+    // Away from the edge, the marks go.
+    a.fake.input(Input::Move { at: [900.0, 540.0], delta: [-1.0, 0.0] });
+    displays::wait("no marks on the Mac", || viewer.seen.lock().unwrap().marks.last().is_some_and(Vec::is_empty));
+
+    a.engine.send(Control::LineUp(false));
+    displays::wait("guides down on the Mac", || viewer.seen.lock().unwrap().guides.last().is_some_and(Vec::is_empty));
+    displays::wait("guides down on the PC", || host.seen.lock().unwrap().guides.last().is_some_and(Vec::is_empty));
+    a.until("no longer lining up", |s| !s.lining_up);
+    b.until("no longer following", |s| s.guided_by.is_none());
 }

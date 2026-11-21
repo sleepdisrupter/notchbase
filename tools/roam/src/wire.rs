@@ -5,7 +5,8 @@
 //! Every packet starts with `RM`, the protocol version and a kind. Beacons and the handshake are
 //! in the clear; everything after the handshake is sealed with the session's keys.
 
-use crate::layout::Rect;
+use crate::align::{Band, Guide, Mark};
+use crate::layout::{Edge, Rect};
 
 pub const MAGIC: [u8; 2] = *b"RM";
 pub const VERSION: u8 = 1;
@@ -78,6 +79,8 @@ pub struct Beacon {
     pub fast_pointer: bool,
     /// Takes a lent screen's pictures over UDP when the host offers (`Down::UdpPlease`).
     pub udp_pictures: bool,
+    /// Shows line-up guides over its screens when told (`Message::Guide`).
+    pub aligns: bool,
     pub ppu: f32,
     pub displays: Vec<Rect>,
     pub name: String,
@@ -165,7 +168,8 @@ impl Packet {
                     | (u8::from(beacon.lends) << 2)
                     | (u8::from(beacon.draws_pointer) << 3)
                     | (u8::from(beacon.fast_pointer) << 4)
-                    | (u8::from(beacon.udp_pictures) << 5));
+                    | (u8::from(beacon.udp_pictures) << 5)
+                    | (u8::from(beacon.aligns) << 6));
                 out.f32(beacon.ppu);
                 let displays = &beacon.displays[..beacon.displays.len().min(16)];
                 out.u8(displays.len() as u8);
@@ -244,6 +248,7 @@ impl Packet {
                     draws_pointer: flags & 8 != 0,
                     fast_pointer: flags & 16 != 0,
                     udp_pictures: flags & 32 != 0,
+                    aligns: flags & 64 != 0,
                     ppu,
                     displays,
                     name,
@@ -343,6 +348,21 @@ pub enum Message {
         display: u8,
         why: String,
     },
+    /// From the controller, while it lines the screens up: what to show over one of your
+    /// screens, from the set numbered `serial`. Only sent to computers whose beacon says they
+    /// align.
+    Guide {
+        serial: u16,
+        guide: Guide,
+    },
+    /// The set numbered `serial` is all here: show it on these screens, and nothing on the rest.
+    /// None takes every guide away.
+    Guided {
+        serial: u16,
+        displays: Vec<u8>,
+    },
+    /// Where the cursor would cross on your screens, in place of the marks before.
+    Marks(Vec<Mark>),
 }
 
 const ENTER: u8 = 1;
@@ -360,6 +380,9 @@ const DRAGGING: u8 = 12;
 const LEND: u8 = 13;
 const LENT: u8 = 14;
 const UNLEND: u8 = 15;
+const GUIDE: u8 = 16;
+const GUIDED: u8 = 17;
+const MARKS: u8 = 18;
 
 /// How much of a clipboard goes in one message.
 pub const CLIP_CHUNK: usize = 900;
@@ -429,6 +452,40 @@ impl Message {
                 w.u8(*display);
                 w.text(why, 160);
             }
+            Message::Guide { serial, guide } => {
+                w.u8(GUIDE);
+                w.u16(*serial);
+                w.u8(guide.display);
+                w.u8(guide.colour);
+                w.text(&guide.title, 64);
+                w.text(&guide.detail, 80);
+                let bands = &guide.bands[..guide.bands.len().min(crate::align::MOST_BANDS)];
+                w.u8(bands.len() as u8);
+                for band in bands {
+                    w.u8(band.edge.code());
+                    w.f32(band.from);
+                    w.f32(band.to);
+                    w.u8(band.colour);
+                    w.text(&band.label, 48);
+                }
+            }
+            Message::Guided { serial, displays } => {
+                w.u8(GUIDED);
+                w.u16(*serial);
+                let displays = &displays[..displays.len().min(16)];
+                w.u8(displays.len() as u8);
+                w.bytes(displays);
+            }
+            Message::Marks(marks) => {
+                w.u8(MARKS);
+                let marks = &marks[..marks.len().min(8)];
+                w.u8(marks.len() as u8);
+                for mark in marks {
+                    w.u8(mark.display);
+                    w.u8(mark.edge.code() | (u8::from(mark.arrives) << 4));
+                    w.u16((mark.along.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16);
+                }
+            }
         }
         *out = w.0;
     }
@@ -472,6 +529,41 @@ impl Message {
                 scale: input.f32()?,
             },
             UNLEND => Message::Unlend { display: input.u8()?, why: input.text()? },
+            GUIDE => {
+                let serial = input.u16()?;
+                let display = input.u8()?;
+                let colour = input.u8()?;
+                let title = input.text()?;
+                let detail = input.text()?;
+                let count = input.u8()? as usize;
+                let mut bands = Vec::with_capacity(count.min(crate::align::MOST_BANDS));
+                for _ in 0..count {
+                    let edge = Edge::from_code(input.u8()?)?;
+                    let (from, to) = (input.f32()?, input.f32()?);
+                    let colour = input.u8()?;
+                    let label = input.text()?;
+                    if from.is_finite() && to.is_finite() && bands.len() < crate::align::MOST_BANDS {
+                        bands.push(Band { edge, from: from.clamp(0.0, 1.0), to: to.clamp(0.0, 1.0), colour, label });
+                    }
+                }
+                Message::Guide { serial, guide: Guide { display, colour, title, detail, bands } }
+            }
+            GUIDED => {
+                let serial = input.u16()?;
+                let count = input.u8()? as usize;
+                Message::Guided { serial, displays: input.take(count)?.to_vec() }
+            }
+            MARKS => {
+                let count = input.u8()? as usize;
+                let mut marks = Vec::with_capacity(count.min(8));
+                for _ in 0..count {
+                    let display = input.u8()?;
+                    let code = input.u8()?;
+                    let along = f32::from(input.u16()?) / f32::from(u16::MAX);
+                    marks.push(Mark { display, edge: Edge::from_code(code & 15)?, along, arrives: code & 16 != 0 });
+                }
+                Message::Marks(marks)
+            }
             _ => return None,
         })
     }
@@ -672,6 +764,7 @@ mod tests {
                 draws_pointer: true,
                 fast_pointer: true,
                 udp_pictures: true,
+                aligns: true,
                 ppu: 1.5,
                 displays: vec![Rect::new(-1920.0, 0.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
                 name: "Desk PC".into(),
@@ -712,6 +805,27 @@ mod tests {
                 (16, Message::Lend { display: 1 }),
                 (17, Message::Lent { display: 1, pixels: [2560, 1440], hz: 60, scale: 1.0 }),
                 (18, Message::Unlend { display: 1, why: "Stopped on the Mac".into() }),
+                (
+                    19,
+                    Message::Guide {
+                        serial: 7,
+                        guide: Guide {
+                            display: 1,
+                            colour: 2,
+                            title: "Desk PC".into(),
+                            detail: "Main screen · 1920 × 1080".into(),
+                            bands: vec![Band {
+                                edge: Edge::Top,
+                                from: 0.25,
+                                to: 1.0,
+                                colour: 3,
+                                label: "MacBook · LG".into(),
+                            }],
+                        },
+                    },
+                ),
+                (20, Message::Guided { serial: 7, displays: vec![0, 1] }),
+                (21, Message::Marks(vec![Mark { display: 1, edge: Edge::Bottom, along: 1.0, arrives: true }])),
             ],
             pointer: Some(Pointer { seq: 3, at: [-4, 1080], visible: true }),
         };
@@ -742,6 +856,7 @@ mod tests {
             draws_pointer: false,
             fast_pointer: false,
             udp_pictures: false,
+            aligns: false,
             ppu: 1.0,
             displays: vec![],
             name: "é".repeat(40),

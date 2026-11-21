@@ -505,6 +505,25 @@ pub trait Displays: Send + Sync {
     /// Covers the display at `rect` with pictures `size` pixels big. What the person does
     /// over them goes to `remote`.
     fn show(&self, rect: Rect, size: [u32; 2], remote: RemoteSink) -> Result<Box<dyn Showing>, String>;
+    /// Whether this computer shows line-up guides over its screens.
+    fn aligns(&self) -> bool {
+        cfg!(any(target_os = "macos", windows))
+    }
+    /// Puts line-up guides over this computer's screens, in place of what was there: none takes
+    /// them away.
+    fn guide(&self, shown: Vec<crate::align::Shown>) {
+        #[cfg(any(target_os = "macos", windows))]
+        crate::align::show_here(shown);
+        #[cfg(not(any(target_os = "macos", windows)))]
+        drop(shown);
+    }
+    /// Puts the cursor's marks over this computer's screens, in place of the ones there.
+    fn mark(&self, marks: Vec<crate::align::Marked>) {
+        #[cfg(any(target_os = "macos", windows))]
+        crate::align::mark_here(marks);
+        #[cfg(not(any(target_os = "macos", windows)))]
+        drop(marks);
+    }
 }
 
 /// The displays of the computer this runs on.
