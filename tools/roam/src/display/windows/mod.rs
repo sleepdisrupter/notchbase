@@ -52,7 +52,7 @@ impl Windows {
     /// driver's own at start-up. Roam only turns them on while one is in use.
     pub fn new() -> Self {
         let _ = std::thread::Builder::new().name("roam-display-tidy".into()).spawn(|| {
-            if let Err(why) = monitor::detach_all() {
+            if let Err(why) = monitor::detach_unused() {
                 eprintln!("roam: couldn't turn off the virtual display: {why}");
             }
         });
@@ -67,14 +67,26 @@ impl Displays for Windows {
 
     fn install(&self) -> Result<(), String> {
         vdd::install()?;
-        // The driver turns its monitor on as it starts; it stays off until it's wanted.
-        let _ = monitor::detach_all();
+        // The driver turns its monitors on as it starts; they stay off until they're wanted.
+        let _ = monitor::detach_unused();
         Ok(())
     }
 
+    fn has_room(&self) -> bool {
+        vdd::has_room(monitor::in_use())
+    }
+
+    fn make_room(&self) -> Result<(), String> {
+        vdd::make_room(monitor::in_use)
+    }
+
     fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
-        let (source, size) = ready_source(super::picture_size(want.panel))?;
+        let (source, size) = monitor::claim(|free, all| ready_source(free, all, super::picture_size(want.panel)))?;
+        // Given back if it doesn't start.
+        let claimed = Claimed(Some(source));
         monitor::attach(&source, size, HZ, want.at)?;
+        // Windows may turn on the driver's other screens with this one: only this one stays.
+        let _ = monitor::detach_unused();
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(Mutex::new(None));
         let (opened, open) = mpsc::channel();
@@ -97,6 +109,7 @@ impl Displays for Windows {
                 .map_err(|err| err.to_string())?
         };
         // Dropped on the way out if it never starts, which turns the monitor off again.
+        claimed.keep();
         let mut shown = Virtual { source, size, stop, failed, thread: Some(thread) };
         match open.recv_timeout(OPEN_WAIT + Duration::from_secs(5)) {
             Ok(Ok(size)) => {
@@ -117,11 +130,46 @@ impl Displays for Windows {
     }
 }
 
-/// A driver monitor, and the size to show a `want`-sized screen at: the nearest the driver
-/// offers, since asking it for new sizes can knock it over. One that's off goes first, so a
-/// monitor the person turned on for something else stays theirs.
-fn ready_source(want: [u32; 2]) -> Result<(monitor::Source, [u32; 2]), String> {
-    let sources = monitor::virtual_sources();
+/// A driver monitor taken for a screen, until it's in use: given back, and off, if it never gets
+/// there.
+struct Claimed(Option<monitor::Source>);
+
+impl Claimed {
+    /// It's in use now: whatever holds it gives it back.
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        if let Some(source) = self.0.take() {
+            monitor::release(&source);
+            let _ = monitor::detach(&source);
+        }
+    }
+}
+
+/// Of the driver monitors not in use (`sources`, of `all` there are), one to show a
+/// `want`-sized screen on, and the size: the nearest the driver offers, since asking it for new
+/// sizes can knock it over. One that's off goes first, so a monitor the person turned on for
+/// something else stays theirs.
+fn ready_source(
+    sources: &[monitor::Source],
+    all: usize,
+    want: [u32; 2],
+) -> Result<(monitor::Source, [u32; 2]), String> {
+    if sources.is_empty() && all > 0 {
+        return Err(if all < vdd::MONITORS {
+            vdd::ask_again();
+            format!(
+                "The display driver has room for {all} screen{} and it's in use. Disconnect the other extended displays and try again: Windows then asks to make room for more",
+                if all == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("All {all} of the display driver's screens are in use. Disconnect one and try again")
+        });
+    }
     let off = sources.iter().filter(|s| !s.attached);
     let on = sources.iter().filter(|s| s.attached);
     let ordered: Vec<monitor::Source> = off.chain(on).copied().collect();
@@ -319,8 +367,10 @@ impl Drop for Virtual {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        // Every driver screen goes, in case Windows turned on another with this one.
-        if let Err(why) = monitor::detach(&self.source).and_then(|()| monitor::detach_all()) {
+        monitor::release(&self.source);
+        // Any other driver screen not in use goes too, in case Windows turned it on with this one;
+        // the ones still showing other lent screens stay.
+        if let Err(why) = monitor::detach(&self.source).and_then(|()| monitor::detach_unused()) {
             eprintln!("roam: couldn't turn off the virtual display: {why}");
         }
     }

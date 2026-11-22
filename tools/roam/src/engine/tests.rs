@@ -391,8 +391,14 @@ mod displays {
         pub shown: Vec<(Rect, [u32; 2])>,
         pub pictures: Vec<Picture>,
         pub gone: bool,
-        pub remote: Option<RemoteSink>,
+        /// The way back from each window, in the order they opened.
+        pub remotes: Vec<RemoteSink>,
         pub pointers: Vec<crate::display::PointerAt>,
+        /// Which window (by the order they opened) each picture and pointer went to, and the
+        /// windows closed.
+        pub pictures_on: Vec<usize>,
+        pub pointers_on: Vec<(usize, crate::display::PointerAt)>,
+        pub closed: Vec<usize>,
         /// Each set of line-up guides put up, and of marks.
         pub guides: Vec<Vec<crate::align::Shown>>,
         pub marks: Vec<Vec<crate::align::Marked>>,
@@ -443,22 +449,28 @@ mod displays {
         }
     }
 
-    struct PretendShowing(Arc<Mutex<Seen>>);
+    struct PretendShowing(Arc<Mutex<Seen>>, usize);
 
     impl Showing for PretendShowing {
         fn picture(&mut self, picture: &Picture) -> Result<(), String> {
-            self.0.lock().unwrap().pictures.push(picture.clone());
+            let mut seen = self.0.lock().unwrap();
+            seen.pictures.push(picture.clone());
+            seen.pictures_on.push(self.1);
             Ok(())
         }
 
         fn pointer(&mut self, at: crate::display::PointerAt) {
-            self.0.lock().unwrap().pointers.push(at);
+            let mut seen = self.0.lock().unwrap();
+            seen.pointers.push(at);
+            seen.pointers_on.push((self.1, at));
         }
     }
 
     impl Drop for PretendShowing {
         fn drop(&mut self) {
-            self.0.lock().unwrap().gone = true;
+            let mut seen = self.0.lock().unwrap();
+            seen.gone = true;
+            seen.closed.push(self.1);
         }
     }
 
@@ -488,7 +500,12 @@ mod displays {
         }
 
         fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
-            self.seen.lock().unwrap().wants.push(want.clone());
+            // Each display's pictures end in its own number, to tell them apart where they show.
+            let tag = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.wants.push(want.clone());
+                seen.wants.len() as u8
+            };
             let rect = Rect::new(
                 f64::from(want.at[0]),
                 f64::from(want.at[1]),
@@ -513,7 +530,7 @@ mod displays {
                     }
                     if !sending.busy() {
                         let key = sending.key_wanted();
-                        sending.push(Picture { key, data: vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, n] });
+                        sending.push(Picture { key, data: vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, n, tag] });
                         n = n.wrapping_add(1);
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -533,8 +550,8 @@ mod displays {
         fn show(&self, rect: Rect, size: [u32; 2], remote: RemoteSink) -> Result<Box<dyn Showing>, String> {
             let mut seen = self.seen.lock().unwrap();
             seen.shown.push((rect, size));
-            seen.remote = Some(remote);
-            Ok(Box::new(PretendShowing(self.seen.clone())))
+            seen.remotes.push(remote);
+            Ok(Box::new(PretendShowing(self.seen.clone(), seen.shown.len() - 1)))
         }
     }
 
@@ -597,9 +614,37 @@ mod displays {
 
     #[allow(dead_code)]
     pub fn remote(seen: &Arc<Mutex<Seen>>, remote: Remote) {
-        if let Some(sink) = &seen.lock().unwrap().remote {
+        if let Some(sink) = seen.lock().unwrap().remotes.last() {
             sink(remote);
         }
+    }
+
+    /// What the person does over the window that opened `nth`.
+    pub fn remote_on(seen: &Arc<Mutex<Seen>>, nth: usize, remote: Remote) {
+        if let Some(sink) = seen.lock().unwrap().remotes.get(nth) {
+            sink(remote);
+        }
+    }
+
+    /// The displays (by the order they were made, from 1) whose pictures the window that opened
+    /// `nth` has shown.
+    pub fn sources_on(seen: &Arc<Mutex<Seen>>, nth: usize) -> Vec<u8> {
+        let seen = seen.lock().unwrap();
+        let mut tags: Vec<u8> = seen
+            .pictures
+            .iter()
+            .zip(&seen.pictures_on)
+            .filter(|(p, on)| **on == nth && p.data.len() > 6)
+            .map(|(p, _)| p.data[6])
+            .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
+    /// How many pictures the window that opened `nth` has shown.
+    pub fn pictures_on(seen: &Arc<Mutex<Seen>>, nth: usize) -> usize {
+        seen.lock().unwrap().pictures_on.iter().filter(|on| **on == nth).count()
     }
 }
 
@@ -630,7 +675,7 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
 
     a.engine.send(Control::Extend { id: b_id.clone(), display: 1 });
     a.until("the extended display up", |s| s.extended.iter().any(|e| e.id == b_id && e.running));
-    b.until("lending the screen", |s| s.lending.as_ref().is_some_and(|l| l.display == 1));
+    b.until("lending the screen", |s| s.lending.iter().any(|l| l.display == 1));
     {
         let wants = &host.seen.lock().unwrap().wants;
         assert_eq!(wants.len(), 1);
@@ -668,9 +713,9 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
     a.wait_for("the cursor put on the virtual display", |s| s.warped.contains(&[3432.0 + 1280.0, 720.0]));
 
     // Disconnecting gives the screen back.
-    a.engine.send(Control::Unextend(b_id.clone()));
+    a.engine.send(Control::Unextend { id: b_id.clone(), display: Some(1) });
     a.until("the extended display gone", |s| s.extended.is_empty());
-    b.until("no longer lending", |s| s.lending.is_none());
+    b.until("no longer lending", |s| s.lending.is_empty());
     displays::wait("the picture closed on the Mac", || viewer.seen.lock().unwrap().gone);
     assert!(!a.fake.state().screens.iter().any(|s| s.x > 3000.0), "the virtual display is gone");
 }
@@ -751,7 +796,7 @@ fn an_extended_display_waits_for_a_session_lost_to_silence() {
     let before = viewer.seen.lock().unwrap().pictures.len();
     displays::wait("pictures still coming", || viewer.seen.lock().unwrap().pictures.len() > before + 5);
     still_extended(&a, &host, &viewer);
-    b.until("still lending", |s| s.lending.as_ref().is_some_and(|l| l.display == 1));
+    b.until("still lending", |s| s.lending.iter().any(|l| l.display == 1));
 }
 
 #[test]
@@ -981,7 +1026,7 @@ fn lining_up_puts_guides_on_every_screen_and_marks_where_the_cursor_crosses() {
         // Its right edge leads to the Mac's built-in screen.
         assert!(own.guide.bands.iter().any(|band| band.edge == Edge::Right), "{own:?}");
         let virtual_one = guides.iter().find(|g| g.rect.x > 3000.0).expect("the virtual display");
-        assert!(virtual_one.guide.title.ends_with("'s screen"), "{virtual_one:?}");
+        assert!(virtual_one.guide.title.ends_with("'s screen 2"), "{virtual_one:?}");
         assert!(virtual_one.guide.bands.iter().any(|band| band.edge == Edge::Left));
     }
     // The Mac shows one on its built-in screen only: the lent one shows the PC's.
@@ -1020,4 +1065,231 @@ fn lining_up_puts_guides_on_every_screen_and_marks_where_the_cursor_crosses() {
     displays::wait("guides down on the PC", || host.seen.lock().unwrap().guides.last().is_some_and(Vec::is_empty));
     a.until("no longer lining up", |s| !s.lining_up);
     b.until("no longer following", |s| s.guided_by.is_none());
+}
+
+/// The PC hosts the Mac's `lent` screens as extended displays at once, pictures flowing to each.
+/// The Mac sits right of the PC on the desk.
+fn lend_screens(
+    mac_screens: Vec<Rect>,
+    lent: &[u8],
+) -> (Machine, Machine, displays::Pretend, displays::Pretend, String) {
+    let a_port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
+    let b_port = a_port + 1;
+    let pc = Fake::new(vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], 1.0);
+    let count = mac_screens.len();
+    let mac = Fake::new(mac_screens, 1.0);
+    let (mut a, host) = displays::start(folder(), pc, a_port, b_port);
+    let (mut b, viewer) = displays::start(folder(), mac, b_port, a_port);
+    let (a_id, b_id) = (a.id(), b.id());
+    a.until("seeing the Mac", |s| s.peers.iter().any(|p| p.id == b_id && p.displays.len() == count && p.lends_many));
+    a.engine.send(Control::Desk(vec![
+        Placement { id: a_id.clone(), at: [0.0, 0.0], scroll: 1.0 },
+        Placement { id: b_id.clone(), at: [1920.0, 0.0], scroll: 1.0 },
+    ]));
+    a.until("the code to check", |s| !s.asks.is_empty());
+    b.until("the request to allow", |s| !s.asks.is_empty());
+    a.engine.send(Control::Allow(b_id.clone()));
+    b.engine.send(Control::Allow(a_id.clone()));
+    connected(&mut a, &b_id);
+    connected(&mut b, &a_id);
+    for display in lent {
+        a.engine.send(Control::Extend { id: b_id.clone(), display: *display });
+    }
+    let all = lent.len();
+    a.until("the extended displays up", |s| s.extended.iter().filter(|e| e.id == b_id && e.running).count() == all);
+    b.until("lending the screens", |s| s.lending.len() == all);
+    displays::wait("pictures on every lent screen", || {
+        (0..all).all(|nth| displays::pictures_on(&viewer.seen, nth) >= 3)
+    });
+    (a, b, host, viewer, b_id)
+}
+
+/// A MacBook with two Full HD monitors to its right.
+fn macbook_and_two_monitors() -> Vec<Rect> {
+    vec![
+        Rect::new(0.0, 0.0, 1512.0, 982.0),
+        Rect::new(1512.0, 0.0, 1920.0, 1080.0),
+        Rect::new(3432.0, 0.0, 1920.0, 1080.0),
+    ]
+}
+
+#[test]
+fn two_of_a_macs_screens_are_extended_displays_at_once() {
+    use crate::display::{PointerAt, Remote};
+
+    let (mut a, mut b, host, viewer, b_id) = lend_screens(macbook_and_two_monitors(), &[1, 2]);
+    {
+        let wants = &host.seen.lock().unwrap().wants;
+        assert_eq!(wants.len(), 2, "one virtual display for each");
+        let mut at: Vec<[i32; 2]> = wants.iter().map(|w| w.at).collect();
+        at.sort_unstable();
+        assert_eq!(at, vec![[1920 + 1512, 0], [1920 + 3432, 0]], "each where its screen sits on the desk");
+        assert!(wants.iter().all(|w| w.name.starts_with(&b.last.me.as_ref().unwrap().name)), "named for the Mac");
+        let mut shown: Vec<Rect> = viewer.seen.lock().unwrap().shown.iter().map(|(r, _)| *r).collect();
+        shown.sort_by(|p, q| p.x.total_cmp(&q.x));
+        assert_eq!(shown, vec![Rect::new(1512.0, 0.0, 1920.0, 1080.0), Rect::new(3432.0, 0.0, 1920.0, 1080.0)]);
+    }
+    {
+        let seen = host.seen.lock().unwrap();
+        let made_for = |x: i32| seen.wants.iter().position(|w| w.at[0] == x).unwrap() as u8 + 1;
+        let shown = viewer.seen.lock().unwrap().shown.clone();
+        for (nth, (rect, _)) in shown.iter().enumerate() {
+            let x = 1920 + rect.x as i32;
+            assert_eq!(displays::sources_on(&viewer.seen, nth), vec![made_for(x)], "the window at {rect:?}");
+        }
+    }
+    let status = a.until("both named apart", |s| s.extended.len() == 2);
+    let screens: Vec<&str> = status.extended.iter().map(|e| e.screen.as_str()).collect();
+    assert!(screens[0].ends_with("'s screen 2") && screens[1].ends_with("'s screen 3"), "{screens:?}");
+    // The PC's own screens, as other computers see them, leave both virtual ones out.
+    a.until("the PC's screens without the virtual ones", |s| {
+        s.me.as_ref().is_some_and(|m| m.displays == vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)])
+    });
+
+    // The MacBook's own screen still sits between the PC and the virtual displays.
+    a.wait_for("listening", |s| s.sink.is_some());
+    assert!(a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [5.0, 0.0] }));
+    a.wait_for("the cursor over on the MacBook's screen", |s| s.captured);
+    b.wait_for("the cursor arriving on the MacBook's screen", |s| {
+        s.played.iter().any(|p| matches!(p, Play::Move([x, _]) if *x < 1512.0))
+    });
+    a.engine.send(Control::Home);
+    a.wait_for("home", |s| !s.captured);
+    settle();
+
+    // Each window works the PC's cursor on its own virtual display.
+    let nth_at = |x: f64| viewer.seen.lock().unwrap().shown.iter().position(|(r, _)| r.x == x).unwrap();
+    let (first, second) = (nth_at(1512.0), nth_at(3432.0));
+    displays::remote_on(&viewer.seen, first, Remote::Move([0.5, 0.5]));
+    a.wait_for("the cursor on the first virtual display", |s| s.warped.contains(&[3432.0 + 960.0, 540.0]));
+    displays::remote_on(&viewer.seen, second, Remote::Move([0.25, 0.5]));
+    a.wait_for("the cursor on the second virtual display", |s| s.warped.contains(&[5352.0 + 480.0, 540.0]));
+
+    // The pointer drawn on the Mac is on the screen the cursor's over, and only that one.
+    for x in [100.0, 140.0, 180.0] {
+        a.fake.input(Input::Move { at: [3432.0 + x, 50.0], delta: [1.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let seen = viewer.seen.clone();
+    let drawn = |nth: usize, at: PointerAt| {
+        let seen = seen.clone();
+        move || seen.lock().unwrap().pointers_on.contains(&(nth, at))
+    };
+    displays::wait("the pointer on the first lent screen", drawn(first, PointerAt { at: [178, 47], visible: true }));
+    for x in [300.0, 340.0] {
+        a.fake.input(Input::Move { at: [5352.0 + x, 70.0], delta: [1.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    displays::wait("the pointer on the second lent screen", drawn(second, PointerAt { at: [338, 67], visible: true }));
+    displays::wait("the pointer gone from the first", || {
+        let seen = viewer.seen.lock().unwrap();
+        seen.pointers_on.iter().rev().find(|(nth, _)| *nth == first).is_some_and(|(_, at)| !at.visible)
+    });
+
+    // Disconnecting one leaves the other up.
+    a.engine.send(Control::Unextend { id: b_id.clone(), display: Some(1) });
+    a.until("one extended display left", |s| s.extended.len() == 1 && s.extended[0].display == 2);
+    b.until("lending one screen", |s| s.lending.len() == 1 && s.lending[0].display == 2);
+    displays::wait("the first window closed", || viewer.seen.lock().unwrap().closed == vec![first]);
+    let before = displays::pictures_on(&viewer.seen, second);
+    displays::wait("pictures still on the other", || displays::pictures_on(&viewer.seen, second) > before + 5);
+    assert!(!a.fake.state().screens.iter().any(|s| s.x == 3432.0), "its virtual display is gone");
+    assert!(a.fake.state().screens.iter().any(|s| s.x == 5352.0), "the other's is still there");
+}
+
+#[test]
+fn a_mac_with_every_screen_lent_leaves_the_desk_and_disconnects_at_once() {
+    let mac = vec![Rect::new(0.0, 0.0, 1920.0, 1080.0), Rect::new(1920.0, 0.0, 1920.0, 1080.0)];
+    let (mut a, mut b, host, viewer, b_id) = lend_screens(mac, &[0, 1]);
+    assert_eq!(host.seen.lock().unwrap().wants.len(), 2);
+    // The Mac's screens are the PC's now: pushing right goes onto the first virtual display,
+    // the PC's own, rather than over to the Mac.
+    a.wait_for("listening", |s| s.sink.is_some());
+    for _ in 0..5 {
+        a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [6.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!a.fake.state().captured, "nothing of the Mac's is left to cross to");
+    let status = b.until("both lent", |s| s.lending.len() == 2);
+    assert_eq!(status.lending.iter().map(|l| l.display).collect::<Vec<_>>(), vec![0, 1]);
+
+    a.engine.send(Control::Unextend { id: b_id.clone(), display: None });
+    a.until("no extended displays", |s| s.extended.is_empty());
+    b.until("lending none", |s| s.lending.is_empty());
+    displays::wait("both windows closed", || viewer.seen.lock().unwrap().closed.len() == 2);
+    assert_eq!(a.fake.state().screens, vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], "both virtual displays gone");
+    // And the Mac is back on the desk to cross to.
+    settle();
+    a.until("the Mac on the desk again", |s| s.extended.is_empty() && s.lending.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !a.fake.state().captured {
+        assert!(Instant::now() < deadline, "the cursor never crossed to the Mac");
+        a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [6.0, 0.0] });
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn several_lent_screens_wait_together_for_a_session_lost_to_silence() {
+    let (mut a, mut b, host, viewer, b_id) = lend_screens(macbook_and_two_monitors(), &[1, 2]);
+    a.engine.send(Control::Deaf(true));
+    b.engine.send(Control::Deaf(true));
+    std::thread::sleep(Duration::from_millis(super::DEAD / super::MS + 1_500));
+    assert!(log_of(&a).contains("the 2 extended displays of"), "{}", log_of(&a));
+    assert!(log_of(&b).contains("the 2 screens lent to"), "{}", log_of(&b));
+    a.engine.send(Control::Deaf(false));
+    b.engine.send(Control::Deaf(false));
+    connected(&mut a, &b_id);
+    a.until("both running again", |s| s.extended.iter().filter(|e| e.running).count() == 2);
+    let before = [displays::pictures_on(&viewer.seen, 0), displays::pictures_on(&viewer.seen, 1)];
+    displays::wait("pictures again on both", || {
+        displays::pictures_on(&viewer.seen, 0) > before[0] + 5 && displays::pictures_on(&viewer.seen, 1) > before[1] + 5
+    });
+    assert_eq!(host.seen.lock().unwrap().wants.len(), 2, "neither virtual display was made again");
+    let (on_first, on_second) = (displays::sources_on(&viewer.seen, 0), displays::sources_on(&viewer.seen, 1));
+    assert!(on_first.len() == 1 && on_second.len() == 1 && on_first != on_second, "{on_first:?} {on_second:?}");
+    let seen = viewer.seen.lock().unwrap();
+    assert_eq!(seen.shown.len(), 2, "the same two windows throughout");
+    assert!(seen.closed.is_empty(), "both stayed up");
+    drop(seen);
+    b.until("still lending both", |s| s.lending.len() == 2);
+}
+
+#[test]
+fn a_dropped_stream_of_one_lent_screen_comes_back_to_that_screen() {
+    let (a, b, host, viewer, _) = lend_screens(macbook_and_two_monitors(), &[1, 2]);
+    std::thread::sleep(Duration::from_secs(3));
+    b.engine.send(Control::CutStream);
+    displays::wait("the host noticing", || log_of(&a).matches("picture stream dropped").count() >= 2);
+    let before = [displays::pictures_on(&viewer.seen, 0), displays::pictures_on(&viewer.seen, 1)];
+    displays::wait("pictures again on both", || {
+        displays::pictures_on(&viewer.seen, 0) > before[0] + 5 && displays::pictures_on(&viewer.seen, 1) > before[1] + 5
+    });
+    assert_eq!(host.seen.lock().unwrap().wants.len(), 2);
+    let (on_first, on_second) = (displays::sources_on(&viewer.seen, 0), displays::sources_on(&viewer.seen, 1));
+    assert!(on_first.len() == 1 && on_second.len() == 1 && on_first != on_second, "{on_first:?} {on_second:?}");
+    let seen = viewer.seen.lock().unwrap();
+    assert_eq!(seen.shown.len(), 2, "each stream found its own window again");
+    assert!(seen.closed.is_empty());
+}
+
+#[test]
+fn lining_up_with_two_lent_screens_names_each_one() {
+    let (mut a, _b, host, _viewer, b_id) = lend_screens(macbook_and_two_monitors(), &[1, 2]);
+    let a_id = a.id();
+    a.engine.send(Control::LineUp(true));
+    let status = a.until("lining up", |s| s.lining_up && s.coloured.len() == 4);
+    for display in [0, 1, 2] {
+        assert!(status.coloured.iter().any(|c| c.id == b_id && c.display == display), "{:?}", status.coloured);
+    }
+    assert!(status.coloured.iter().any(|c| c.id == a_id && c.display == 0));
+    displays::wait("guides on the PC", || host.seen.lock().unwrap().guides.last().is_some_and(|g| g.len() == 3));
+    let seen = host.seen.lock().unwrap();
+    let mut titles: Vec<String> = seen.guides.last().unwrap().iter().map(|g| g.guide.title.clone()).collect();
+    titles.sort();
+    assert!(
+        titles.iter().any(|t| t.ends_with("'s screen 2")) && titles.iter().any(|t| t.ends_with("'s screen 3")),
+        "{titles:?}"
+    );
 }

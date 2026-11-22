@@ -176,16 +176,16 @@ impl Core {
                         next = next.wrapping_add(1);
                         let display = u8::try_from(index).unwrap_or(u8::MAX);
                         let hosted = self.extended.iter().find(|(_, e)| e.rect.is_some_and(|r| extend::same(&r, rect)));
-                        if let Some((peer, entry)) = hosted {
-                            let lender = self.who(*peer);
+                        if let Some((&(peer, lent), _)) = hosted {
+                            let screen = self.screen_name(peer, lent);
                             list.push(Screen {
                                 display,
                                 colour,
-                                title: format!("{lender}'s screen"),
+                                title: screen.clone(),
                                 detail: format!("Extended display of {my_name} · {}", size_words(rect)),
-                                label: format!("{lender}'s screen"),
+                                label: screen,
                             });
-                            coloured.push(Coloured { id: hex(peer), display: entry.display, colour });
+                            coloured.push(Coloured { id: hex(&peer), display: lent, colour });
                             continue;
                         }
                         let place = real.iter().position(|r| r == rect).unwrap_or(index);
@@ -211,8 +211,12 @@ impl Core {
                 Some(peer) => {
                     let name = self.who(*peer);
                     let theirs = self.peers.get(peer).map(|p| p.displays.clone()).unwrap_or_default();
-                    let lent = self.extended.get(peer).filter(|e| e.rect.is_some()).map(|e| usize::from(e.display));
-                    let indices: Vec<usize> = (0..theirs.len()).filter(|i| Some(*i) != lent).collect();
+                    let lent = |index: usize| {
+                        self.extended
+                            .get(&(*peer, u8::try_from(index).unwrap_or(u8::MAX)))
+                            .is_some_and(|e| e.rect.is_some())
+                    };
+                    let indices: Vec<usize> = (0..theirs.len()).filter(|i| !lent(*i)).collect();
                     for (place, rect) in indices.iter().zip(&computer.displays) {
                         let colour = next;
                         next = next.wrapping_add(1);

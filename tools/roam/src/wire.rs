@@ -81,6 +81,9 @@ pub struct Beacon {
     pub udp_pictures: bool,
     /// Shows line-up guides over its screens when told (`Message::Guide`).
     pub aligns: bool,
+    /// Lends several of its screens at once, telling their picture streams apart by the stream
+    /// number's top byte (`display::stream::number`) and their pointers by `Pointer::display`.
+    pub lends_many: bool,
     pub ppu: f32,
     pub displays: Vec<Rect>,
     pub name: String,
@@ -169,7 +172,8 @@ impl Packet {
                     | (u8::from(beacon.draws_pointer) << 3)
                     | (u8::from(beacon.fast_pointer) << 4)
                     | (u8::from(beacon.udp_pictures) << 5)
-                    | (u8::from(beacon.aligns) << 6));
+                    | (u8::from(beacon.aligns) << 6)
+                    | (u8::from(beacon.lends_many) << 7));
                 out.f32(beacon.ppu);
                 let displays = &beacon.displays[..beacon.displays.len().min(16)];
                 out.u8(displays.len() as u8);
@@ -249,6 +253,7 @@ impl Packet {
                     fast_pointer: flags & 16 != 0,
                     udp_pictures: flags & 32 != 0,
                     aligns: flags & 64 != 0,
+                    lends_many: flags & 128 != 0,
                     ppu,
                     displays,
                     name,
@@ -584,6 +589,8 @@ pub struct Pointer {
     pub seq: u32,
     pub at: [i32; 2],
     pub visible: bool,
+    /// Which of the lending computer's screens it's on: `None` from a host that lends only one.
+    pub display: Option<u8>,
 }
 
 /// The inside of a sealed packet.
@@ -606,7 +613,7 @@ pub struct Body {
 /// Marks the pointer's news after a body's messages.
 const POINTER_NEWS: u8 = 1;
 /// The bytes the pointer's news takes.
-pub const POINTER_SIZE: usize = 14;
+pub const POINTER_SIZE: usize = 15;
 
 impl Body {
     pub fn encode(&self) -> Vec<u8> {
@@ -636,6 +643,10 @@ impl Body {
             out.extend_from_slice(&pointer.at[0].to_le_bytes());
             out.extend_from_slice(&pointer.at[1].to_le_bytes());
             out.push(u8::from(pointer.visible));
+            // Last, where an older version stops reading.
+            if let Some(display) = pointer.display {
+                out.push(display);
+            }
         }
         out
     }
@@ -661,7 +672,8 @@ impl Body {
             Some(POINTER_NEWS) => (|| {
                 let seq = input.u32()?;
                 let at = [input.u32()? as i32, input.u32()? as i32];
-                Some(Pointer { seq, at, visible: input.u8()? != 0 })
+                let visible = input.u8()? != 0;
+                Some(Pointer { seq, at, visible, display: input.u8() })
             })(),
             _ => None,
         };
@@ -765,6 +777,7 @@ mod tests {
                 fast_pointer: true,
                 udp_pictures: true,
                 aligns: true,
+                lends_many: true,
                 ppu: 1.5,
                 displays: vec![Rect::new(-1920.0, 0.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
                 name: "Desk PC".into(),
@@ -827,12 +840,20 @@ mod tests {
                 (20, Message::Guided { serial: 7, displays: vec![0, 1] }),
                 (21, Message::Marks(vec![Mark { display: 1, edge: Edge::Bottom, along: 1.0, arrives: true }])),
             ],
-            pointer: Some(Pointer { seq: 3, at: [-4, 1080], visible: true }),
+            pointer: Some(Pointer { seq: 3, at: [-4, 1080], visible: true, display: Some(1) }),
         };
         assert_eq!(Body::decode(&body.encode()), Some(body.clone()));
         // A version that knows no pointer news still reads the rest.
         let bytes = body.encode();
         assert_eq!(bytes.len(), Body { pointer: None, ..body.clone() }.encode().len() + POINTER_SIZE);
+        // News from a host that lends one screen only says no screen, and reads the same.
+        let older = Body { pointer: Some(Pointer { display: None, ..body.pointer.unwrap() }), ..body.clone() };
+        assert_eq!(Body::decode(&older.encode()), Some(older.clone()));
+        assert_eq!(older.encode().len(), bytes.len() - 1);
+        // A version that knows no screen in the pointer's news reads the rest of it as before.
+        let mut seen = bytes.clone();
+        seen.pop();
+        assert_eq!(Body::decode(&seen).and_then(|b| b.pointer).map(|p| p.display), Some(None));
     }
 
     #[test]
@@ -857,6 +878,7 @@ mod tests {
             fast_pointer: false,
             udp_pictures: false,
             aligns: false,
+            lends_many: false,
             ppu: 1.0,
             displays: vec![],
             name: "é".repeat(40),

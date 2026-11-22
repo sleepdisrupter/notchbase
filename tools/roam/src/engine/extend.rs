@@ -132,6 +132,8 @@ pub(super) struct Lending {
     pub up: Arc<Mutex<Option<Sender<Up>>>>,
     /// When the session went quiet, while the window waits for the host to come back.
     pub held_since: Option<u64>,
+    /// Where the session's packets last put the host's pointer on it.
+    pub pointer: Option<display::PointerAt>,
 }
 
 /// A lent screen's window, and the size of the pictures it was made for.
@@ -150,8 +152,8 @@ pub(super) enum ExtendEvent {
     Remote { peer: Id, serial: u32, remote: Remote },
     /// The host's side is over, with why.
     Ended { peer: Id, serial: u32, why: String },
-    /// A stream is coming in for `session`: is a screen lent for it?
-    Stream { session: u32, answer: Sender<Option<Grant>> },
+    /// A stream is coming in for `session`, numbered `stream`: is a screen lent for it?
+    Stream { session: u32, stream: u32, answer: Sender<Option<Grant>> },
     /// The lending side is over.
     LendEnded { serial: u32, why: String },
     /// A line for the log from the host's side.
@@ -177,6 +179,9 @@ pub struct ExtendedView {
     pub id: String,
     pub name: String,
     pub display: u8,
+    /// What the screen is called: "MacBook's screen 2", or "MacBook's screen" when it's the
+    /// computer's only one.
+    pub screen: String,
     /// What's happening, when it isn't up yet: "Installing the display driver".
     pub working: Option<String>,
     pub running: bool,
@@ -209,12 +214,12 @@ impl Core {
         Computer::new("me", all, ppu, [at[0] - shift[0], at[1] - shift[1]])
     }
 
-    /// A computer on the desk, without the screen it lends here. Its other screens stay where
+    /// A computer on the desk, without the screens it lends here. Its other screens stay where
     /// they are on the desk, so the cursor reaches them the way it always did. Only where they'd
-    /// sit on this computer's screens (the virtual display among them), or face none of them,
-    /// do they go beside the virtual display instead: that is as many points as the system makes
-    /// it, and where the system puts it, which needn't be the size or place the lent screen has
-    /// on the desk. `None` when it lends every screen it has.
+    /// sit on this computer's screens (the virtual displays among them), or face none of them,
+    /// do they go beside the virtual display of the lent screen they sat nearest instead: that is
+    /// as many points as the system makes it, and where the system puts it, which needn't be the
+    /// size or place the lent screen has on the desk. `None` when it lends every screen it has.
     pub(super) fn peer_on_desk(
         &self,
         id: Id,
@@ -224,26 +229,39 @@ impl Core {
         at: [f64; 2],
         me: &Computer,
     ) -> Option<Computer> {
-        let Some((lent, rect)) = self.extended.get(&id).and_then(|e| Some((usize::from(e.display), e.rect?))) else {
+        let lent: Vec<(usize, Rect)> = self
+            .extended
+            .iter()
+            .filter(|((peer, display), _)| *peer == id && usize::from(*display) < displays.len())
+            .filter_map(|((_, display), e)| Some((usize::from(*display), e.rect?)))
+            .collect();
+        if lent.is_empty() {
             return Some(Computer::new(name, displays, ppu, at));
-        };
+        }
         let whole = Computer::new(name.clone(), displays.clone(), ppu, at);
         let desk = whole.desk_displays();
-        let lent_on_desk = *desk.get(lent)?;
-        let left: Vec<Rect> = displays.iter().enumerate().filter(|(i, _)| *i != lent).map(|(_, d)| *d).collect();
+        let is_lent = |index: usize| lent.iter().any(|(lent, _)| *lent == index);
+        let left: Vec<Rect> = displays.iter().enumerate().filter(|(i, _)| !is_lent(*i)).map(|(_, d)| *d).collect();
         if left.is_empty() {
             return None;
         }
-        let rest_on_desk: Vec<Rect> = desk.iter().enumerate().filter(|(i, _)| *i != lent).map(|(_, d)| *d).collect();
+        let rest_on_desk: Vec<Rect> = desk.iter().enumerate().filter(|(i, _)| !is_lent(*i)).map(|(_, d)| *d).collect();
         let rest = layout::bounds(&rest_on_desk);
-        let [vx, vy] = me.to_desk([rect.x, rect.y]);
-        let virtual_on_desk = Rect::new(vx, vy, rect.w / me.ppu, rect.h / me.ppu);
         let mine = me.desk_displays();
         let shift = shift(&left, &displays, ppu);
         let stays = [at[0] + shift[0], at[1] + shift[1]];
         if rest_on_desk.iter().all(|d| !covers_any(d, &mine)) && rest_on_desk.iter().any(|d| faces_any(d, &mine)) {
             return Some(Computer::new(name, left, ppu, stays));
         }
+        let virtual_on_desk = |rect: Rect| {
+            let [vx, vy] = me.to_desk([rect.x, rect.y]);
+            Rect::new(vx, vy, rect.w / me.ppu, rect.h / me.ppu)
+        };
+        // They follow the lent screen they sat nearest, as it becomes its virtual display.
+        let (lent_on_desk, virtual_on_desk) = lent
+            .iter()
+            .filter_map(|(index, rect)| Some((*desk.get(*index)?, virtual_on_desk(*rect))))
+            .min_by(|a, b| gap(&a.0, &rest).total_cmp(&gap(&b.0, &rest)))?;
         let [dx, dy] = follow(lent_on_desk, rest, virtual_on_desk);
         let moved = Rect::new(rest.x + dx, rest.y + dy, rest.w, rest.h);
         // The system puts the virtual display against this computer's others, which can land
@@ -274,11 +292,36 @@ impl Core {
         self.extend_serial
     }
 
+    /// How a screen of `peer` is called: "MacBook's screen 2", or "MacBook's screen" when it
+    /// has one.
+    pub(super) fn screen_name(&self, peer: Id, display: u8) -> String {
+        let several = self.peers.get(&peer).is_some_and(|p| p.displays.len() > 1);
+        let who = self.who(peer);
+        if several { format!("{who}'s screen {}", u32::from(display) + 1) } else { format!("{who}'s screen") }
+    }
+
+    /// Which screen a pointer's news for `peer` names: none for a computer that lends only one,
+    /// which doesn't know the byte.
+    fn pointer_display(&self, peer: Id, display: u8) -> Option<u8> {
+        self.peers.get(&peer).is_some_and(|p| p.lends_many).then_some(display)
+    }
+
     // ------------------------------------------------------------ hosting another's screen
 
-    /// The person asked for `display` of `peer` as an extended display of this computer.
+    /// The person asked for `display` of `peer` as an extended display of this computer. Any
+    /// number of a computer's screens can be at once; one that lends only one at a time gives
+    /// up the screen it lent before.
     pub(super) fn extend(&mut self, peer: Id, display: u8) {
-        self.unextend(peer, "Replaced by another screen");
+        let many = self.peers.get(&peer).is_some_and(|p| p.lends_many);
+        let before: Vec<u8> = self
+            .extended
+            .keys()
+            .filter(|(id, other)| *id == peer && (*other == display || !many))
+            .map(|(_, other)| *other)
+            .collect();
+        for other in before {
+            self.unextend(peer, other, "Replaced by another screen");
+        }
         let serial = self.next_serial();
         let now = self.now();
         let mut entry = Extended {
@@ -309,27 +352,39 @@ impl Core {
                 }
             }
         }
-        self.extended.insert(peer, entry);
+        self.extended.insert((peer, display), entry);
         self.flush(now, true);
     }
 
-    /// Ends the extended display of `peer`'s screen, telling it why.
-    pub(super) fn unextend(&mut self, peer: Id, why: &str) {
-        let Some(entry) = self.extended.remove(&peer) else { return };
+    /// Ends the extended display of `peer`'s screen `display`, telling it why.
+    pub(super) fn unextend(&mut self, peer: Id, display: u8, why: &str) {
+        let Some(entry) = self.extended.remove(&(peer, display)) else { return };
         if let Some(feed) = &entry.feed {
             feed.stop();
         }
+        if self.pointer_over.is_some_and(|(over, _)| over == (peer, display)) {
+            self.pointer_over = None;
+        }
         if !matches!(entry.state, State::Failed(_)) {
-            self.note(&format!("extended display of {} ends: {why}", self.who(peer)));
+            self.note(&format!("extended display of {} ends: {why}", self.screen_name(peer, display)));
             if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
-                link.queue(Message::Unlend { display: entry.display, why: why.to_owned() });
+                link.queue(Message::Unlend { display, why: why.to_owned() });
             }
+        }
+    }
+
+    /// Ends every extended display of `peer`'s screens.
+    pub(super) fn unextend_all(&mut self, peer: Id, why: &str) {
+        let displays: Vec<u8> = self.extended.keys().filter(|(id, _)| *id == peer).map(|(_, d)| *d).collect();
+        for display in displays {
+            self.unextend(peer, display, why);
         }
     }
 
     /// The other computer said yes: make the display and start sending it.
     pub(super) fn lent(&mut self, peer: Id, display: u8, pixels: [u16; 2], hz: u8, scale: f32) {
-        let Some(entry) = self.extended.get(&peer).filter(|e| e.display == display) else { return };
+        let key = (peer, display);
+        let Some(entry) = self.extended.get(&key) else { return };
         let held = entry.held_since.is_some() && entry.route.is_some();
         if !held && entry.state != State::Asking {
             return;
@@ -342,6 +397,7 @@ impl Core {
         };
         let at = self.virtual_at(peer, display).unwrap_or_default();
         let name = self.who(peer);
+        let screen = self.screen_name(peer, display);
         // The other computer draws the pointer itself, where it can: it then moves without
         // waiting for the pictures.
         let pointer_apart = self.peers.get(&peer).is_some_and(|p| p.draws_pointer)
@@ -356,7 +412,7 @@ impl Core {
         if held {
             // Back after the network dropped: the display is still up, only the way to it is new.
             self.note(&format!("{name} lends its display {display} again: the extended display carries on"));
-            if let Some(entry) = self.extended.get_mut(&peer) {
+            if let Some(entry) = self.extended.get_mut(&key) {
                 entry.held_since = None;
                 entry.state = State::Working("Reconnecting".into());
                 if let Some(routes) = &entry.route {
@@ -369,10 +425,15 @@ impl Core {
         let (reroute, routes) = mpsc::channel();
         let (place, placed) = mpsc::channel();
         let install = self.ability == Ability::NeedsDriver;
+        // The system calls the virtual display by the screen it stands for.
+        let several = self.peers.get(&peer).is_some_and(|p| p.displays.len() > 1);
+        let system_name = if several { format!("{name} {}", u32::from(display) + 1) } else { name.clone() };
         let job = HostJob {
             peer,
             serial,
-            want: Want { name: name.clone(), panel, at, pointer_apart },
+            display,
+            want: Want { name: system_name, panel, at, pointer_apart },
+            screen,
             route,
             routes,
             feed: feed.clone(),
@@ -387,7 +448,7 @@ impl Core {
             panel.pixels[0], panel.pixels[1], panel.hz, panel.scale, at[0], at[1]
         ));
         let started = std::thread::Builder::new().name("roam-host".into()).spawn(move || host(job));
-        let Some(entry) = self.extended.get_mut(&peer) else { return };
+        let Some(entry) = self.extended.get_mut(&key) else { return };
         if started.is_err() {
             entry.state = State::Failed("Couldn't start the display".into());
             return;
@@ -402,10 +463,10 @@ impl Core {
 
     /// The desk changed: move each virtual display to where its screen now sits.
     pub(super) fn place_extended(&mut self) {
-        let wanted: Vec<(Id, u8)> = self.extended.iter().map(|(id, e)| (*id, e.display)).collect();
+        let wanted: Vec<(Id, u8)> = self.extended.keys().copied().collect();
         for (peer, display) in wanted {
             let Some(at) = self.virtual_at(peer, display) else { continue };
-            if let Some(place) = self.extended.get(&peer).and_then(|e| e.place.as_ref()) {
+            if let Some(place) = self.extended.get(&(peer, display)).and_then(|e| e.place.as_ref()) {
                 let _ = place.send(at);
             }
         }
@@ -415,19 +476,19 @@ impl Core {
     /// come back asks again once it has, and gives up when it doesn't.
     pub(super) fn check_extended(&mut self, now: u64) {
         let (mut ask, mut gone) = (Vec::new(), Vec::new());
-        for (id, entry) in &mut self.extended {
+        for (&(id, display), entry) in &mut self.extended {
             if entry.state == State::Asking && now.saturating_sub(entry.asked_at) > ASK_FOR {
-                let name = self.peers.get(id).map_or_else(|| "The other computer".into(), |p| p.name.clone());
+                let name = self.peers.get(&id).map_or_else(|| "The other computer".into(), |p| p.name.clone());
                 entry.state = State::Failed(format!("{name} didn't answer"));
             }
             let Some(since) = entry.held_since else { continue };
             if now.saturating_sub(since) > HOLD_FOR {
-                gone.push(*id);
+                gone.push((id, display));
             } else if now.saturating_sub(entry.asked_at) > ASK_FOR
-                && self.sessions.get(id).is_some_and(|s| s.side == Side::Controller && s.is_live())
+                && self.sessions.get(&id).is_some_and(|s| s.side == Side::Controller && s.is_live())
             {
                 entry.asked_at = now;
-                ask.push((*id, entry.display));
+                ask.push((id, display));
             }
         }
         for (id, display) in ask {
@@ -436,21 +497,25 @@ impl Core {
                 link.queue(Message::Lend { display });
             }
         }
-        for id in gone {
+        for (id, display) in gone {
             let why = format!("{} didn't come back", self.who(id));
-            self.unextend(id, &why);
+            self.unextend(id, display, &why);
         }
-        if self.lending.as_ref().and_then(|l| l.held_since).is_some_and(|since| now.saturating_sub(since) > HOLD_FOR) {
-            if let Some(to) = self.lending.as_ref().map(|l| l.to) {
-                self.note(&format!("{} didn't come back for its extended display", self.who(to)));
-            }
-            self.stop_lending(None);
+        let stale: Vec<(Id, u8)> = self
+            .lending
+            .iter()
+            .filter(|l| l.held_since.is_some_and(|since| now.saturating_sub(since) > HOLD_FOR))
+            .map(|l| (l.to, l.display))
+            .collect();
+        for (to, display) in stale {
+            self.note(&format!("{} didn't come back for its extended display", self.who(to)));
+            self.stop_lending(Some(display), None);
         }
     }
 
-    // ------------------------------------------------------------ lending this computer's screen
+    // ------------------------------------------------------------ lending this computer's screens
 
-    /// The controller asks for one of this computer's screens.
+    /// The controller asks for one of this computer's screens. It may have others already.
     pub(super) fn lend(&mut self, to: Id, display: u8) {
         let (real, _) = self.real_screens();
         let rect = real.get(usize::from(display)).copied();
@@ -468,7 +533,7 @@ impl Core {
             return;
         };
         if let Some(lending) =
-            self.lending.as_mut().filter(|l| l.to == to && l.display == display && same(&l.rect, &rect))
+            self.lending.iter_mut().find(|l| l.to == to && l.display == display && same(&l.rect, &rect))
         {
             // The host is back after the network dropped: the same window shows its pictures.
             lending.session = session;
@@ -489,7 +554,18 @@ impl Core {
     }
 
     fn lend_anew(&mut self, to: Id, display: u8, rect: Rect, panel: Panel, session: u32) {
-        self.stop_lending(None);
+        // What this screen showed before, and whatever was lent to another computer (only one
+        // controls this one) or, for a host that takes one screen at a time, its other screen.
+        let many = self.peers.get(&to).is_some_and(|p| p.lends_many);
+        let before: Vec<u8> = self
+            .lending
+            .iter()
+            .filter(|l| l.to != to || l.display == display || !many || same(&l.rect, &rect))
+            .map(|l| l.display)
+            .collect();
+        for other in before {
+            self.stop_lending(Some(other), None);
+        }
         let serial = self.next_serial();
         self.note(&format!(
             "{} asked for display {display} ({}x{} pixels at {} Hz) as its extended display",
@@ -498,7 +574,7 @@ impl Core {
             panel.pixels[1],
             panel.hz
         ));
-        self.lending = Some(Lending {
+        self.lending.push(Lending {
             serial,
             to,
             display,
@@ -508,24 +584,31 @@ impl Core {
             shown: Arc::default(),
             up: Arc::default(),
             held_since: None,
+            pointer: None,
         });
     }
 
-    /// Stops showing another computer's picture, telling it why when `why` is given.
-    pub(super) fn stop_lending(&mut self, why: Option<&str>) {
-        let Some(lending) = self.lending.take() else { return };
-        if let Some(up) = lending.up.lock().ok().and_then(|mut up| up.take()) {
-            let _ = up.send(Up::Bye);
-        }
-        if let Some(stream) = lending.stream.lock().ok().and_then(|mut s| s.take()) {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-        // Gives the screen back.
-        drop(lending.shown.lock().ok().and_then(|mut shown| shown.take()));
-        if let Some(why) = why {
-            self.note(&format!("no longer lending display {} to {}: {why}", lending.display, self.who(lending.to)));
-            if let Some(link) = self.sessions.get_mut(&lending.to).and_then(Session::live) {
-                link.queue(Message::Unlend { display: lending.display, why: why.to_owned() });
+    /// Stops showing another computer's picture on `display` (every lent screen when `None`),
+    /// telling it why when `why` is given.
+    pub(super) fn stop_lending(&mut self, display: Option<u8>, why: Option<&str>) {
+        let (stopped, kept) = std::mem::take(&mut self.lending)
+            .into_iter()
+            .partition::<Vec<Lending>, _>(|l| display.is_none_or(|d| d == l.display));
+        self.lending = kept;
+        for lending in stopped {
+            if let Some(up) = lending.up.lock().ok().and_then(|mut up| up.take()) {
+                let _ = up.send(Up::Bye);
+            }
+            if let Some(stream) = lending.stream.lock().ok().and_then(|mut s| s.take()) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            // Gives the screen back.
+            drop(lending.shown.lock().ok().and_then(|mut shown| shown.take()));
+            if let Some(why) = why {
+                self.note(&format!("no longer lending display {} to {}: {why}", lending.display, self.who(lending.to)));
+                if let Some(link) = self.sessions.get_mut(&lending.to).and_then(Session::live) {
+                    link.queue(Message::Unlend { display: lending.display, why: why.to_owned() });
+                }
             }
         }
     }
@@ -535,87 +618,125 @@ impl Core {
     pub(super) fn hold_displays(&mut self, id: Id) {
         let now = self.now();
         let name = self.who(id);
-        if let Some(entry) = self.extended.get_mut(&id).filter(|e| e.route.is_some() && e.held_since.is_none())
-            && matches!(entry.state, State::Running | State::Working(_))
-        {
-            entry.held_since = Some(now);
-            // Ask again as soon as the session is back.
-            entry.asked_at = 0;
-            entry.state = State::Working(format!("Waiting for {name} to come back"));
-            self.note(&format!("the extended display of {name} stays up while {name} comes back"));
+        let mut held = 0;
+        for (_, entry) in self.extended.iter_mut().filter(|((peer, _), _)| *peer == id) {
+            if entry.route.is_some()
+                && entry.held_since.is_none()
+                && matches!(entry.state, State::Running | State::Working(_))
+            {
+                entry.held_since = Some(now);
+                // Ask again as soon as the session is back.
+                entry.asked_at = 0;
+                entry.state = State::Working(format!("Waiting for {name} to come back"));
+                held += 1;
+            }
         }
-        if let Some(lending) = self.lending.as_mut().filter(|l| l.to == id && l.held_since.is_none()) {
+        match held {
+            0 => {}
+            1 => self.note(&format!("the extended display of {name} stays up while {name} comes back")),
+            _ => self.note(&format!("the {held} extended displays of {name} stay up while {name} comes back")),
+        }
+        let mut lent = 0;
+        for lending in self.lending.iter_mut().filter(|l| l.to == id && l.held_since.is_none()) {
             lending.held_since = Some(now);
-            self.note(&format!("the screen lent to {name} stays up while {name} comes back"));
+            lent += 1;
+        }
+        match lent {
+            0 => {}
+            1 => self.note(&format!("the screen lent to {name} stays up while {name} comes back")),
+            _ => self.note(&format!("the {lent} screens lent to {name} stay up while {name} comes back")),
         }
     }
 
     /// A computer in a session with this one stopped: whatever was lent between them ends,
     /// unless it holds on for the session to come back.
     pub(super) fn session_ended_displays(&mut self, id: Id) {
-        if self.extended.get(&id).is_none_or(|e| e.held_since.is_none())
-            && let Some(entry) = self.extended.remove(&id)
-            && let Some(feed) = entry.feed
-        {
-            feed.stop();
+        let ended: Vec<(Id, u8)> = self
+            .extended
+            .iter()
+            .filter(|((peer, _), e)| *peer == id && e.held_since.is_none())
+            .map(|(key, _)| *key)
+            .collect();
+        for key in ended {
+            if let Some(feed) = self.extended.remove(&key).and_then(|e| e.feed) {
+                feed.stop();
+            }
         }
-        if self.lending.as_ref().is_some_and(|l| l.to == id && l.held_since.is_none()) {
-            self.stop_lending(None);
+        if self.pointer_over.is_some_and(|((peer, _), _)| peer == id && !self.extended.keys().any(|k| k.0 == id)) {
+            self.pointer_over = None;
+        }
+        let ended: Vec<u8> =
+            self.lending.iter().filter(|l| l.to == id && l.held_since.is_none()).map(|l| l.display).collect();
+        for display in ended {
+            self.stop_lending(Some(display), None);
         }
     }
 
-    /// Tests: cuts the picture stream of the lent screen, as a network hiccup does.
+    /// Tests: cuts the picture streams of the lent screens, as a network hiccup does.
     #[cfg(test)]
     pub(super) fn cut_lent_stream(&mut self) {
-        if let Some(stream) = self.lending.as_ref().and_then(|l| l.stream.lock().ok()?.take()) {
-            let _ = stream.shutdown(Shutdown::Both);
+        for lending in &self.lending {
+            if let Some(stream) = lending.stream.lock().ok().and_then(|mut s| s.take()) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
         }
     }
 
     pub(super) fn shut_down_displays(&mut self) {
-        let hosted: Vec<Id> = self.extended.keys().copied().collect();
-        for id in hosted {
-            self.unextend(id, "Roam stopped");
+        let hosted: Vec<(Id, u8)> = self.extended.keys().copied().collect();
+        for (id, display) in hosted {
+            self.unextend(id, display, "Roam stopped");
         }
-        self.stop_lending(Some("Roam stopped"));
+        self.stop_lending(None, Some("Roam stopped"));
     }
 
     // ------------------------------------------------------------ word from the threads
 
+    /// The extended display a thread of the host works for.
+    fn by_serial(&self, peer: Id, serial: u32) -> Option<(Id, u8)> {
+        self.extended.iter().find(|((id, _), e)| *id == peer && e.serial == serial).map(|(key, _)| *key)
+    }
+
     pub(super) fn extend_event(&mut self, event: ExtendEvent) {
         match event {
             ExtendEvent::Working { peer, serial, words } => {
-                if let Some(entry) = self.extended.get_mut(&peer).filter(|e| e.serial == serial) {
+                let Some(key) = self.by_serial(peer, serial) else { return };
+                if let Some(entry) = self.extended.get_mut(&key) {
                     entry.state = State::Working(words);
                 }
             }
             ExtendEvent::At { peer, serial, rect } => {
-                let Some(entry) = self.extended.get_mut(&peer).filter(|e| e.serial == serial) else { return };
+                let Some(key) = self.by_serial(peer, serial) else { return };
+                let Some(entry) = self.extended.get_mut(&key) else { return };
                 let first = entry.state != State::Running;
                 entry.state = State::Running;
                 entry.rect = rect;
                 let words = rect
                     .map_or_else(|| "somewhere".into(), |r| format!("({:.0}, {:.0}) {:.0}x{:.0}", r.x, r.y, r.w, r.h));
                 if first {
-                    self.note(&format!("extended display of {} is up at {words}", self.who(peer)));
+                    self.note(&format!("extended display of {} is up at {words}", self.screen_name(key.0, key.1)));
                 }
                 // The system lists it among this computer's displays on its next look.
                 self.screens_at = 0;
             }
             ExtendEvent::Remote { peer, serial, remote } => {
-                let Some(rect) = self.extended.get(&peer).filter(|e| e.serial == serial).and_then(|e| e.rect) else {
+                let Some(rect) = self.by_serial(peer, serial).and_then(|key| self.extended.get(&key)?.rect) else {
                     return;
                 };
                 self.remote(rect, remote);
             }
             ExtendEvent::Ended { peer, serial, why } => {
-                let Some(entry) = self.extended.get(&peer).filter(|e| e.serial == serial) else { return };
+                let Some(key) = self.by_serial(peer, serial) else { return };
+                let Some(entry) = self.extended.get(&key) else { return };
                 let running = entry.state == State::Running;
                 let display = entry.display;
-                self.note(&format!("extended display of {} ended: {why}", self.who(peer)));
+                self.note(&format!("extended display of {} ended: {why}", self.screen_name(peer, display)));
                 if running {
-                    self.extended.remove(&peer);
-                } else if let Some(entry) = self.extended.get_mut(&peer) {
+                    self.extended.remove(&key);
+                    if self.pointer_over.is_some_and(|(over, _)| over == key) {
+                        self.pointer_over = None;
+                    }
+                } else if let Some(entry) = self.extended.get_mut(&key) {
                     entry.state = State::Failed(why.clone());
                     entry.feed = None;
                     entry.place = None;
@@ -625,79 +746,109 @@ impl Core {
                 }
                 self.screens_at = 0;
             }
-            ExtendEvent::Stream { session, answer } => {
-                let who = self.lending.as_ref().map(|l| self.who(l.to)).unwrap_or_default();
-                let grant = self.lending.as_ref().filter(|l| l.session == session).and_then(|lending| {
-                    let session = self.sessions.get_mut(&lending.to)?;
-                    let keys = stream::keys(session.live()?.bulk_receive());
-                    Some(Grant {
-                        keys,
-                        rect: lending.rect,
-                        serial: lending.serial,
-                        displays: self.displays.clone(),
-                        stream: lending.stream.clone(),
-                        shown: lending.shown.clone(),
-                        up: lending.up.clone(),
-                        who,
-                    })
+            ExtendEvent::Stream { session, stream: number, answer } => {
+                // A host that lends several says which screen in the stream's number; an older
+                // one has only the one.
+                let names = |l: &Lending| {
+                    !self.peers.get(&l.to).is_some_and(|p| p.lends_many)
+                        || stream::display_of(number).is_none_or(|d| d == l.display)
+                };
+                let found = self.lending.iter().position(|l| l.session == session && names(l));
+                let grant = found.and_then(|index| {
+                    let who = self.screen_lent_words(&self.lending[index]);
+                    let lending = &self.lending[index];
+                    let (to, rect, serial) = (lending.to, lending.rect, lending.serial);
+                    let (stream, shown, up) = (lending.stream.clone(), lending.shown.clone(), lending.up.clone());
+                    let keys = stream::keys(self.sessions.get_mut(&to)?.live()?.bulk_receive());
+                    Some(Grant { keys, rect, serial, displays: self.displays.clone(), stream, shown, up, who })
                 });
                 let _ = answer.send(grant);
             }
             ExtendEvent::LendEnded { serial, why } => {
-                if self.lending.as_ref().is_some_and(|l| l.serial == serial) {
-                    self.stop_lending(Some(&why));
+                if let Some(display) = self.lending.iter().find(|l| l.serial == serial).map(|l| l.display) {
+                    self.stop_lending(Some(display), Some(&why));
                 }
             }
             ExtendEvent::Note { text } => self.note(&text),
         }
     }
 
-    /// The lending computer's own mouse or keyboard, over its lent screen: it works this
-    /// computer's cursor there.
+    /// Who a lent screen's pictures come from, for the log: "PC", or "PC (display 1)" when this
+    /// computer lends it several.
+    fn screen_lent_words(&self, lending: &Lending) -> String {
+        let who = self.who(lending.to);
+        if self.lending.len() > 1 { format!("{who} (display {})", lending.display) } else { who }
+    }
+
     /// This computer's cursor is at `at` (`None`: it left for another computer). Over a virtual
     /// display whose lending computer draws the pointer, that computer hears where the pointer
     /// image goes in the session's packets, straight from the mouse hook: ahead of the
     /// pictures, without waiting for the screen to be captured, and newest-wins like any
-    /// cursor move.
+    /// cursor move. Going from one of its lent screens to another, the news for the new one
+    /// hides it on the one before.
     pub(super) fn quick_pointer(&mut self, at: Option<[f64; 2]>) {
         let mut over = None;
         if let Some(at) = at {
-            for (peer, entry) in &self.extended {
+            for (key, entry) in &self.extended {
                 let (Some(rect), Some(feed)) = (entry.rect, &entry.feed) else { continue };
-                if !rect.contains(at) || !self.peers.get(peer).is_some_and(|p| p.fast_pointer) {
+                if !rect.contains(at) || !self.peers.get(&key.0).is_some_and(|p| p.fast_pointer) {
                     continue;
                 }
                 let Some(cursor) = feed.cursor() else { continue };
                 feed.go_quick();
-                over = Some((*peer, pointer_image_at(rect, at, cursor), cursor.visible));
+                over = Some((*key, pointer_image_at(rect, at, cursor), cursor.visible));
                 break;
             }
         }
         let was = self.pointer_over;
         // It left the display it was over: hide it there.
-        if let Some((peer, last)) = was
-            && over.is_none_or(|(now_over, ..)| now_over != peer)
-            && let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live)
+        if let Some(((peer, display), last)) = was
+            && over.is_none_or(|(now_over, ..)| now_over != (peer, display))
         {
-            link.pointer = Some((last, false));
+            let named = self.pointer_display(peer, display);
+            if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
+                link.pointer = Some((named, last, false));
+            }
         }
-        self.pointer_over = over.map(|(peer, image, _)| (peer, image));
-        if let Some((peer, image, visible)) = over
-            && was != Some((peer, image))
-            && let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live)
+        self.pointer_over = over.map(|(key, image, _)| (key, image));
+        if let Some(((peer, display), image, visible)) = over
+            && was != Some(((peer, display), image))
         {
-            link.pointer = Some((image, visible));
+            let named = self.pointer_display(peer, display);
+            if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
+                link.pointer = Some((named, image, visible));
+            }
         }
     }
 
-    /// The computer this one lends a screen to says where its pointer is on it.
+    /// The computer this one lends screens to says where its pointer is on one of them. Shown
+    /// on one, it's on none of the others.
     pub(super) fn lent_pointer(&mut self, from: Id, pointer: crate::wire::Pointer) {
-        let Some(lending) = self.lending.as_ref().filter(|l| l.to == from) else { return };
-        if let Some(shown) = lending.shown.lock().ok().as_mut().and_then(|s| s.as_mut()) {
-            shown.showing.pointer(display::PointerAt { at: pointer.at, visible: pointer.visible });
+        let on = match pointer.display {
+            Some(display) => display,
+            None => match self.lending.iter().find(|l| l.to == from) {
+                Some(lending) => lending.display,
+                None => return,
+            },
+        };
+        let at = display::PointerAt { at: pointer.at, visible: pointer.visible };
+        for lending in self.lending.iter_mut().filter(|l| l.to == from) {
+            let news = if lending.display == on {
+                at
+            } else if pointer.visible && lending.pointer.is_some_and(|p| p.visible) {
+                display::PointerAt { visible: false, ..lending.pointer.unwrap_or(at) }
+            } else {
+                continue;
+            };
+            lending.pointer = Some(news);
+            if let Some(shown) = lending.shown.lock().ok().as_mut().and_then(|s| s.as_mut()) {
+                shown.showing.pointer(news);
+            }
         }
     }
 
+    /// The lending computer's own mouse or keyboard, over its lent screen at `rect`: it works
+    /// this computer's cursor there.
     fn remote(&mut self, rect: Rect, remote: Remote) {
         match remote {
             // Off the lent screen: an older lending computer also passes on moves its window
@@ -726,12 +877,13 @@ impl Core {
         let mut views: Vec<ExtendedView> = self
             .extended
             .iter()
-            .map(|(id, entry)| ExtendedView {
-                id: hex(id),
-                name: self.who(*id),
-                display: entry.display,
+            .map(|(&(id, display), entry)| ExtendedView {
+                id: hex(&id),
+                name: self.who(id),
+                display,
+                screen: self.screen_name(id, display),
                 working: match &entry.state {
-                    State::Asking => Some(format!("Asking {}", self.who(*id))),
+                    State::Asking => Some(format!("Asking {}", self.who(id))),
                     State::Working(words) => Some(words.clone()),
                     _ => None,
                 },
@@ -742,13 +894,23 @@ impl Core {
                 },
             })
             .collect();
-        views.sort_by(|a, b| a.name.cmp(&b.name));
+        views.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)).then(a.display.cmp(&b.display)));
         views
     }
 
-    pub(super) fn lending_view(&self) -> Option<LendingView> {
-        self.lending.as_ref().map(|l| LendingView { to: self.who(l.to), display: l.display })
+    pub(super) fn lending_views(&self) -> Vec<LendingView> {
+        let mut views: Vec<LendingView> =
+            self.lending.iter().map(|l| LendingView { to: self.who(l.to), display: l.display }).collect();
+        views.sort_by_key(|v| v.display);
+        views
     }
+}
+
+/// How far apart two rectangles are: nothing when they touch or overlap.
+fn gap(a: &Rect, b: &Rect) -> f64 {
+    let dx = (a.x - b.right()).max(b.x - a.right()).max(0.0);
+    let dy = (a.y - b.bottom()).max(b.y - a.bottom()).max(0.0);
+    dx.hypot(dy)
 }
 
 /// Whether two rectangles are the same display, give or take rounding.
@@ -828,7 +990,11 @@ fn shift(part: &[Rect], all: &[Rect], ppu: f64) -> [f64; 2] {
 struct HostJob {
     peer: Id,
     serial: u32,
+    /// Which of the other computer's screens it is.
+    display: u8,
     want: Want,
+    /// What that screen is called, for the log.
+    screen: String,
     /// The way to the other computer's stream, and newer ones after the session forms again.
     route: Route,
     routes: Receiver<Route>,
@@ -911,6 +1077,14 @@ fn run_host(job: &HostJob) -> Result<String, String> {
         job.displays.install()?;
         job.working("Starting the display");
     }
+    if !job.feed.stopped() && !job.displays.has_room() {
+        // Once, so that any number of screens can be displays later without asking again.
+        job.working("Making room for more screens in the display driver. Say Yes when Windows asks");
+        if let Err(why) = job.displays.make_room() {
+            job.note(format!("the display driver has no more room: {why}"));
+        }
+        job.working("Starting the display");
+    }
     if job.feed.stopped() {
         return Ok("Stopped".into());
     }
@@ -942,7 +1116,10 @@ fn run_host(job: &HostJob) -> Result<String, String> {
                 if lasted {
                     ever = true;
                     down_since = None;
-                    job.note(format!("the extended display's picture stream dropped ({why}): trying again"));
+                    job.note(format!(
+                        "{}: the extended display's picture stream dropped ({why}): trying again",
+                        job.screen
+                    ));
                     job.working("Reconnecting");
                     // The next one starts the picture over.
                     upkeep.was = None;
@@ -1150,8 +1327,9 @@ fn stream_once(job: &HostJob, route: Route, hosted: &mut Box<dyn display::Hosted
         return dropped("Couldn't use the connection".into());
     };
     let mut out = BufWriter::with_capacity(256 * 1024, writer);
-    // A new number for every stream: the same keys never seal two streams' messages alike.
-    let hello = Hello { session: route.session, stream: u32::from_le_bytes(crypto::random::<4>()) };
+    // A new number for every stream: the same keys never seal two streams' messages alike. Its
+    // top byte says which screen the stream is for, to a computer lending several.
+    let hello = Hello { session: route.session, stream: stream::number(job.display, crypto::random::<4>()) };
     let mut sealer = Sealer::new(route.keys.pictures, hello.stream);
     // Pictures made while there was no stream are stale: start from a key picture, and say
     // where the pointer is.
@@ -1317,7 +1495,7 @@ fn pointer_image_at(rect: Rect, at: [f64; 2], cursor: display::Cursor) -> [i32; 
 pub(super) fn view(stream: TcpStream, hello: Hello, events: &Sender<Event>) -> std::io::Result<()> {
     let (answer, granted) = mpsc::channel();
     events
-        .send(Event::Extend(ExtendEvent::Stream { session: hello.session, answer }))
+        .send(Event::Extend(ExtendEvent::Stream { session: hello.session, stream: hello.stream, answer }))
         .map_err(std::io::Error::other)?;
     let Ok(Some(grant)) = granted.recv_timeout(Duration::from_secs(2)) else { return Ok(()) };
     // A still screen still sends a picture a second: hearing nothing for longer, it's gone.

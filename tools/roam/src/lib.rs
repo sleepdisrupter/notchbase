@@ -204,9 +204,11 @@ pub enum Msg {
     Menu(Pointer),
     /// Make that computer's display an extended display of this one.
     Extend(String, u8),
-    /// Give that computer's screen back.
-    Unextend(String),
-    /// Take this computer's screen back from the computer using it as a display.
+    /// Make every one of that computer's screens not already one an extended display.
+    ExtendAll(String),
+    /// Give that computer's screen back (`None`: every one of its screens).
+    Unextend(String, Option<u8>),
+    /// Take this computer's screens back from the computer using them as displays.
     StopLending,
     /// Put the desk back the way it was before the last change.
     Undo,
@@ -490,9 +492,20 @@ impl<B: Backend> Tool for Roam<B> {
                 self.control(Control::Extend { id, display });
                 Command::none()
             }
-            Msg::Unextend(id) => {
+            Msg::ExtendAll(id) => {
                 self.menu = None;
-                self.control(Control::Unextend(id));
+                let count = self.desk.iter().find(|s| s.id == id).map_or(0, |s| s.displays.len());
+                for display in 0..count {
+                    let display = u8::try_from(display).unwrap_or(u8::MAX);
+                    if self.extended(&id, usize::from(display)).is_none_or(|e| e.failed.is_some()) {
+                        self.control(Control::Extend { id: id.clone(), display });
+                    }
+                }
+                Command::none()
+            }
+            Msg::Unextend(id, display) => {
+                self.menu = None;
+                self.control(Control::Unextend { id, display });
                 Command::none()
             }
             Msg::StopLending => {
@@ -568,17 +581,22 @@ impl<B: Backend> Tool for Roam<B> {
                 ("Stop", Msg::Release),
             ));
         }
-        for extended in &self.status.extended {
-            parts.push(extended_view(extended));
-        }
-        if let Some(lending) = &self.status.lending {
+        parts.extend(extended_banners(&self.status.extended));
+        if let Some(first) = self.status.lending.first() {
             let me = self.me().map_or(1, |m| m.displays.len());
-            let which = if me > 1 { format!("screen {}", lending.display + 1) } else { "screen".to_owned() };
+            let numbers: Vec<String> =
+                self.status.lending.iter().map(|l| (u32::from(l.display) + 1).to_string()).collect();
+            let (which, displays, them) = match numbers.len() {
+                1 if me > 1 => (format!("screen {}", numbers[0]), "a display", "it"),
+                1 => ("screen".to_owned(), "a display", "it"),
+                _ if numbers.len() >= me => ("screens".to_owned(), "displays", "them"),
+                _ => (format!("screens {}", and_list(&numbers)), "displays", "them"),
+            };
             parts.push(banner(
                 Icon::Display,
                 Tone::Green,
-                format!("{} is using this computer's {which} as a display", lending.to),
-                Some("Your mouse and keyboard work on it as usual".into()),
+                format!("{} is using this computer's {which} as {displays}", first.to),
+                Some(format!("Your mouse and keyboard work on {them} as usual")),
                 ("Stop", Msg::StopLending),
             ));
         }
@@ -685,34 +703,75 @@ fn transfer_view(transfer: &Transfer) -> Element<Msg> {
     )
 }
 
+/// The screens on their way to being, or being, extended displays of this computer: one card
+/// each, but one for all the screens of a computer that are up.
+fn extended_banners(extended: &[ExtendedView]) -> Vec<Element<Msg>> {
+    let mut parts = Vec::new();
+    let mut done: Vec<&str> = Vec::new();
+    for view in extended {
+        if view.failed.is_some() || view.working.is_some() {
+            parts.push(extended_view(view));
+            continue;
+        }
+        if done.contains(&view.id.as_str()) {
+            continue;
+        }
+        done.push(&view.id);
+        let up: Vec<&ExtendedView> = extended.iter().filter(|e| e.id == view.id && e.running).collect();
+        if up.len() < 2 {
+            parts.push(extended_view(view));
+            continue;
+        }
+        let numbers: Vec<String> = up.iter().map(|e| (u32::from(e.display) + 1).to_string()).collect();
+        parts.push(banner(
+            Icon::Display,
+            Tone::Blue,
+            format!("{}'s screens {} are displays of this computer", view.name, and_list(&numbers)),
+            Some("Arrange them in Display settings like any monitor".into()),
+            ("Disconnect all", Msg::Unextend(view.id.clone(), None)),
+        ));
+    }
+    parts
+}
+
+/// "1", "1 and 2", "1, 2 and 3".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// A screen on its way to being, or being, an extended display of this computer.
 fn extended_view(extended: &ExtendedView) -> Element<Msg> {
-    let id = extended.id.clone();
+    let (id, display) = (extended.id.clone(), Some(extended.display));
+    let screen = &extended.screen;
     if let Some(why) = &extended.failed {
         return card(
             row![
                 icon(Icon::Exclamation).tone(Tone::Orange),
                 column![
-                    text(format!("{}'s screen didn't become a display", extended.name)).callout().wrap(),
+                    text(format!("{screen} didn't become a display")).callout().wrap(),
                     text(why.clone()).caption().secondary().wrap(),
                 ]
                 .spacing(2.0),
                 spacer(),
-                button("OK").on_press(Msg::Unextend(id)),
+                button("OK").on_press(Msg::Unextend(id, display)),
             ]
             .spacing(8.0)
             .align(Align::Center),
         );
     }
     let (title, detail, action) = match &extended.working {
-        Some(working) => (format!("Making {}'s screen a display", extended.name), format!("{working}…"), "Cancel"),
+        Some(working) => (format!("Making {screen} a display"), format!("{working}…"), "Cancel"),
         None => (
-            format!("{}'s screen is a display of this computer", extended.name),
+            format!("{screen} is a display of this computer"),
             "Arrange it in Display settings like any monitor".to_owned(),
             "Disconnect",
         ),
     };
-    banner(Icon::Display, Tone::Blue, title, Some(detail), (action, Msg::Unextend(id)))
+    banner(Icon::Display, Tone::Blue, title, Some(detail), (action, Msg::Unextend(id, display)))
 }
 
 /// A card at the top of the page for what's going on now: an icon, what it is, a word more,
@@ -1295,6 +1354,9 @@ impl<B: Backend> Roam<B> {
         let blocked = self.lend_blocked(spot);
         let picked = self.menu.as_ref().filter(|(m, _)| *m == id).map(|(_, d)| usize::from(*d));
         let several = spot.displays.len() > 1;
+        let many = peer.is_some_and(|p| p.lends_many);
+        let up: Vec<usize> =
+            (0..spot.displays.len()).filter(|i| self.extended(&id, *i).is_some_and(|e| e.failed.is_none())).collect();
         for (index, display) in spot.displays.iter().enumerate() {
             let display_index = u8::try_from(index).unwrap_or(u8::MAX);
             let name = if several {
@@ -1310,14 +1372,28 @@ impl<B: Backend> Roam<B> {
                         Some(working) => format!("{working}…"),
                         None => "A display of this computer now".into(),
                     },
-                    button("Disconnect display").destructive().on_press(Msg::Unextend(id.clone())).into(),
+                    button("Disconnect display")
+                        .destructive()
+                        .on_press(Msg::Unextend(id.clone(), Some(display_index)))
+                        .into(),
                 ),
                 _ => {
-                    let detail = blocked.clone().unwrap_or_else(|| match self.status.ability {
-                        Ability::NeedsDriver => {
+                    let replaces = up.first().filter(|_| !many);
+                    let detail = blocked.clone().unwrap_or_else(|| match (replaces, &self.status.ability) {
+                        (Some(other), _) => format!(
+                            "Takes the place of screen {}: update notchbase on {} to use several of its screens at once",
+                            other + 1,
+                            spot.name
+                        ),
+                        (None, Ability::NeedsDriver) => {
                             "Installs a free display driver first; Windows asks for permission once".into()
                         }
-                        _ => format!("{size} · Becomes another display of this computer, like a monitor plugged in"),
+                        (None, _) if !up.is_empty() => {
+                            format!("{size} · Becomes one more display of this computer, beside the others")
+                        }
+                        (None, _) => {
+                            format!("{size} · Becomes another display of this computer, like a monitor plugged in")
+                        }
                     });
                     let button = button("Turn into extended display")
                         .filled()
@@ -1348,7 +1424,34 @@ impl<B: Backend> Roam<B> {
                 .into(),
             );
         }
-        if several && picked.is_none() && !matches!(self.status.ability, Ability::No(_)) {
+        let free = spot.displays.len() - up.len();
+        if several && blocked.is_none() && many && free >= 1 {
+            parts.push(divider());
+            let label = if up.is_empty() {
+                format!("Use all {} screens as displays", spot.displays.len())
+            } else if free == 1 {
+                "Use the other screen too".to_owned()
+            } else {
+                format!("Use the other {free} screens too")
+            };
+            parts.push(
+                row![
+                    text(if picked.is_none() && up.is_empty() {
+                        "Right-click one of its screens to use it as a display, or use them all"
+                    } else {
+                        "Each one becomes its own display of this computer"
+                    })
+                    .caption()
+                    .tertiary()
+                    .wrap(),
+                    spacer(),
+                    button(label).on_press(Msg::ExtendAll(id.clone())),
+                ]
+                .spacing(8.0)
+                .align(Align::Center)
+                .into(),
+            );
+        } else if several && picked.is_none() && up.is_empty() && !matches!(self.status.ability, Ability::No(_)) {
             parts
                 .push(text("Right-click one of its screens to use it as a display").caption().tertiary().wrap().into());
         }

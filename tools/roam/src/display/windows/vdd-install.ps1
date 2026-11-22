@@ -3,7 +3,7 @@
 # NefCon creates the driver's device. Any earlier device and driver package go first, since the
 # driver in the project's 25.5.2 setup never makes a screen. Roam runs this as administrator,
 # hidden, and reads what happened from install.log in $Folder. Downloads are pinned by SHA-256.
-param([Parameter(Mandatory = $true)][string]$Folder)
+param([Parameter(Mandatory = $true)][string]$Folder, [int]$Monitors = 1)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -39,6 +39,21 @@ try {
     New-Item -ItemType Directory -Path $Settings -Force | Out-Null
     $Kept = Join-Path $Settings 'vdd_settings.xml'
     if (-not (Test-Path $Kept)) { Copy-Item (Join-Path $Driver 'vdd_settings.xml') $Kept }
+    # As many screens as Roam may lend at once: each stays off until it's in use.
+    try {
+        $Xml = New-Object System.Xml.XmlDocument
+        $Xml.PreserveWhitespace = $true
+        $Xml.Load($Kept)
+        $Count = $Xml.SelectSingleNode('//monitors/count')
+        $Had = 0
+        if ($Count -and [int]::TryParse($Count.InnerText.Trim(), [ref]$Had) -and $Had -lt $Monitors) {
+            $Count.InnerText = "$Monitors"
+            $Xml.Save($Kept)
+            Say "Screens: $Had to $Monitors"
+        }
+    } catch {
+        Say "Couldn't set how many screens the driver makes: $($_.Exception.Message)"
+    }
     # Roam adds sizes to the settings without administrator rights.
     & icacls.exe $Settings /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
 

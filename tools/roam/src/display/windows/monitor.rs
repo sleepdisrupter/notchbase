@@ -1,5 +1,8 @@
-//! Finding the driver's virtual monitors among Windows' displays, and turning one on at a size
-//! and place, or off again. Everything here works without administrator rights.
+//! Finding the driver's virtual monitors among Windows' displays, turning one on at a size
+//! and place, or off again, and which of them Roam has in use. Everything here works without
+//! administrator rights.
+
+use std::sync::Mutex;
 
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
@@ -162,10 +165,39 @@ pub fn detach(source: &Source) -> Result<(), String> {
     Ok(())
 }
 
-/// Turns every driver screen off.
-pub fn detach_all() -> Result<(), String> {
+/// The driver screens Roam has in use, by name: each shows one lent screen.
+static IN_USE: Mutex<Vec<[u16; 32]>> = Mutex::new(Vec::new());
+
+/// How many driver screens are in use.
+pub fn in_use() -> usize {
+    IN_USE.lock().map_or(0, |used| used.len())
+}
+
+/// Takes a driver screen nobody is using, chosen by `choose` from the free ones, and keeps it
+/// from the others until `release`. Choosing and taking go together, so two screens asked for at
+/// once never get the same one.
+pub fn claim<T>(choose: impl FnOnce(&[Source], usize) -> Result<(Source, T), String>) -> Result<(Source, T), String> {
+    let mut used = IN_USE.lock().map_err(|_| "Lost track of the virtual displays".to_owned())?;
+    let all = virtual_sources();
+    let free: Vec<Source> = all.iter().copied().filter(|s| !used.contains(&s.name)).collect();
+    let (source, chosen) = choose(&free, all.len())?;
+    used.push(source.name);
+    Ok((source, chosen))
+}
+
+/// The screen is no longer in use.
+pub fn release(source: &Source) {
+    if let Ok(mut used) = IN_USE.lock() {
+        used.retain(|name| *name != source.name);
+    }
+}
+
+/// Turns off every driver screen that's on but not in use: left from a run that didn't tidy
+/// up, the driver's own at start-up, or turned on by Windows alongside one that's wanted.
+pub fn detach_unused() -> Result<(), String> {
+    let used = IN_USE.lock().map(|used| used.clone()).unwrap_or_default();
     let mut result = Ok(());
-    for source in virtual_sources().iter().filter(|s| s.attached) {
+    for source in virtual_sources().iter().filter(|s| s.attached && !used.contains(&s.name)) {
         result = result.and(detach(source));
     }
     result

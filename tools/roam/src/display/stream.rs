@@ -61,6 +61,20 @@ impl Hello {
     }
 }
 
+/// A new number for a stream of the lending computer's screen `display`: random, but for its
+/// top byte, which says the screen (one more than its number, so 0 says none, as from a host
+/// that lends one screen only). The same keys never seal two streams' messages alike: the 24
+/// random bits differ from one stream to the next.
+pub fn number(display: u8, random: [u8; 4]) -> u32 {
+    let [a, b, c, _] = random;
+    u32::from_le_bytes([a, b, c, display.saturating_add(1)])
+}
+
+/// Which screen a stream's number says it's for, if it says.
+pub fn display_of(stream: u32) -> Option<u8> {
+    (stream >> 24).checked_sub(1).map(|display| display as u8)
+}
+
 /// The keys for both directions, from the session's key for big clipboards from host to viewer.
 pub fn keys(bulk: [u8; 32]) -> Keys {
     Keys { pictures: hash(&[b"roam display pictures", &bulk]), input: hash(&[b"roam display input", &bulk]) }
@@ -333,6 +347,10 @@ mod tests {
     fn hellos_are_told_apart_from_clipboards() {
         let mut out = Vec::new();
         Hello { session: 7, stream: 9 }.write(&mut out).unwrap();
+        assert_eq!(display_of(number(1, [0xAA, 0xBB, 0xCC, 0xDD])), Some(1));
+        assert_eq!(number(1, [0xAA, 0xBB, 0xCC, 0xDD]), 0x02CC_BBAA);
+        assert_eq!(display_of(number(0, [9; 4])), Some(0));
+        assert_eq!(display_of(9), None, "an older host's number says no screen");
         let header: [u8; 12] = out.try_into().unwrap();
         assert_eq!(Hello::parse(&header), Some(Hello { session: 7, stream: 9 }));
         let mut clipboard = header;

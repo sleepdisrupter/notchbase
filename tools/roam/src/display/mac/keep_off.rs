@@ -4,11 +4,12 @@
 //! While the screen is lent, a thread looks about twice a second for ordinary windows on it
 //! (from the window server's list, which needs no permission) and moves each one, through the
 //! accessibility API Roam already has permission for, to the Mac's biggest other screen, made
-//! smaller if it wouldn't fit there.
+//! smaller if it wouldn't fit there. With several screens lent, a window never goes to another
+//! lent one: they all share the list of what's lent.
 
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -82,41 +83,58 @@ unsafe extern "C" {
     fn CFRelease(object: Ref);
 }
 
+/// Every screen lent now.
+static LENT: Mutex<Vec<Rect>> = Mutex::new(Vec::new());
+
+fn lent_now() -> Vec<Rect> {
+    LENT.lock().map(|lent| lent.clone()).unwrap_or_default()
+}
+
 /// Keeps windows off `rect` until dropped.
 pub struct KeepOff {
+    rect: Rect,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl KeepOff {
     pub fn start(rect: Rect) -> Self {
+        if let Ok(mut lent) = LENT.lock() {
+            lent.push(rect);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = std::thread::Builder::new()
             .name("roam-keep-off".into())
             .spawn(move || {
                 while !stopping.load(Ordering::Acquire) {
-                    if let Some(to) = elsewhere(rect) {
+                    if let Some(to) = elsewhere(&lent_now()) {
                         sweep(rect, to);
                     }
                     std::thread::sleep(EVERY);
                 }
             })
             .ok();
-        Self { stop, thread }
+        Self { rect, stop, thread }
     }
 }
 
 impl Drop for KeepOff {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Ok(mut lent) = LENT.lock()
+            && let Some(index) = lent.iter().position(|r| *r == self.rect)
+        {
+            lent.remove(index);
+        }
         // Not joined: a slow app may hold the thread a moment, and it ends by itself.
         drop(self.thread.take());
     }
 }
 
-/// The biggest of the Mac's other screens, where windows go instead.
-fn elsewhere(lent: Rect) -> Option<Rect> {
+/// The biggest of the Mac's screens that isn't lent, where windows go instead: none when every
+/// one is lent.
+fn elsewhere(lent: &[Rect]) -> Option<Rect> {
     let mut ids = [0u32; 16];
     let mut count = 0u32;
     // SAFETY: room for 16 displays, as the call is told.
@@ -128,7 +146,7 @@ fn elsewhere(lent: Rect) -> Option<Rect> {
         // SAFETY: plain queries of displays the system just listed.
         .map(|&id| unsafe { CGDisplayBounds(id) })
         .map(|b| Rect::new(b.origin.x, b.origin.y, b.size.width, b.size.height))
-        .filter(|r| !overlaps_mostly(*r, lent))
+        .filter(|r| !lent.iter().any(|lent| overlaps_mostly(*r, *lent)))
         .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
 }
 

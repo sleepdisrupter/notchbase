@@ -2,11 +2,27 @@
 //! open-source indirect display driver, signed, so Windows takes it without test mode. It
 //! offers the sizes listed in its settings file. Roam leaves those alone: the driver's command
 //! to read them again can knock it over, so a screen is shown at the nearest size it offers.
-//! Installing it is the one step that asks for administrator rights.
+//! Installing it, and once giving it room for more than one screen, are the steps that ask
+//! for administrator rights.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::monitor;
+
+/// How many screens the driver is set to make: as many as anyone lends at once. Each one stays
+/// off until it's in use.
+pub const MONITORS: usize = 4;
+/// What runs as administrator to give the driver room for more screens.
+const ROOM_SCRIPT: &str = include_str!("vdd-room.ps1");
+/// How long the driver may take to come back with its new screens.
+const ROOM_WAIT: Duration = Duration::from_secs(30);
+/// One install, or one change to the driver, at a time: two screens asked for at once would
+/// otherwise each ask Windows for permission.
+static CHANGING: Mutex<()> = Mutex::new(());
+/// The person said no to more room this run: don't ask on every screen.
+static ROOM_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// How long the install may take, permission prompt and downloads included.
 const INSTALL_RUN: Duration = Duration::from_secs(5 * 60);
@@ -30,6 +46,11 @@ pub fn installed() -> bool {
 /// device. Then waits for its monitor to show up. (The winget package of the same name is only
 /// the project's control app, not the driver.)
 pub fn install() -> Result<(), String> {
+    let _changing = CHANGING.lock();
+    if installed() {
+        // Another screen asked at the same time, and its install did it.
+        return Ok(());
+    }
     if cfg!(target_arch = "aarch64") {
         return Err("The display driver doesn't support ARM PCs yet".into());
     }
@@ -41,7 +62,7 @@ pub fn install() -> Result<(), String> {
     let script = folder.join("install.ps1");
     std::fs::write(&script, SCRIPT).map_err(|err| format!("Couldn't write {}: {err}", script.display()))?;
     let arguments = format!(
-        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Folder \"{}\"",
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Folder \"{}\" -Monitors {MONITORS}",
         script.display(),
         folder.display()
     );
@@ -59,6 +80,73 @@ pub fn install() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(500));
     }
     Err(NOT_RUNNING.into())
+}
+
+/// Whether the driver has room for one more screen without asking anyone: a screen of it not in
+/// use, and as many as it's meant to have (or the person said no to more this run, or a screen is
+/// in use, and changing the driver now would knock that one over).
+pub fn has_room(in_use: usize) -> bool {
+    let all = monitor::virtual_sources().len();
+    let free = all > in_use;
+    free && (all >= MONITORS || in_use > 0 || ROOM_REFUSED.load(Ordering::Acquire))
+}
+
+/// The person was told Windows asks again for more room next time: it will.
+pub fn ask_again() {
+    ROOM_REFUSED.store(false, Ordering::Release);
+}
+
+/// Gives the driver room for `MONITORS` screens: a script run as administrator, after Windows
+/// asks the person, sets the count in the driver's settings and restarts its device, which
+/// makes the new screens. Only while none of its screens is in use, since restarting takes
+/// them all away a moment. `in_use` says how many are, once it's this one's turn.
+pub fn make_room(in_use: impl Fn() -> usize) -> Result<(), String> {
+    let _changing = CHANGING.lock();
+    let before = monitor::virtual_sources().len();
+    if before >= MONITORS || in_use() > 0 || ROOM_REFUSED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let folder = std::env::temp_dir().join("roam-display-driver");
+    let log = folder.join("room.log");
+    std::fs::create_dir_all(&folder).map_err(|err| format!("Couldn't make {}: {err}", folder.display()))?;
+    let _ = std::fs::remove_file(&log);
+    let script = folder.join("room.ps1");
+    std::fs::write(&script, ROOM_SCRIPT).map_err(|err| format!("Couldn't write {}: {err}", script.display()))?;
+    let arguments = format!(
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Folder \"{}\" -Monitors {MONITORS}",
+        script.display(),
+        folder.display()
+    );
+    let code = match elevated::run("powershell.exe", &arguments, INSTALL_RUN) {
+        Ok(code) => code,
+        Err(why) => {
+            ROOM_REFUSED.store(true, Ordering::Release);
+            return Err(why);
+        }
+    };
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    if code != 0 {
+        ROOM_REFUSED.store(true, Ordering::Release);
+        let why = log.lines().rev().find_map(|line| line.strip_prefix("FAILED: ")).unwrap_or("no reason given");
+        return Err(format!("The display driver didn't make room for more screens: {why}"));
+    }
+    // The driver comes back with its screens on: they stay off until they're wanted.
+    let started = Instant::now();
+    while started.elapsed() < ROOM_WAIT {
+        std::thread::sleep(Duration::from_millis(500));
+        if monitor::virtual_sources().len() >= MONITORS {
+            break;
+        }
+    }
+    let _ = monitor::detach_unused();
+    let after = monitor::virtual_sources().len();
+    if after < MONITORS {
+        ROOM_REFUSED.store(true, Ordering::Release);
+    }
+    if after == 0 {
+        return Err(NOT_RUNNING.into());
+    }
+    Ok(())
 }
 
 /// Running a program as administrator.
@@ -91,9 +179,9 @@ mod elevated {
         // SAFETY: `info` is filled in as the call expects, and its strings outlive it.
         if let Err(err) = unsafe { ShellExecuteExW(&mut info) } {
             return Err(if err.code() == ERROR_CANCELLED.to_hresult() {
-                "Windows didn't get permission to install the display driver. Try again and say Yes".into()
+                "Windows didn't get permission to change the display driver. Try again and say Yes".into()
             } else {
-                format!("Couldn't start the display driver install: {}", err.message())
+                format!("Couldn't start changing the display driver: {}", err.message())
             });
         }
         let process = info.hProcess;
@@ -112,9 +200,9 @@ mod elevated {
         // SAFETY: closes the handle the call above gave.
         let _ = unsafe { CloseHandle(process) };
         if !finished {
-            return Err(format!("The display driver install didn't finish in {} minutes", most.as_secs() / 60));
+            return Err(format!("Changing the display driver didn't finish in {} minutes", most.as_secs() / 60));
         }
-        read.map_err(|err| format!("Lost track of the display driver install: {}", err.message()))?;
+        read.map_err(|err| format!("Lost track of the display driver change: {}", err.message()))?;
         Ok(code)
     }
 }

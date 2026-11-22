@@ -51,8 +51,9 @@ pub struct Link {
     early: BTreeMap<u32, Message>,
     motion: u32,
     motion_in: Option<u32>,
-    /// The host's pointer on the screen the other computer lends, to go in the next packet.
-    pub pointer: Option<([i32; 2], bool)>,
+    /// The host's pointer on a screen the other computer lends (which one, where, and whether it
+    /// shows), to go in the next packet.
+    pub pointer: Option<(Option<u8>, [i32; 2], bool)>,
     pointer_seq: u32,
     pointer_in: Option<u32>,
     peer_time: Option<(u32, u64)>,
@@ -154,9 +155,9 @@ impl Link {
             Some((time, received)) => (time, now.saturating_sub(received).min(u64::from(u32::MAX)) as u32),
             None => (0, 0),
         };
-        let pointer = self.pointer.take().map(|(at, visible)| {
+        let pointer = self.pointer.take().map(|(display, at, visible)| {
             self.pointer_seq = self.pointer_seq.wrapping_add(1);
-            Pointer { seq: self.pointer_seq, at, visible }
+            Pointer { seq: self.pointer_seq, at, visible, display }
         });
         let mut body = Body { ack: self.expect, time: now as u32, echo, held, motion, messages: Vec::new(), pointer };
         let mut room = MAX_PACKET - 16 - 16 - 32 - POINTER_SIZE;

@@ -152,9 +152,13 @@ pub enum Control {
         id: String,
         display: u8,
     },
-    /// Stop showing that computer's screen here, or forget why it couldn't be.
-    Unextend(String),
-    /// Stop lending this computer's screen to the computer controlling it.
+    /// Stop showing that computer's screen here (`None`: every one of its screens), or forget
+    /// why it couldn't be.
+    Unextend {
+        id: String,
+        display: Option<u8>,
+    },
+    /// Stop lending this computer's screens to the computer controlling it.
     StopLending,
     /// Put line-up guides over every screen on the desk, or take them down.
     LineUp(bool),
@@ -247,6 +251,8 @@ pub struct PeerView {
     pub open: bool,
     /// Can lend its screens as extended displays.
     pub lends: bool,
+    /// Can lend several at once.
+    pub lends_many: bool,
     pub nearby: bool,
     pub paired: bool,
     pub link: LinkState,
@@ -313,8 +319,8 @@ pub struct Status {
     pub ability: Ability,
     /// Other computers' screens shown here as extended displays.
     pub extended: Vec<ExtendedView>,
-    /// This computer's screen, lent to another computer as its extended display.
-    pub lending: Option<LendingView>,
+    /// This computer's screens, lent to another computer as its extended displays.
+    pub lending: Vec<LendingView>,
     /// Line-up guides are up on every screen on the desk, coloured like this.
     pub lining_up: bool,
     pub coloured: Vec<Coloured>,
@@ -383,6 +389,7 @@ struct Peer {
     fast_pointer: bool,
     udp_pictures: bool,
     aligns: bool,
+    lends_many: bool,
     displays: Vec<Rect>,
     ppu: f64,
     seen: u64,
@@ -606,14 +613,15 @@ struct Core {
     displays: Arc<dyn Displays>,
     ability: Ability,
     ability_at: u64,
-    /// Other computers' screens this computer shows as extended displays.
-    extended: HashMap<Id, Extended>,
-    /// This computer's screen, lent to the computer controlling it.
-    lending: Option<Lending>,
+    /// Other computers' screens this computer shows as extended displays, by computer and
+    /// which of its screens.
+    extended: HashMap<(Id, u8), Extended>,
+    /// This computer's screens, lent to the computer controlling it.
+    lending: Vec<Lending>,
     extend_serial: u32,
     /// The extended display this computer's cursor is over, whose lending computer is told
     /// where the pointer is the quick way, and where it was last said to be.
-    pointer_over: Option<(Id, [i32; 2])>,
+    pointer_over: Option<((Id, u8), [i32; 2])>,
     /// Lining the screens up: this computer leading, or following another's.
     leading: Option<line_up::Leading>,
     following: Option<line_up::Following>,
@@ -708,7 +716,7 @@ impl Core {
             displays,
             ability_at: 0,
             extended: HashMap::new(),
-            lending: None,
+            lending: Vec::new(),
             extend_serial: 0,
             pointer_over: None,
             leading: None,
@@ -893,7 +901,7 @@ impl Core {
         if self.smoother.pending() {
             next = next.min(now + FRAME);
         }
-        if let Some((peer, _)) = self.pointer_over
+        if let Some(((peer, _), _)) = self.pointer_over
             && let Some(Phase::Live { link }) = self.sessions.get(&peer).map(|s| &s.phase)
             && link.pointer.is_some()
         {
@@ -1092,7 +1100,7 @@ impl Core {
         let mut notes = Vec::new();
         for (id, session) in &mut self.sessions {
             let addr = session.addr;
-            let pointing = self.pointer_over.is_some_and(|(over, _)| over == *id);
+            let pointing = self.pointer_over.is_some_and(|((over, _), _)| over == *id);
             let busy = away == Some(*id) || (here && session.side == Side::Controlled) || pointing;
             match &mut session.phase {
                 Phase::Pairing { link, .. } | Phase::Live { link } => {
@@ -1176,6 +1184,7 @@ impl Core {
             fast_pointer: self.displays.draws_pointer(),
             udp_pictures: self.displays.lends(),
             aligns: self.displays.aligns(),
+            lends_many: self.displays.lends(),
             ppu: ppu as f32,
             displays,
             name: self.name(),
@@ -1241,6 +1250,7 @@ impl Core {
             fast_pointer: beacon.fast_pointer,
             udp_pictures: beacon.udp_pictures,
             aligns: beacon.aligns,
+            lends_many: beacon.lends_many,
             displays: beacon.displays,
             ppu: f64::from(beacon.ppu),
             seen: now,
@@ -1521,6 +1531,7 @@ impl Core {
                     fast_pointer: false,
                     udp_pictures: false,
                     aligns: false,
+                    lends_many: false,
                     displays: Vec::new(),
                     ppu: 1.0,
                     seen: now,
@@ -1618,27 +1629,28 @@ impl Core {
                 self.lent(id, display, pixels, hz, scale);
             }
             Message::Unlend { display, why } if side == Side::Controller => {
-                if self.extended.get(&id).is_some_and(|e| e.display == display) {
-                    let failed = self.extended.get(&id).is_some_and(|e| e.state != extend::State::Running);
+                if let Some(entry) = self.extended.remove(&(id, display)) {
+                    let failed = entry.state != extend::State::Running;
                     self.note(&format!("{} stopped lending its display {display}: {why}", self.who(id)));
-                    if let Some(entry) = self.extended.remove(&id) {
-                        if let Some(feed) = &entry.feed {
-                            feed.stop();
-                        }
-                        if failed {
-                            self.extended.insert(
-                                id,
-                                Extended { state: extend::State::Failed(why), feed: None, place: None, ..entry },
-                            );
-                        }
+                    if let Some(feed) = &entry.feed {
+                        feed.stop();
+                    }
+                    if self.pointer_over.is_some_and(|(over, _)| over == (id, display)) {
+                        self.pointer_over = None;
+                    }
+                    if failed {
+                        self.extended.insert(
+                            (id, display),
+                            Extended { state: extend::State::Failed(why), feed: None, place: None, ..entry },
+                        );
                     }
                 }
             }
             Message::Lend { display } if side == Side::Controlled && live => self.lend(id, display),
             Message::Unlend { display, why } if side == Side::Controlled => {
-                if self.lending.as_ref().is_some_and(|l| l.to == id && l.display == display) {
-                    self.note(&format!("{} no longer shows its picture here: {why}", self.who(id)));
-                    self.stop_lending(None);
+                if self.lending.iter().any(|l| l.to == id && l.display == display) {
+                    self.note(&format!("{} no longer shows its picture on display {display}: {why}", self.who(id)));
+                    self.stop_lending(Some(display), None);
                 }
             }
             Message::Screens { ppu, displays } if side == Side::Controller => {
@@ -2508,15 +2520,18 @@ impl Core {
                     self.extend(id, display);
                 }
             }
-            Control::Unextend(id) => {
+            Control::Unextend { id, display } => {
                 if let Some(id) = unhex::<8>(&id) {
                     let why = format!("Disconnected on {}", self.name());
-                    self.unextend(id, &why);
+                    match display {
+                        Some(display) => self.unextend(id, display, &why),
+                        None => self.unextend_all(id, &why),
+                    }
                 }
             }
             Control::StopLending => {
                 let why = format!("Stopped on {}", self.name());
-                self.stop_lending(Some(&why));
+                self.stop_lending(None, Some(&why));
             }
             Control::LineUp(on) => self.line_up(on),
             Control::HideGuides => self.hide_followed(),
@@ -2551,6 +2566,7 @@ impl Core {
             ppu,
             open: self.prefs.open,
             lends: self.displays.lends(),
+            lends_many: self.displays.lends(),
             nearby: true,
             paired: true,
             link: LinkState::None,
@@ -2609,6 +2625,7 @@ impl Core {
                 ppu: peer.ppu,
                 open: peer.open && !peer.busy,
                 lends: peer.lends,
+                lends_many: peer.lends_many,
                 nearby,
                 paired: self.paired.contains_key(&id),
                 link,
@@ -2644,7 +2661,7 @@ impl Core {
             landed: self.landed.clone(),
             ability: self.ability.clone(),
             extended: self.extended_views(),
-            lending: self.lending_view(),
+            lending: self.lending_views(),
             lining_up: self.lining_up(),
             coloured: self.coloured(),
             guided_by: self.guided_by(),

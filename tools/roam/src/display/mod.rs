@@ -498,7 +498,17 @@ pub trait Displays: Send + Sync {
     fn install(&self) -> Result<(), String> {
         Err("There's nothing to install on this computer".into())
     }
-    /// Makes a virtual display and starts sending what's on it to `feed`.
+    /// Whether another virtual display can be made without asking the system first.
+    fn has_room(&self) -> bool {
+        true
+    }
+    /// Makes room for more virtual displays, asking the system for permission, while none is in
+    /// use. Blocks until done.
+    fn make_room(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Makes a virtual display and starts sending what's on it to `feed`. Several can be up at
+    /// once, each showing another screen.
     fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String>;
     /// What the display at `rect` (in this computer's units) is like, to lend it.
     fn panel(&self, rect: Rect) -> Option<Panel>;

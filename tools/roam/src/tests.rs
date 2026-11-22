@@ -23,6 +23,7 @@ fn view(id: &str, name: &str, os: Os, link: LinkState) -> PeerView {
         ppu: 1.5,
         open: true,
         lends: true,
+        lends_many: true,
         nearby: true,
         paired: false,
         link,
@@ -222,6 +223,7 @@ fn right_clicking_another_screen_offers_to_make_it_a_display() {
         id: "pc".into(),
         name: "Desk PC".into(),
         display: 0,
+        screen: "Desk PC's screen".into(),
         working: None,
         running: true,
         failed: None,
@@ -455,4 +457,95 @@ fn preview_the_desk() {
     let texts = harness.texts();
     let out = serde_json::json!({ "dragging": dragging, "resting": resting, "texts": texts });
     std::fs::write(path, out.to_string()).unwrap();
+}
+
+#[test]
+fn several_screens_of_one_computer_can_be_displays_at_once() {
+    let mut harness = Harness::<Tool>::start();
+    let mut update = status(vec![two_screen_pc()]);
+    update.ability = Ability::Ready;
+    harness.send(Msg::Status(Box::new(update.clone())));
+    harness.click("Add");
+    harness.send(Msg::Select(Some("pc".into())));
+    assert!(harness.shows("Use all 2 screens as displays"), "{:?}", harness.texts());
+
+    // One up: the other offers to come too, and says it adds to the first.
+    let up = |display: u8| ExtendedView {
+        id: "pc".into(),
+        name: "Desk PC".into(),
+        display,
+        screen: format!("Desk PC's screen {}", display + 1),
+        working: None,
+        running: true,
+        failed: None,
+    };
+    update.extended = vec![up(0)];
+    harness.send(Msg::Status(Box::new(update.clone())));
+    assert!(harness.shows("Desk PC's screen 1 is a display of this computer"));
+    assert!(harness.shows("Use the other screen too"));
+
+    // Both up: one card for the two, which takes them both back.
+    update.extended = vec![up(0), up(1)];
+    harness.send(Msg::Status(Box::new(update.clone())));
+    assert!(harness.shows("Desk PC's screens 1 and 2 are displays of this computer"), "{:?}", harness.texts());
+    assert!(harness.shows("Disconnect all"));
+    assert!(!harness.shows("Use the other screen too"));
+    assert_eq!(
+        harness.texts().iter().filter(|t| t.as_str() == "Disconnect display").count(),
+        2,
+        "{:?}",
+        harness.texts()
+    );
+
+    // One still on its way gets its own card.
+    update.extended[1].running = false;
+    update.extended[1].working = Some("Starting the display".into());
+    harness.send(Msg::Status(Box::new(update)));
+    assert!(harness.shows("Making Desk PC's screen 2 a display"));
+    assert!(harness.shows("Desk PC's screen 1 is a display of this computer"));
+}
+
+#[test]
+fn a_computer_that_lends_one_screen_at_a_time_says_the_next_takes_its_place() {
+    let mut harness = Harness::<Tool>::start();
+    let mut pc = two_screen_pc();
+    pc.lends_many = false;
+    let mut update = status(vec![pc]);
+    update.ability = Ability::Ready;
+    update.extended = vec![ExtendedView {
+        id: "pc".into(),
+        name: "Desk PC".into(),
+        display: 0,
+        screen: "Desk PC's screen 1".into(),
+        working: None,
+        running: true,
+        failed: None,
+    }];
+    harness.send(Msg::Status(Box::new(update)));
+    harness.click("Add");
+    let view = View::fit(&harness.model().desk);
+    let second = harness.model().desk[1].computer().desk_displays()[1];
+    let [x, y] = view.to_canvas([second.x + second.w / 2.0, second.y + second.h / 2.0]);
+    harness.right_click(0, x, y);
+    assert!(harness.shows("Takes the place of screen 1"), "{:?}", harness.texts());
+    assert!(!harness.shows("Use the other screen too"));
+}
+
+#[test]
+fn lending_several_screens_says_which() {
+    let mut harness = Harness::<Tool>::start();
+    let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]);
+    if let Some(me) = update.me.as_mut() {
+        me.displays.push(Rect::new(1512.0, 0.0, 1920.0, 1080.0));
+        me.displays.push(Rect::new(3432.0, 0.0, 1920.0, 1080.0));
+    }
+    update.lending = vec![
+        engine::LendingView { to: "Desk PC".into(), display: 1 },
+        engine::LendingView { to: "Desk PC".into(), display: 2 },
+    ];
+    harness.send(Msg::Status(Box::new(update.clone())));
+    assert!(harness.shows("Desk PC is using this computer's screens 2 and 3 as displays"), "{:?}", harness.texts());
+    update.lending.insert(0, engine::LendingView { to: "Desk PC".into(), display: 0 });
+    harness.send(Msg::Status(Box::new(update)));
+    assert!(harness.shows("Desk PC is using this computer's screens as displays"), "{:?}", harness.texts());
 }
