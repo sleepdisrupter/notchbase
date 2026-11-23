@@ -189,7 +189,7 @@ fn ends_of_text_count_characters() {
 #[ignore = "sends the WAV in NOTCHBASE_DICTATION_WAV to Groq with the key in GROQ_API_KEY"]
 fn real_speech_is_written() {
     let wav = std::fs::read(std::env::var("NOTCHBASE_DICTATION_WAV").unwrap()).unwrap();
-    let samples: Vec<i16> = wav[44..].chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
+    let samples: Vec<i16> = wav[44..].as_chunks::<2>().0.iter().map(|pair| i16::from_le_bytes(*pair)).collect();
     let groq = Groq::new();
     groq.set_key(&std::env::var("GROQ_API_KEY").unwrap());
     let mut glossary = Glossary::default();

@@ -313,7 +313,9 @@ unsafe impl Send for Owned {}
 
 impl Owned {
     fn new(object: Ref) -> Option<Self> {
-        (!object.is_null()).then_some(Self(object))
+        // `then`, not `then_some`: an `Owned` built eagerly around NULL would be
+        // dropped on the spot and CFRelease(NULL) kills the process.
+        (!object.is_null()).then(|| Self(object))
     }
 }
 
