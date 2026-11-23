@@ -62,7 +62,29 @@ const FIXES: &str = "Words you correct are spelled your way next time";
 #[cfg(not(target_os = "macos"))]
 const FIXES: &str = "Words you say often are spelled your way next time";
 
+#[cfg(target_os = "macos")]
+const SHIELD: &str = "The notch stays closed in Mission Control";
+#[cfg(target_os = "macos")]
+const EXPOSE: &str = "App Expos\u{e9} gets your clicks too";
+#[cfg(target_os = "macos")]
+const BADGES: &str = "The dock shows app badges";
+#[cfg(target_os = "macos")]
+const UNREAD: &str = "Unread counts show on each icon";
+const LEADS: &str = "Dictation comes first while it listens";
+const MIDDLE: &str = "It takes the middle of the notch";
+
 pub(super) static NOTES: &[Release] = &[
+    Release {
+        version: "0.31.0",
+        picture: None,
+        changes: &[
+            #[cfg(target_os = "macos")]
+            Change { glyph: Glyph::Grid, title: SHIELD, caption: EXPOSE },
+            #[cfg(target_os = "macos")]
+            Change { glyph: Glyph::Bell, title: BADGES, caption: UNREAD },
+            Change { glyph: Glyph::Microphone, title: LEADS, caption: MIDDLE },
+        ],
+    },
     Release {
         version: "0.30.1",
         picture: None,
