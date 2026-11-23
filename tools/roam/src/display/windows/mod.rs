@@ -73,7 +73,7 @@ impl Displays for Windows {
     }
 
     fn has_room(&self, want: &Want) -> bool {
-        vdd::has_room(monitor::in_use(), want.units)
+        vdd::has_room(monitor::in_use(), want.units, want.sizes().len())
     }
 
     fn make_room(&self, want: &Want) -> Result<(), String> {

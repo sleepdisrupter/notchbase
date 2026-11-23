@@ -16,9 +16,15 @@ use windows::core::w;
 use super::monitor;
 use crate::display::vdd_settings;
 
-/// How many screens the driver is set to make: as many as anyone lends at once. Each one stays
-/// off until it's in use.
+/// The most screens the driver is set to make. It makes as many as the lending computer has
+/// (so lending them all needs no change while some are in use), and no more: Windows lists every
+/// one it makes in Display settings, greyed out while it's off.
 pub const MONITORS: usize = 4;
+
+/// How many screens the driver should make for a computer with `screens` screens.
+pub fn monitors_for(screens: usize) -> usize {
+    screens.clamp(1, MONITORS)
+}
 /// What runs as administrator to give the driver room for more screens.
 const ROOM_SCRIPT: &str = include_str!("vdd-room.ps1");
 /// How long the driver may take to come back with its new screens.
@@ -51,6 +57,7 @@ pub fn installed() -> bool {
 /// device. Then waits for its monitor to show up. (The winget package of the same name is only
 /// the project's control app, not the driver.)
 pub fn install(sizes: &[[u32; 2]]) -> Result<(), String> {
+    let monitors = monitors_for(sizes.len());
     let _changing = CHANGING.lock();
     if installed() {
         // Another screen asked at the same time, and its install did it.
@@ -69,7 +76,7 @@ pub fn install(sizes: &[[u32; 2]]) -> Result<(), String> {
     let sizes = vdd_settings::missing(&[], sizes);
     let sizes = if sizes.is_empty() { String::new() } else { format!(" -Sizes {sizes}") };
     let arguments = format!(
-        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Folder \"{}\" -Monitors {MONITORS}{sizes}",
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Folder \"{}\" -Monitors {monitors}{sizes}",
         script.display(),
         folder.display()
     );
@@ -128,15 +135,16 @@ pub fn offers(size: [u32; 2]) -> Option<bool> {
     listed().map(|sizes| sizes.contains(&size))
 }
 
-/// Whether the driver has room for one more screen `size` big without asking anyone: a screen
-/// of it not in use, as many as it's meant to have, and that size among its own (or the person
+/// Whether the driver is ready for one more screen `size` big, of a computer with `screens`
+/// screens, without asking anyone: a screen of it not in use, as many as that computer has (no
+/// fewer, and no spares to clutter Display settings), and that size among its own. Or the person
 /// said no to changing it this run, or a screen is in use, and changing the driver now would
-/// knock that one over).
-pub fn has_room(in_use: usize, size: [u32; 2]) -> bool {
+/// knock that one over.
+pub fn has_room(in_use: usize, size: [u32; 2], screens: usize) -> bool {
     let all = monitor::virtual_sources().len();
     let free = all > in_use;
     let settled = in_use > 0 || ROOM_REFUSED.load(Ordering::Acquire);
-    free && (settled || (all >= MONITORS && offers(size) != Some(false)))
+    free && (settled || (all == monitors_for(screens) && offers(size) != Some(false)))
 }
 
 /// The person was told Windows asks again for more room next time: it will.
@@ -144,7 +152,8 @@ pub fn ask_again() {
     ROOM_REFUSED.store(false, Ordering::Release);
 }
 
-/// Gets the driver ready for `MONITORS` screens, and for each of `sizes` it lacks: a script
+/// Gets the driver ready for as many screens as `sizes` (one for each of the lending
+/// computer's screens), and for each size it lacks: a script
 /// run as administrator, after Windows asks the person, changes the driver's settings and
 /// restarts its device, which makes the screens again as the settings say. Only while none of
 /// its screens is in use, since restarting takes them all away a moment. `in_use` says how
@@ -152,8 +161,9 @@ pub fn ask_again() {
 pub fn make_room(in_use: impl Fn() -> usize, sizes: &[[u32; 2]]) -> Result<(), String> {
     let _changing = CHANGING.lock();
     let before = monitor::virtual_sources().len();
+    let monitors = monitors_for(sizes.len());
     let missing = listed().map(|listed| vdd_settings::missing(&listed, sizes)).unwrap_or_default();
-    if (before >= MONITORS && missing.is_empty()) || in_use() > 0 || ROOM_REFUSED.load(Ordering::Acquire) {
+    if (before == monitors && missing.is_empty()) || in_use() > 0 || ROOM_REFUSED.load(Ordering::Acquire) {
         return Ok(());
     }
     let folder = std::env::temp_dir().join("roam-display-driver");
@@ -164,7 +174,7 @@ pub fn make_room(in_use: impl Fn() -> usize, sizes: &[[u32; 2]]) -> Result<(), S
     std::fs::write(&script, ROOM_SCRIPT).map_err(|err| format!("Couldn't write {}: {err}", script.display()))?;
     let sizes = if missing.is_empty() { String::new() } else { format!(" -Sizes {missing}") };
     let arguments = format!(
-        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Folder \"{}\" -Monitors {MONITORS}{sizes}",
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Folder \"{}\" -Monitors {monitors}{sizes}",
         script.display(),
         folder.display()
     );
@@ -183,11 +193,10 @@ pub fn make_room(in_use: impl Fn() -> usize, sizes: &[[u32; 2]]) -> Result<(), S
     }
     // The driver comes back with its screens on: they stay off until they're wanted. It may
     // still be on its way down when the script ends.
-    let target = MONITORS.max(before);
     let started = Instant::now();
     std::thread::sleep(Duration::from_secs(1));
     while started.elapsed() < ROOM_WAIT {
-        if monitor::virtual_sources().len() >= target {
+        if monitor::virtual_sources().len() == monitors {
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -196,7 +205,7 @@ pub fn make_room(in_use: impl Fn() -> usize, sizes: &[[u32; 2]]) -> Result<(), S
     std::thread::sleep(Duration::from_millis(500));
     let _ = monitor::detach_unused();
     let after = monitor::virtual_sources().len();
-    if after < MONITORS {
+    if after < monitors {
         ROOM_REFUSED.store(true, Ordering::Release);
     }
     if after == 0 {

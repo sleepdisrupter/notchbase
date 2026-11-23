@@ -399,6 +399,9 @@ mod displays {
         pub pictures_on: Vec<usize>,
         pub pointers_on: Vec<(usize, crate::display::PointerAt)>,
         pub closed: Vec<usize>,
+        /// Where each virtual display is, in the order they were made: a test moves one as the
+        /// person would in the system's display settings.
+        pub hosted: Vec<Arc<Mutex<Rect>>>,
         /// Each set of line-up guides put up, and of marks.
         pub guides: Vec<Vec<crate::align::Shown>>,
         pub marks: Vec<Vec<crate::align::Marked>>,
@@ -420,33 +423,44 @@ mod displays {
 
     struct PretendHosted {
         fake: Fake,
-        rect: Rect,
+        rect: Arc<Mutex<Rect>>,
         feed: Feed,
+        /// How many times it was moved.
+        placed: Arc<Mutex<usize>>,
     }
 
     impl Hosted for PretendHosted {
         fn rect(&mut self) -> Option<Rect> {
-            Some(self.rect)
+            Some(*self.rect.lock().unwrap())
         }
 
         fn place(&mut self, at: [i32; 2]) {
-            let mut state = self.fake.state();
-            state.screens.retain(|s| *s != self.rect);
-            self.rect.x = f64::from(at[0]);
-            self.rect.y = f64::from(at[1]);
-            state.screens.push(self.rect);
+            *self.placed.lock().unwrap() += 1;
+            move_display(&self.fake, &self.rect, [f64::from(at[0]), f64::from(at[1])]);
         }
 
         fn size(&self) -> [u32; 2] {
-            [self.rect.w as u32, self.rect.h as u32]
+            let rect = *self.rect.lock().unwrap();
+            [rect.w as u32, rect.h as u32]
         }
     }
 
     impl Drop for PretendHosted {
         fn drop(&mut self) {
             self.feed.stop();
-            self.fake.state().screens.retain(|s| *s != self.rect);
+            let rect = *self.rect.lock().unwrap();
+            self.fake.state().screens.retain(|s| *s != rect);
         }
+    }
+
+    /// Moves a virtual display's top left to `at`, among the computer's screens too.
+    pub fn move_display(fake: &Fake, rect: &Arc<Mutex<Rect>>, at: [f64; 2]) {
+        let mut rect = rect.lock().unwrap();
+        let mut state = fake.state();
+        state.screens.retain(|s| *s != *rect);
+        rect.x = at[0];
+        rect.y = at[1];
+        state.screens.push(*rect);
     }
 
     struct PretendShowing(Arc<Mutex<Seen>>, usize);
@@ -537,7 +551,9 @@ mod displays {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             });
-            Ok(Box::new(PretendHosted { fake: self.fake.clone(), rect, feed }))
+            let shared = Arc::new(Mutex::new(rect));
+            self.seen.lock().unwrap().hosted.push(shared.clone());
+            Ok(Box::new(PretendHosted { fake: self.fake.clone(), rect: shared, feed, placed: Arc::default() }))
         }
 
         fn panel(&self, rect: Rect) -> Option<Panel> {
@@ -920,11 +936,17 @@ fn dragging_over_an_extended_display_keeps_its_stream() {
 /// beside the built-in screen. The virtual display is as big as the monitor is on the desk
 /// (2880 by 1620 pixels at 150%), and where it is, which touches the PC's own screen.
 fn lend_the_screen_above(pc_on_the_left: bool) -> (Machine, Machine, Rect) {
+    let (a, b, virtual_display, _host) = lend_the_screen_above_to(pc_on_the_left);
+    (a, b, virtual_display)
+}
+
+/// As `lend_the_screen_above`, with the PC's pretend displays.
+fn lend_the_screen_above_to(pc_on_the_left: bool) -> (Machine, Machine, Rect, displays::Pretend) {
     let a_port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
     let b_port = a_port + 1;
     let pc = Fake::new(vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], 1.5);
     let mac = Fake::new(vec![Rect::new(0.0, 0.0, 1470.0, 956.0), Rect::new(-60.0, -1080.0, 1920.0, 1080.0)], 1.0);
-    let (mut a, _host) = displays::start_snapping(folder(), pc, a_port, b_port, true);
+    let (mut a, host) = displays::start_snapping(folder(), pc, a_port, b_port, true);
     let (mut b, _viewer) = displays::start(folder(), mac, b_port, a_port);
     let (a_id, b_id) = (a.id(), b.id());
     a.until("seeing the Mac", |s| s.peers.iter().any(|p| p.id == b_id && p.displays.len() == 2 && p.lends));
@@ -944,7 +966,27 @@ fn lend_the_screen_above(pc_on_the_left: bool) -> (Machine, Machine, Rect) {
     a.until("the extended display up", |s| s.extended.iter().any(|e| e.id == b_id && e.running));
     a.wait_for("listening", |s| s.sink.is_some());
     let virtual_display = a.fake.state().screens.iter().copied().find(|s| s.x != 0.0 || s.y != 0.0).unwrap();
-    (a, b, virtual_display)
+    (a, b, virtual_display, host)
+}
+
+#[test]
+fn an_extended_display_moved_in_display_settings_takes_its_screen_along_on_the_desk() {
+    let (mut a, mut b, virtual_display, host) = lend_the_screen_above_to(true);
+    let b_id = b.id();
+    let rect = host.seen.lock().unwrap().hosted[0].clone();
+    // The person drags it 300 pixels right and 150 up in Display settings: 200 and 100 points
+    // at 150%. The Mac was at (1220, -1080) on the desk.
+    displays::move_display(&a.fake, &rect, [virtual_display.x + 300.0, virtual_display.y - 150.0]);
+    a.until("the Mac moved on the desk with its screen", |s| {
+        s.moved.as_ref().is_some_and(|(_, placements)| {
+            placements.iter().any(|p| p.id == b_id && (p.at[0] - 1420.0).abs() < 1.0 && (p.at[1] + 1180.0).abs() < 1.0)
+        })
+    });
+    // And the display stays where the person put it.
+    std::thread::sleep(Duration::from_millis(1500));
+    let now = *rect.lock().unwrap();
+    assert_eq!([now.x, now.y], [virtual_display.x + 300.0, virtual_display.y - 150.0], "{}", log_of(&a));
+    assert!(log_of(&a).contains("was moved in the display settings"), "{}", log_of(&a));
 }
 
 /// Pushes from `at` by `push`, then keeps going: whether the cursor went over and stayed.

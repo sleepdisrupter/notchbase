@@ -151,7 +151,7 @@ fn shrink(bgra: &[u8], source: [usize; 2], output: [usize; 2], workers: usize, o
             scope.spawn(move || {
                 for (line, dst) in lines.chunks_exact_mut(row).enumerate() {
                     let y = band * rows + line;
-                    for (x, px) in dst.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+                    for (x, px) in dst.as_chunks_mut::<BYTES_PER_PIXEL>().0.iter_mut().enumerate() {
                         let mut sum = [0u64; 3];
                         let mut total = 0u64;
                         for &(sy, wy) in &ys[y] {

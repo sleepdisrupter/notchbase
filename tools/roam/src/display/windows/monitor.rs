@@ -142,11 +142,49 @@ pub fn attach(source: &Source, size: [u32; 2], hz: u32, at: [i32; 2]) -> Result<
     change(source, devmode)
 }
 
-/// Moves the source's top left to `at`.
+/// Whether a change of place is waiting to be applied.
+static PLACING: Mutex<bool> = Mutex::new(false);
+/// How long moves wait for others, so moving several screens sets Windows' displays up once.
+const PLACE_TOGETHER: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Moves the source's top left to `at`, along with any other source moved within a moment:
+/// Windows sets its displays up again once for all of them. One already there stays put.
 pub fn place(source: &Source, at: [i32; 2]) -> Result<(), String> {
+    if rect(source).is_some_and(|r| r.x as i32 == at[0] && r.y as i32 == at[1]) {
+        return Ok(());
+    }
     let mut devmode = DEVMODEW { dmFields: DM_POSITION, ..Default::default() };
     devmode.Anonymous1.Anonymous2.dmPosition = POINTL { x: at[0], y: at[1] };
-    change(source, devmode)
+    devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    let mut placing = PLACING.lock().map_err(|_| "Lost track of the virtual displays".to_owned())?;
+    let flags = CDS_TYPE(CDS_UPDATEREGISTRY.0 | CDS_NORESET.0);
+    // SAFETY: `devmode` lives for the call; it's stored now and applied below.
+    let stored = unsafe { ChangeDisplaySettingsExW(source.name(), Some(&devmode), None, flags, None) };
+    if stored != DISP_CHANGE_SUCCESSFUL {
+        return Err(format!("Windows didn't take the display's place (code {})", stored.0));
+    }
+    if !*placing {
+        *placing = true;
+        let spawned = std::thread::Builder::new().name("roam-display-place".into()).spawn(|| {
+            std::thread::sleep(PLACE_TOGETHER);
+            let mut placing = PLACING.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: applies the settings stored above.
+            let applied = unsafe { ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None) };
+            if applied != DISP_CHANGE_SUCCESSFUL {
+                eprintln!("roam: Windows couldn't move the virtual displays (code {})", applied.0);
+            }
+            *placing = false;
+        });
+        if spawned.is_err() {
+            *placing = false;
+            // SAFETY: as above, now.
+            let applied = unsafe { ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None) };
+            if applied != DISP_CHANGE_SUCCESSFUL {
+                return Err(format!("Windows couldn't move the display (code {})", applied.0));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Turns the source off: it leaves the desktop, and its windows move to the other displays.

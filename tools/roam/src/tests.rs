@@ -549,3 +549,22 @@ fn lending_several_screens_says_which() {
     harness.send(Msg::Status(Box::new(update)));
     assert!(harness.shows("Desk PC is using this computer's screens as displays"), "{:?}", harness.texts());
 }
+
+#[test]
+fn a_display_moved_in_the_systems_settings_moves_its_computer_on_the_desk() {
+    let mut harness = Harness::<Tool>::start();
+    harness.send(Msg::Status(Box::new(status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]))));
+    harness.click("Add");
+    let before = desk(&harness);
+    let mut update = status(vec![view("pc", "Desk PC", Os::Windows, LinkState::Connected)]);
+    let moved = |at: [f64; 2]| {
+        vec![Placement { id: "me".into(), at: [0.0, 0.0], scroll: 1.0 }, Placement { id: "pc".into(), at, scroll: 1.0 }]
+    };
+    update.moved = Some((1, moved([1712.0, -100.0])));
+    harness.send(Msg::Status(Box::new(update.clone())));
+    assert_eq!(desk(&harness)[1].at, [1712.0, -100.0], "saved where the engine moved it");
+    // The same move again changes nothing; Undo puts it back.
+    harness.send(Msg::Status(Box::new(update)));
+    harness.click("Undo");
+    assert_eq!(desk(&harness)[1].at, before[1].at);
+}

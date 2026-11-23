@@ -45,6 +45,15 @@ const KEY_EVERY: Duration = Duration::from_millis(500);
 /// How long an extended display waits for the other computer after the network drops, before
 /// it gives up and the virtual display goes.
 const HOLD_FOR: u64 = 120 * super::SECOND;
+/// How long after the desk last changed the virtual displays move: moving one makes the
+/// system set its displays up again, which costs every extended display a moment's picture.
+const PLACE_AFTER: u64 = super::SECOND * 2 / 5;
+/// How long a virtual display sent somewhere may take to get there.
+const PLACING_FOR: u64 = 3 * super::SECOND;
+/// How long after this computer's own screens change the desk may take to show it.
+const SCREENS_SETTLE: u64 = 2 * super::SECOND;
+/// How far, in this computer's units, a virtual display may be from its spot and still be there.
+const NEAR: i32 = 2;
 const HOLD: Duration = Duration::from_secs(120);
 /// How often the host tries the picture stream again while it's down.
 const RETRY_EVERY: Duration = Duration::from_millis(700);
@@ -93,6 +102,8 @@ pub(super) struct Extended {
     pub rect: Option<Rect>,
     pub feed: Option<Feed>,
     pub place: Option<Sender<[i32; 2]>>,
+    /// Till when it may still be on its way to where it was last sent.
+    pub placing_until: u64,
     /// The way to the other computer's stream, for the host's thread: a new one when the
     /// session forms again.
     pub route: Option<Sender<Route>>,
@@ -341,6 +352,7 @@ impl Core {
             rect: None,
             feed: None,
             place: None,
+            placing_until: 0,
             route: None,
             asked_at: now,
             held_since: None,
@@ -356,7 +368,7 @@ impl Core {
         match failed {
             Some(why) => entry.state = State::Failed(why),
             None => {
-                self.note(&format!("asking {} for its display {display} as an extended display", self.who(peer)));
+                self.note(&format!("asking for {} as an extended display", self.screen_name(peer, display)));
                 if let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) {
                     link.queue(Message::Lend { display });
                 }
@@ -441,7 +453,7 @@ impl Core {
         let route = Route { addr, session: session_id, keys: stream::keys(link.bulk_send()) };
         if held {
             // Back after the network dropped: the display is still up, only the way to it is new.
-            self.note(&format!("{name} lends its display {display} again: the extended display carries on"));
+            self.note(&format!("{screen} is lent again: the extended display carries on"));
             if let Some(entry) = self.extended.get_mut(&key) {
                 entry.held_since = None;
                 entry.state = State::Working("Reconnecting".into());
@@ -463,7 +475,7 @@ impl Core {
             serial,
             display,
             want: Want { name: system_name, panel, at, units, ppu, also, pointer_apart },
-            screen,
+            screen: screen.clone(),
             route,
             routes,
             feed: feed.clone(),
@@ -474,7 +486,7 @@ impl Core {
             udp,
         };
         self.note(&format!(
-            "{name} lends its display {display}: {}x{} at {} Hz, scale {}; making it {}x{} at ({}, {}), as it is on the desk",
+            "{screen} is lent: {}x{} at {} Hz, scale {}; making it {}x{} at ({}, {}), as it is on the desk",
             panel.pixels[0], panel.pixels[1], panel.hz, panel.scale, units[0], units[1], at[0], at[1]
         ));
         let started = std::thread::Builder::new().name("roam-host".into()).spawn(move || host(job));
@@ -491,20 +503,78 @@ impl Core {
         entry.route = Some(reroute);
     }
 
-    /// The desk changed: move each virtual display to where its screen now sits.
+    /// The desk changed: each virtual display moves to where its screen now sits, once the
+    /// desk has stayed put a moment.
     pub(super) fn place_extended(&mut self) {
+        if !self.extended.is_empty() {
+            self.place_due = Some(self.now() + PLACE_AFTER);
+        }
+    }
+
+    /// Moves each virtual display that isn't where its screen sits on the desk.
+    fn place_now(&mut self) {
         let wanted: Vec<(Id, u8)> = self.extended.keys().copied().collect();
         for (peer, display) in wanted {
             let Some(at) = self.virtual_at(peer, display) else { continue };
-            if let Some(place) = self.extended.get(&(peer, display)).and_then(|e| e.place.as_ref()) {
+            let Some(entry) = self.extended.get(&(peer, display)) else { continue };
+            // One already there stays as it is: moving it costs its picture a moment.
+            if entry.rect.is_some_and(|r| near(r, at)) {
+                continue;
+            }
+            let until = self.now() + PLACING_FOR;
+            if let Some(entry) = self.extended.get_mut(&(peer, display))
+                && let Some(place) = entry.place.as_ref()
+            {
                 let _ = place.send(at);
+                entry.placing_until = until;
             }
         }
+    }
+
+    /// A virtual display the person moved in the system's display settings takes its screen
+    /// with it on the desk, and that screen's computer: Roam follows the arrangement they made
+    /// there instead of putting it back. Not while the desk is changing, or a display is on
+    /// its way somewhere.
+    fn follow_moved(&mut self, now: u64) {
+        if self.place_due.is_some() || now < self.real_changed_at + SCREENS_SETTLE {
+            return;
+        }
+        let moved = self.extended.iter().find_map(|(&(peer, display), entry)| {
+            let rect = entry.rect?;
+            if entry.state != State::Running || now < entry.placing_until {
+                return None;
+            }
+            let (at, screen) = self.virtual_spot(peer, display)?;
+            (!near(rect, at)).then_some((peer, display, rect, screen))
+        });
+        let Some((peer, display, rect, screen)) = moved else { return };
+        let mine = hex(&self.identity.id);
+        let my_spot = self.placements.iter().find(|p| p.id == mine).map_or([0.0, 0.0], |p| p.at);
+        let (real, ppu) = self.real_screens();
+        let [x, y] = Computer::new("me", real, ppu, my_spot).to_desk([rect.x, rect.y]);
+        let (dx, dy) = (x - screen.x, y - screen.y);
+        let id = hex(&peer);
+        let Some(placement) = self.placements.iter_mut().find(|p| p.id == id) else { return };
+        placement.at = [placement.at[0] + dx, placement.at[1] + dy];
+        self.note(&format!(
+            "{} was moved in the display settings: {} moves {dx:.0}, {dy:.0} on the desk with it",
+            self.screen_name(peer, display),
+            self.who(peer)
+        ));
+        let serial = self.moved.as_ref().map_or(1, |(serial, _)| serial.wrapping_add(1));
+        self.moved = Some((serial, self.placements.clone()));
+        // Its computer's other lent screens go along.
+        self.place_extended();
     }
 
     /// An extended display asked for and never answered gives up; one waiting for its session to
     /// come back asks again once it has, and gives up when it doesn't.
     pub(super) fn check_extended(&mut self, now: u64) {
+        if self.place_due.is_some_and(|due| now >= due) {
+            self.place_due = None;
+            self.place_now();
+        }
+        self.follow_moved(now);
         let (mut ask, mut gone) = (Vec::new(), Vec::new());
         for (&(id, display), entry) in &mut self.extended {
             if entry.state == State::Asking && now.saturating_sub(entry.asked_at) > ASK_FOR {
@@ -522,7 +592,7 @@ impl Core {
             }
         }
         for (id, display) in ask {
-            self.note(&format!("{} is back: asking for its display {display} again", self.who(id)));
+            self.note(&format!("{} is back: asking for {} again", self.who(id), self.screen_name(id, display)));
             if let Some(link) = self.sessions.get_mut(&id).and_then(Session::live) {
                 link.queue(Message::Lend { display });
             }
@@ -691,6 +761,10 @@ impl Core {
             if let Some(feed) = self.extended.remove(&key).and_then(|e| e.feed) {
                 feed.stop();
             }
+            self.note(&format!(
+                "extended display of {} ends: the connection to it ended",
+                self.screen_name(key.0, key.1)
+            ));
         }
         if self.pointer_over.is_some_and(|((peer, _), _)| peer == id && !self.extended.keys().any(|k| k.0 == id)) {
             self.pointer_over = None;
@@ -1087,7 +1161,8 @@ impl Upkeep {
         for text in job.feed.take_notes() {
             job.note(text);
         }
-        while let Ok(at) = job.placed.try_recv() {
+        // Only the latest place: each move sets the system's displays up again.
+        if let Some(at) = job.placed.try_iter().last() {
             hosted.place(at);
         }
         let rect = hosted.rect();
@@ -1843,6 +1918,11 @@ impl Arrivals {
             .map_or(String::new(), |lag| format!(", longest to draw {:.1} ms", lag.as_secs_f64() * 1000.0));
         format!("; the pointer drawn here, {:.0} moves a second{lag}", f64::from(self.pointers) / seconds)
     }
+}
+
+/// Whether a display at `rect` is at `at`, near enough.
+fn near(rect: Rect, at: [i32; 2]) -> bool {
+    (rect.x.round() as i32 - at[0]).abs() <= NEAR && (rect.y.round() as i32 - at[1]).abs() <= NEAR
 }
 
 #[cfg(test)]

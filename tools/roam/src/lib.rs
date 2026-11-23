@@ -177,6 +177,9 @@ pub struct Roam<B: Backend = Native> {
     history: Vec<Vec<Spot>>,
     /// The computer last nudged, so a run of nudges is one step of Undo.
     nudged: Option<String>,
+    /// The last desk the engine moved itself (an extended display moved in the system's display
+    /// settings), by its number.
+    moved_seen: u32,
     backend: PhantomData<B>,
 }
 
@@ -373,6 +376,7 @@ impl<B: Backend> Tool for Roam<B> {
             hover: None,
             history: Vec::new(),
             nudged: None,
+            moved_seen: 0,
             backend: PhantomData,
         };
         (roam, pump)
@@ -889,6 +893,20 @@ impl<B: Backend> Roam<B> {
         };
         self.status = status;
         let mut changed = !self.desk.is_empty() && self.ensure_me();
+        // An extended display moved in the system's display settings moves its computer here too.
+        if let Some((serial, placements)) = self.status.moved.clone()
+            && serial != self.moved_seen
+            && self.drag.is_none()
+        {
+            self.moved_seen = serial;
+            self.remember();
+            for placement in placements {
+                if let Some(spot) = self.desk.iter_mut().find(|s| s.id == placement.id) {
+                    changed |= spot.at != placement.at;
+                    spot.at = placement.at;
+                }
+            }
+        }
         let peers = self.status.peers.clone();
         for peer in &peers {
             if let Some(spot) = self.desk.iter_mut().find(|s| s.id == peer.id) {

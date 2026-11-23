@@ -1,4 +1,4 @@
-# Gets the Virtual Display Driver ready for more screens and sizes: sets how many it makes, and
+# Gets the Virtual Display Driver ready for the lent screens: sets how many it makes, and
 # adds any of -Sizes (2880x1620,...) its settings lack, then restarts its device, which reads
 # the file as it starts. Roam runs this as administrator, hidden, only while none of the
 # driver's screens is in use, and reads what happened from room.log in $Folder.
@@ -24,7 +24,7 @@ try {
     if (-not $Count) { throw "The driver's settings in $File don't say how many screens it makes" }
     $Had = 0
     [void][int]::TryParse($Count.InnerText.Trim(), [ref]$Had)
-    if ($Had -lt $Monitors) {
+    if ($Had -ne $Monitors) {
         $Count.InnerText = "$Monitors"
         Say "Screens in $File`: $Had to $Monitors"
     }

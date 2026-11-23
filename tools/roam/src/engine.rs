@@ -326,6 +326,9 @@ pub struct Status {
     pub coloured: Vec<Coloured>,
     /// Another computer's line-up guides are up on this one's screens.
     pub guided_by: Option<String>,
+    /// The desk as this computer moved it itself, when the person moved an extended display in
+    /// the system's display settings: numbered, newest last, for the editor to take on.
+    pub moved: Option<(u32, Vec<Placement>)>,
 }
 
 /// A running engine. Dropping it stops everything and gives the mouse and keyboard back.
@@ -619,6 +622,14 @@ struct Core {
     /// This computer's screens, lent to the computer controlling it.
     lending: Vec<Lending>,
     extend_serial: u32,
+    /// When the virtual displays move to where the desk now has their screens: a moment after
+    /// the desk last changed, so a run of changes moves them once.
+    place_due: Option<u64>,
+    /// When this computer's own screens last changed: the desk the editor sends may not show it
+    /// yet, so where the virtual displays are isn't read as the person moving them till later.
+    real_changed_at: u64,
+    /// The desk as moved here, for the editor: see `Status::moved`.
+    moved: Option<(u32, Vec<Placement>)>,
     /// The extended display this computer's cursor is over, whose lending computer is told
     /// where the pointer is the quick way, and where it was last said to be.
     pointer_over: Option<((Id, u8), [i32; 2])>,
@@ -718,6 +729,9 @@ impl Core {
             extended: HashMap::new(),
             lending: Vec::new(),
             extend_serial: 0,
+            place_due: None,
+            real_changed_at: 0,
+            moved: None,
             pointer_over: None,
             leading: None,
             following: None,
@@ -965,7 +979,11 @@ impl Core {
             self.screens_at = now + SCREENS_EVERY;
             let screens = self.platform.screens();
             if screens != self.screens {
+                let before = self.real_screens();
                 self.screens = screens;
+                if self.real_screens() != before {
+                    self.real_changed_at = now;
+                }
                 self.note(&format!("this computer's screens: {}", screens_words(&self.screens.0, self.screens.1)));
                 let (displays, ppu) = self.real_screens();
                 for session in self.sessions.values_mut() {
@@ -2665,6 +2683,7 @@ impl Core {
             lining_up: self.lining_up(),
             coloured: self.coloured(),
             guided_by: self.guided_by(),
+            moved: self.moved.clone(),
         }
     }
 }
