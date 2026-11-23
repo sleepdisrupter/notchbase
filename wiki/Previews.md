@@ -91,6 +91,8 @@ This makes previews safe to run next to your real notchbase.
 | `shelf-convert` (or `convert`) | the Shelf page with the Convert row open: the formats for the files on the shelf, each an icon over its name, and the x. The shelf needs files of one kind, so set `NOTCHBASE_SHELF_FILES` as for `shelf` |
 | `shelf-airdrop` (or `airdrop`) | the Shelf page with the first three items selected, folders included. On a Mac the row ends with the AirDrop button; Windows has no AirDrop, so there is none (with files on the shelf, as above) |
 | `video-drop` | the notch offering to take a YouTube tab: **Video** (aimed at) and **Audio**, side by side |
+| `layouts` (or `snap`) | the window layout picker, the left half marked as the app's usual layout: side-by-side layouts on top, stacked ones under them |
+| `layouts-stacked` | the layout picker with **Middle third** aimed at |
 | `video-layouts` | the layout picker with its two download cells, **Download video** aimed at |
 | `video-finding` | a [video download](Video-Downloads.md) looking its page up: a light chasing its tail and "Finding" |
 | `video` (or `video-downloading`) | a download 62% done: the ring, "62%" and the light under the notch |

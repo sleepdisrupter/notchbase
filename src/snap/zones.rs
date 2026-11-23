@@ -14,7 +14,6 @@ pub enum Zone {
     Full,
     Left,
     Right,
-    #[allow(dead_code)]
     Top,
     Bottom,
     TopLeft,
@@ -24,6 +23,9 @@ pub enum Zone {
     LeftThird,
     CenterThird,
     RightThird,
+    TopThird,
+    MiddleThird,
+    BottomThird,
     Center,
 }
 
@@ -45,7 +47,7 @@ impl Choice {
 }
 
 impl Zone {
-    pub const ALL: [Zone; 13] = [
+    pub const ALL: [Zone; 16] = [
         Zone::Full,
         Zone::Left,
         Zone::Right,
@@ -58,6 +60,9 @@ impl Zone {
         Zone::LeftThird,
         Zone::CenterThird,
         Zone::RightThird,
+        Zone::TopThird,
+        Zone::MiddleThird,
+        Zone::BottomThird,
         Zone::Center,
     ];
 
@@ -75,6 +80,9 @@ impl Zone {
             Zone::LeftThird => "Left third",
             Zone::CenterThird => "Center third",
             Zone::RightThird => "Right third",
+            Zone::TopThird => "Top third",
+            Zone::MiddleThird => "Middle third",
+            Zone::BottomThird => "Bottom third",
             Zone::Center => "Center",
         }
     }
@@ -96,6 +104,9 @@ impl Zone {
             Zone::LeftThird => unit(0.0, 0.0, third, 1.0),
             Zone::CenterThird => unit(third, 0.0, third, 1.0),
             Zone::RightThird => unit(2.0 * third, 0.0, third, 1.0),
+            Zone::TopThird => unit(0.0, 0.0, 1.0, third),
+            Zone::MiddleThird => unit(0.0, third, 1.0, third),
+            Zone::BottomThird => unit(0.0, 2.0 * third, 1.0, third),
             Zone::Center => {
                 let margin = (1.0 - CENTER_SHARE) * 0.5;
                 unit(margin, margin, CENTER_SHARE, CENTER_SHARE)
@@ -117,6 +128,9 @@ impl Zone {
             Zone::LeftThird => (3, 1, [0, 1], [0, 1]),
             Zone::CenterThird => (3, 1, [1, 2], [0, 1]),
             Zone::RightThird => (3, 1, [2, 3], [0, 1]),
+            Zone::TopThird => (1, 3, [0, 1], [0, 1]),
+            Zone::MiddleThird => (1, 3, [0, 1], [1, 2]),
+            Zone::BottomThird => (1, 3, [0, 1], [2, 3]),
             Zone::Center => return None,
         })
     }
@@ -314,6 +328,41 @@ mod tests {
         assert!(thirds[0].right() < thirds[1].left() && thirds[1].right() < thirds[2].left());
         assert!((thirds[0].width() - thirds[1].width()).abs() < 1e-3);
         assert!((thirds[1].width() - thirds[2].width()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn stacked_halves_leave_one_gap_everywhere() {
+        let top = Zone::Top.rect(LAPTOP, 8.0);
+        let bottom = Zone::Bottom.rect(LAPTOP, 8.0);
+        assert_eq!(top.top(), LAPTOP.top() + 8.0);
+        assert_eq!(bottom.bottom(), LAPTOP.bottom() - 8.0);
+        assert!((bottom.top() - top.bottom() - 8.0).abs() < 1e-3);
+        assert!((top.height() - bottom.height()).abs() < 1e-3);
+        assert_eq!((top.left(), top.right()), (8.0, 1512.0 - 8.0));
+    }
+
+    #[test]
+    fn stacked_thirds_are_equal_and_ordered() {
+        let tall = Rect::from_min_max(pos2(0.0, 0.0), pos2(1080.0, 1920.0));
+        let thirds = [Zone::TopThird, Zone::MiddleThird, Zone::BottomThird].map(|z| z.rect(tall, 8.0));
+        assert_eq!((thirds[0].top(), thirds[2].bottom()), (8.0, 1920.0 - 8.0));
+        for pair in thirds.windows(2) {
+            assert!((pair[1].top() - pair[0].bottom() - 8.0).abs() < 1e-3, "one gap between {pair:?}");
+            assert!((pair[0].height() - pair[1].height()).abs() < 1e-3);
+        }
+        assert!(thirds.iter().all(|r| r.left() == 8.0 && r.right() == 1080.0 - 8.0));
+    }
+
+    #[test]
+    fn previews_match_where_windows_go() {
+        let field = LAPTOP.shrink(8.0);
+        for zone in Zone::ALL.into_iter().filter(|zone| *zone != Zone::Center) {
+            let share = zone.share();
+            let rect = zone.rect(LAPTOP, 8.0);
+            let x = (rect.center().x - field.left()) / field.width();
+            let y = (rect.center().y - field.top()) / field.height();
+            assert!((x - share.center().x).abs() < 0.01 && (y - share.center().y).abs() < 0.01, "{zone:?}");
+        }
     }
 
     #[test]

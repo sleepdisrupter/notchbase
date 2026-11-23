@@ -114,6 +114,7 @@ pub(super) enum Preview {
     DockIntro,
     DockIntroOpen,
     Layouts,
+    LayoutsStacked,
     VideoDrop,
     VideoLayouts,
     VideoFinding,
@@ -186,6 +187,7 @@ impl Preview {
             "shelf" => Self::Shelf,
             "drop" => Self::Drop,
             "layouts" | "snap" => Self::Layouts,
+            "layouts-stacked" => Self::LayoutsStacked,
             "video-drop" => Self::VideoDrop,
             "video-layouts" => Self::VideoLayouts,
             "video-finding" => Self::VideoFinding,
@@ -297,6 +299,11 @@ impl Notch {
                 self.mode = Mode::Drop;
                 self.picking = true;
                 self.usual_pick = Some(super::drop_zone::layouts::Pick::Zone(crate::snap::Zone::Left));
+            }
+            Preview::LayoutsStacked => {
+                self.mode = Mode::Drop;
+                self.picking = true;
+                self.hot_pick = Some(super::drop_zone::layouts::Pick::Zone(crate::snap::Zone::MiddleThird));
             }
             Preview::VideoDrop => {
                 self.mode = Mode::Drop;

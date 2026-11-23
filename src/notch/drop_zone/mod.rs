@@ -77,14 +77,12 @@ impl Notch {
 
     pub(super) fn drop_geometry(&self) -> Geometry {
         let wide = if self.picking { self.layouts_width() } else { 300.0 };
+        let tall = WELL_H + if self.picking { layouts::STACKED_H } else { 0.0 };
         match self.style {
-            Style::Notch => Geometry {
-                w: (self.notch.x + 2.0 * 72.0).max(wide),
-                h: self.notch.y + WELL_H + 12.0,
-                r: 22.0,
-                ear: 10.0,
-            },
-            Style::Island => Geometry { w: wide, h: WELL_H + 20.0, r: 30.0, ear: 0.0 },
+            Style::Notch => {
+                Geometry { w: (self.notch.x + 2.0 * 72.0).max(wide), h: self.notch.y + tall + 12.0, r: 22.0, ear: 10.0 }
+            }
+            Style::Island => Geometry { w: wide, h: tall + 20.0, r: 30.0, ear: 0.0 },
         }
     }
 

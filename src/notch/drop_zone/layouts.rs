@@ -14,6 +14,10 @@ const CELL: egui::Vec2 = vec2(38.0, 26.0);
 const CELL_GAP: f32 = 8.0;
 const CELL_TOP: f32 = 12.0;
 const CELL_GROW: f32 = 2.0;
+/// Space between the side-by-side row and the stacked row under it.
+const ROW_GAP: f32 = 12.0;
+/// How much taller the well is for the stacked row.
+pub(in crate::notch) const STACKED_H: f32 = CELL.y + ROW_GAP;
 const PROMPT: &str = "Drop on a layout";
 const VIDEO_GAP: f32 = 12.0;
 const VIDEO_GLYPH: f32 = 14.0;
@@ -23,6 +27,7 @@ const AWAY_KEY: &str = if cfg!(target_os = "macos") { "⇧" } else { "Shift" };
 
 pub use crate::snap::Choice as Pick;
 
+/// The first row: layouts that put windows side by side.
 pub const PICKS: [Pick; 9] = [
     Pick::Auto,
     Pick::Fill,
@@ -35,6 +40,20 @@ pub const PICKS: [Pick; 9] = [
     Pick::Zone(Zone::Center),
 ];
 
+/// The second row: layouts that stack windows, each under the side-by-side layout it turns on its side. A column
+/// with nothing stacked gives its first-row layout.
+pub const STACKED: [Option<Pick>; PICKS.len()] = [
+    None,
+    None,
+    Some(Pick::Zone(Zone::Top)),
+    Some(Pick::Zone(Zone::Bottom)),
+    None,
+    Some(Pick::Zone(Zone::TopThird)),
+    Some(Pick::Zone(Zone::MiddleThird)),
+    Some(Pick::Zone(Zone::BottomThird)),
+    None,
+];
+
 pub(in crate::notch) fn width() -> f32 {
     PICKS.len() as f32 * CELL.x + (PICKS.len() - 1) as f32 * CELL_GAP + 36.0
 }
@@ -45,6 +64,14 @@ fn cells(well: Rect) -> [Rect; PICKS.len()] {
     std::array::from_fn(|i| {
         Rect::from_min_size(pos2(left + i as f32 * (CELL.x + CELL_GAP), well.top() + CELL_TOP), CELL)
     })
+}
+
+/// Every layout in the grid with its cell, the first row then the stacked one.
+fn grid(well: Rect) -> impl Iterator<Item = (Pick, Rect)> {
+    let first = cells(well);
+    let stacked = first.map(|rect| rect.translate(vec2(0.0, STACKED_H)));
+    let firsts = PICKS.into_iter().zip(first);
+    firsts.chain(STACKED.into_iter().zip(stacked).filter_map(|(pick, rect)| Some((pick?, rect))))
 }
 
 impl Notch {
@@ -111,10 +138,12 @@ impl Notch {
             return None;
         }
         let rects = cells(well);
-        PICKS.iter().zip(rects).find_map(|(pick, rect)| {
+        let column = rects.iter().position(|rect| {
             let column = rect.expand2(vec2(CELL_GAP * 0.5, 0.0));
-            (cursor.x >= column.left() && cursor.x < column.right()).then_some(*pick)
-        })
+            cursor.x >= column.left() && cursor.x < column.right()
+        })?;
+        let lower = cursor.y >= rects[column].bottom() + ROW_GAP * 0.5;
+        Some(STACKED[column].filter(|_| lower).unwrap_or(PICKS[column]))
     }
 
     pub fn set_usual_pick(&mut self, pick: Option<Pick>) {
@@ -130,10 +159,10 @@ impl Notch {
     }
 
     pub(super) fn layouts_ui(&self, canvas: &mut Canvas, well: Rect) {
-        for (pick, rect) in PICKS.iter().zip(cells(well)) {
-            let hot = self.hot_pick == Some(*pick);
-            let usual = self.usual_pick == Some(*pick);
-            paint_cell(canvas, *pick, if hot { rect.expand(CELL_GROW) } else { rect }, hot, usual);
+        for (pick, rect) in grid(well) {
+            let hot = self.hot_pick == Some(pick);
+            let usual = self.usual_pick == Some(pick);
+            paint_cell(canvas, pick, if hot { rect.expand(CELL_GROW) } else { rect }, hot, usual);
             if usual {
                 canvas.circle(pos2(rect.center().x, rect.bottom() + 6.0), 1.8, color::PEARL);
             }
@@ -215,8 +244,8 @@ mod tests {
     fn every_cell_reaches_its_layout() {
         for n in [picking(island()), picking(notch())] {
             let well = n.drop_well(n.body_rect(n.drop_geometry()));
-            for (pick, rect) in PICKS.iter().zip(cells(well)) {
-                assert_eq!(n.pick_at(rect.center()), Some(*pick));
+            for (pick, rect) in grid(well) {
+                assert_eq!(n.pick_at(rect.center()), Some(pick));
             }
             assert_eq!(n.pick_at(pos2(well.left() - 40.0, well.center().y)), None);
         }
@@ -226,10 +255,44 @@ mod tests {
     fn cells_fit_in_well() {
         for n in [picking(island()), picking(notch())] {
             let well = n.drop_well(n.body_rect(n.drop_geometry()));
-            for rect in cells(well) {
+            for (_, rect) in grid(well) {
                 assert!(well.contains_rect(rect.expand(CELL_GROW)), "{rect:?} spills out of {well:?}");
             }
         }
+    }
+
+    #[test]
+    fn stacked_layouts_sit_under_their_side_by_side_ones() {
+        let n = picking(island());
+        let well = n.drop_well(n.body_rect(n.drop_geometry()));
+        let first = cells(well);
+        let under = |i: usize| pos2(first[i].center().x, first[i].bottom() + STACKED_H - CELL.y * 0.5);
+        assert_eq!(n.pick_at(under(2)), Some(Pick::Zone(Zone::Top)), "under the left half");
+        assert_eq!(n.pick_at(under(3)), Some(Pick::Zone(Zone::Bottom)), "under the right half");
+        assert_eq!(n.pick_at(under(6)), Some(Pick::Zone(Zone::MiddleThird)), "under the center third");
+        assert_eq!(n.pick_at(under(0)), Some(Pick::Auto), "a column with nothing stacked keeps its layout");
+        let stacked = STACKED.iter().flatten().count();
+        assert_eq!(grid(well).count(), PICKS.len() + stacked);
+    }
+
+    #[test]
+    fn stacked_row_clears_the_label() {
+        for n in [picking(island()), picking(notch())] {
+            let well = n.drop_well(n.body_rect(n.drop_geometry()));
+            let lowest = grid(well).map(|(_, rect)| rect.bottom()).fold(f32::MIN, f32::max);
+            let dot = lowest + 6.0 + 1.8;
+            assert!(well.bottom() - 16.0 - 8.0 > dot, "the label runs into the stacked row in {well:?}");
+        }
+    }
+
+    #[test]
+    fn well_grows_only_for_the_picker() {
+        let mut n = island();
+        n.set_drop_hover(Some(1));
+        let files = n.drop_geometry().h;
+        n.set_drop_hover(None);
+        let n = picking(n);
+        assert_eq!(n.drop_geometry().h, files + STACKED_H);
     }
 
     #[test]

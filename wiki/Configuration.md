@@ -319,7 +319,7 @@ A Keep Awake session and a running Timer are also remembered across restarts and
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `snap.enabled` | `true` | Drag a window to the notch to lay it out; hold Shift over a layout to send it to the next display instead. "Fill the free space" gives it the biggest empty area left on the screen |
+| `snap.enabled` | `true` | Drag a window to the notch to lay it out; hold Shift over a layout to send it to the next display instead. "Fill the free space" gives it the biggest empty area left on the screen. The top row lays windows side by side (halves, thirds); the row under it stacks them (top and bottom halves under the left and right halves, three stacked thirds under the thirds) |
 | `snap.gap` | `8` | Space between windows and screen edges, in points |
 
 The layout you pick for each app is learned in `snap-habits.json` in the data folder; the notch marks your usual one.

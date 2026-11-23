@@ -240,6 +240,8 @@ mod tests {
                 Preview::AgentsExpanded,
                 Preview::AgentsWaiting,
                 Preview::AgentsEmpty,
+                Preview::Layouts,
+                Preview::LayoutsStacked,
                 Preview::VideoDrop,
                 Preview::VideoLayouts,
                 Preview::VideoFinding,
