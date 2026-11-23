@@ -138,6 +138,7 @@ const SESSION_TAP: u32 = 1;
 const HEAD: u32 = 0;
 const ACTIVE: u32 = 0;
 const KEY_DOWN: u32 = 10;
+const KEY_UP: u32 = 11;
 const FLAGS_CHANGED: u32 = 12;
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_BY_INPUT: u32 = 0xFFFF_FFFF;
@@ -196,6 +197,11 @@ impl Platform for Native {
     }
 
     fn hotkey_down(&self, hotkey: Hotkey) -> Option<bool> {
+        // The tap keeps fn from the system, so the system's own key state never sees it go down:
+        // ask the tap instead.
+        if hotkey == Hotkey::Fn {
+            return self.tap.as_ref().map(|tap| tap.held.load(Ordering::Relaxed));
+        }
         let flags = unsafe { CGEventSourceFlagsState(HID_STATE) };
         Some(flags & mask(hotkey)? != 0)
     }
@@ -485,7 +491,7 @@ struct Watched {
     hotkey: Hotkey,
     keys: KeySink,
     listening: Arc<AtomicBool>,
-    held: AtomicBool,
+    held: Arc<AtomicBool>,
     port: AtomicPtr<c_void>,
 }
 
@@ -496,19 +502,21 @@ unsafe impl Send for Loop {}
 struct KeyTap {
     run_loop: Loop,
     join: Option<JoinHandle<()>>,
+    /// Whether the tap last saw the key go down.
+    held: Arc<AtomicBool>,
 }
 
 impl KeyTap {
     fn install(hotkey: Hotkey, keys: KeySink, listening: Arc<AtomicBool>) -> Option<Self> {
         let (ready_tx, ready) = mpsc::sync_channel(1);
-        let watched =
-            Watched { hotkey, keys, listening, held: AtomicBool::new(false), port: AtomicPtr::new(null_mut()) };
+        let held = Arc::new(AtomicBool::new(false));
+        let watched = Watched { hotkey, keys, listening, held: held.clone(), port: AtomicPtr::new(null_mut()) };
         let join = thread::Builder::new()
             .name("notchbase dictation key".into())
             .spawn(move || tap_thread(watched, &ready_tx))
             .ok()?;
         match ready.recv() {
-            Ok(Some(run_loop)) => Some(Self { run_loop, join: Some(join) }),
+            Ok(Some(run_loop)) => Some(Self { run_loop, join: Some(join), held }),
             _ => {
                 let _ = join.join();
                 None
@@ -529,7 +537,7 @@ impl Drop for KeyTap {
 fn tap_thread(watched: Watched, ready: &SyncSender<Option<Loop>>) {
     let watched = Box::new(watched);
     let user = (&raw const *watched).cast_mut().cast::<c_void>();
-    let events = (1 << KEY_DOWN) | (1 << FLAGS_CHANGED);
+    let events = (1 << KEY_DOWN) | (1 << KEY_UP) | (1 << FLAGS_CHANGED);
     let port = unsafe { CGEventTapCreate(HID_TAP, HEAD, ACTIVE, events, tapped, user) };
     if port.is_null() {
         let _ = ready.send(None);
@@ -586,11 +594,16 @@ extern "C" fn tapped(_proxy: Ref, kind: u32, event: Ref, user: *mut c_void) -> R
             }
             // fn on its own is dictation's: the system never sees it, so a press or double press
             // can't open the emoji picker, switch the input source or call up Siri on the way.
-            // Keys pressed with fn still carry it.
+            // Keys pressed with fn get it back below.
             if watched.hotkey == Hotkey::Fn { null_mut() } else { event }
         }
-        KEY_DOWN => {
-            if unsafe { CGEventGetIntegerValueField(event, AUTOREPEAT) } != 0 {
+        KEY_DOWN | KEY_UP => {
+            // With fn's own events kept from the system, keys pressed with it would arrive
+            // without it, so fn+E, fn+F and fn+arrows would act as plain keys. Put it back on them.
+            if watched.hotkey == Hotkey::Fn && watched.held.load(Ordering::Relaxed) {
+                unsafe { CGEventSetFlags(event, CGEventGetFlags(event) | SECONDARY_FN) };
+            }
+            if kind == KEY_UP || unsafe { CGEventGetIntegerValueField(event, AUTOREPEAT) } != 0 {
                 return event;
             }
             if keycode == ESCAPE_CODE && watched.listening.load(Ordering::Relaxed) {
