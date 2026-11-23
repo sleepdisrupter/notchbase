@@ -506,11 +506,12 @@ mod displays {
                 seen.wants.push(want.clone());
                 seen.wants.len() as u8
             };
+            // As big as asked, as both real hosts make it.
             let rect = Rect::new(
                 f64::from(want.at[0]),
                 f64::from(want.at[1]),
-                f64::from(want.panel.pixels[0]),
-                f64::from(want.panel.pixels[1]),
+                f64::from(want.units[0]),
+                f64::from(want.units[1]),
             );
             let rect = if self.snap { snap_like_windows(rect, &self.fake.state().screens) } else { rect };
             self.fake.state().screens.push(rect);
@@ -681,11 +682,13 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
         assert_eq!(wants.len(), 1);
         assert_eq!(wants[0].panel.pixels, [2560, 1440], "the lent screen's own pixels");
         assert_eq!(wants[0].at, [1920 + 1512, 0], "where that screen sits on the desk");
+        assert_eq!(wants[0].units, [1280, 720], "and as big as it is there");
+        assert_eq!(wants[0].also, vec![[1512, 982]], "the Mac's other screen, in case it's lent too");
     }
     displays::wait("pictures shown on the Mac", || viewer.seen.lock().unwrap().pictures.len() >= 3);
     {
         let seen = viewer.seen.lock().unwrap();
-        assert_eq!(seen.shown, vec![(Rect::new(1512.0, 0.0, 1280.0, 720.0), [2560, 1440])]);
+        assert_eq!(seen.shown, vec![(Rect::new(1512.0, 0.0, 1280.0, 720.0), [1280, 720])]);
         assert!(seen.pictures[0].key, "it starts from a key picture");
     }
 
@@ -695,8 +698,7 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
     });
 
     // The Mac's built-in screen stays where it is on the desk, between the PC's own screen and
-    // the virtual display: pushing right from the PC's screen still reaches it, even though the
-    // PC's screens now reach past it.
+    // the virtual display: pushing right from the PC's screen still reaches it.
     a.wait_for("listening", |s| s.sink.is_some());
     assert!(a.fake.input(Input::Move { at: [1919.0, 500.0], delta: [5.0, 0.0] }));
     a.wait_for("the cursor over on the Mac's built-in screen", |s| s.captured);
@@ -710,7 +712,7 @@ fn a_screen_lent_as_an_extended_display_takes_its_place_on_the_desk() {
 
     // The Mac's own mouse over the lent screen works the PC's cursor there.
     displays::remote(&viewer.seen, Remote::Move([0.5, 0.5]));
-    a.wait_for("the cursor put on the virtual display", |s| s.warped.contains(&[3432.0 + 1280.0, 720.0]));
+    a.wait_for("the cursor put on the virtual display", |s| s.warped.contains(&[3432.0 + 640.0, 360.0]));
 
     // Disconnecting gives the screen back.
     a.engine.send(Control::Unextend { id: b_id.clone(), display: Some(1) });
@@ -915,8 +917,8 @@ fn dragging_over_an_extended_display_keeps_its_stream() {
 }
 
 /// The Mac lends its Full HD monitor, which sits above its built-in screen, to a PC at 150%
-/// beside the built-in screen. Windows puts the virtual display against the PC's own screen,
-/// not where the monitor is on the desk, and it's smaller there than the monitor is.
+/// beside the built-in screen. The virtual display is as big as the monitor is on the desk
+/// (2880 by 1620 pixels at 150%), and where it is, which touches the PC's own screen.
 fn lend_the_screen_above(pc_on_the_left: bool) -> (Machine, Machine, Rect) {
     let a_port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
     let b_port = a_port + 1;
@@ -969,7 +971,7 @@ fn the_lending_computers_other_screen_stays_beside_the_pc_while_one_is_lent() {
     // The PC on the left: right from anywhere along its edge that faces the built-in screen
     // (clear of the corner, which a Mac running this keeps for hot corners).
     let (a, _b, virtual_display) = lend_the_screen_above(true);
-    assert_eq!(virtual_display, Rect::new(1830.0, -1080.0, 1920.0, 1080.0), "where Windows puts it");
+    assert_eq!(virtual_display, Rect::new(1830.0, -1620.0, 2880.0, 1620.0), "just where the monitor is on the desk");
     for y in [100.0, 600.0, 1040.0] {
         assert!(crosses_and_stays(&a, [1919.0, y], [6.0, 0.0]), "right from the PC at {y}\n{}", log_of(&a));
     }
@@ -977,15 +979,29 @@ fn the_lending_computers_other_screen_stays_beside_the_pc_while_one_is_lent() {
     let below = virtual_display.bottom() - 1.0;
     assert!(crosses_and_stays(&a, [virtual_display.x + 300.0, below], [0.0, 6.0]), "{}", log_of(&a));
 
-    // The PC on the right: Windows puts the virtual display above its screen, and the built-in
-    // screen is still across from the PC's left edge.
+    // The PC on the right: the virtual display is above its screen, and the built-in screen is
+    // still across from the PC's left edge.
     let (a, _b, virtual_display) = lend_the_screen_above(false);
-    assert_eq!(virtual_display, Rect::new(-1919.0, -1080.0, 1920.0, 1080.0), "where Windows puts it");
+    assert_eq!(virtual_display, Rect::new(-2295.0, -1620.0, 2880.0, 1620.0), "just where the monitor is on the desk");
     for y in [100.0, 600.0, 1040.0] {
         assert!(crosses_and_stays(&a, [0.0, y], [-6.0, 0.0]), "left from the PC at {y}\n{}", log_of(&a));
     }
     let below = virtual_display.bottom() - 1.0;
     assert!(crosses_and_stays(&a, [virtual_display.x + 300.0, below], [0.0, 6.0]), "{}", log_of(&a));
+}
+
+#[test]
+fn the_cursor_leaves_a_lent_screen_just_where_it_would_if_the_screen_werent_lent() {
+    // The Mac's monitor sits above its built-in screen, 60 points further left. Down from the
+    // monitor 780 points in, the Mac's own cursor lands 720 points into the built-in screen:
+    // down from the virtual display that stands for it, as far in, lands there too.
+    let (a, b, virtual_display) = lend_the_screen_above(true);
+    let x = virtual_display.x + 780.0 * 1.5;
+    a.fake.input(Input::Move { at: [x, virtual_display.bottom() - 1.0], delta: [0.0, 6.0] });
+    a.wait_for("the cursor over on the Mac's built-in screen", |s| s.captured);
+    b.wait_for("the cursor arriving straight below", |s| {
+        s.played.iter().any(|p| matches!(p, Play::Move([x, y]) if (x - 720.0).abs() <= 3.0 && *y >= 0.0 && *y < 20.0))
+    });
 }
 
 #[test]

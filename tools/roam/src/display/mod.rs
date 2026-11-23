@@ -21,6 +21,8 @@ pub mod h264;
 mod nv12;
 pub mod stream;
 pub mod udp;
+#[cfg(any(windows, test))]
+mod vdd_settings;
 
 #[cfg(target_os = "macos")]
 mod mac;
@@ -57,6 +59,15 @@ pub struct Want {
     pub panel: Panel,
     /// Where its top left goes, in the host's own units.
     pub at: [i32; 2],
+    /// How big it is, in the host's own units: as big as the lent screen is on the desk, so the
+    /// pointer meets its edges just where it meets the screen's own when nothing is lent.
+    pub units: [u32; 2],
+    /// The host's units to a point on the desk.
+    pub ppu: f64,
+    /// The sizes the lending computer's other screens would take, in the same units: a host
+    /// that has to get ready for a size gets ready for those too, so lending them later
+    /// needn't ask again.
+    pub also: Vec<[u32; 2]>,
     /// The lending computer draws the pointer itself: a host that can sends it with
     /// `Feed::pointer` and leaves it out of the pictures, so it moves without waiting for them.
     pub pointer_apart: bool,
@@ -493,18 +504,18 @@ pub trait Displays: Send + Sync {
     fn draws_pointer(&self) -> bool {
         false
     }
-    /// Installs what making virtual displays needs, asking the system for permission. Blocks
-    /// until done.
-    fn install(&self) -> Result<(), String> {
+    /// Installs what making virtual displays needs, ready for displays as `want` says, asking
+    /// the system for permission. Blocks until done.
+    fn install(&self, _want: &Want) -> Result<(), String> {
         Err("There's nothing to install on this computer".into())
     }
-    /// Whether another virtual display can be made without asking the system first.
-    fn has_room(&self) -> bool {
+    /// Whether a virtual display as `want` says can be made without asking the system first.
+    fn has_room(&self, _want: &Want) -> bool {
         true
     }
-    /// Makes room for more virtual displays, asking the system for permission, while none is in
-    /// use. Blocks until done.
-    fn make_room(&self) -> Result<(), String> {
+    /// Gets ready for virtual displays as `want` says, and as many as anyone lends, asking the
+    /// system for permission, while none is in use. Blocks until done.
+    fn make_room(&self, _want: &Want) -> Result<(), String> {
         Ok(())
     }
     /// Makes a virtual display and starts sending what's on it to `feed`. Several can be up at
@@ -572,6 +583,13 @@ impl Displays for Unsupported {
     }
 }
 
+impl Want {
+    /// Every size the lending computer's screens take here: this one's first.
+    pub fn sizes(&self) -> Vec<[u32; 2]> {
+        std::iter::once(self.units).chain(self.also.iter().copied()).collect()
+    }
+}
+
 /// The picture size for a panel: its own pixels, kept within what H.264 levels and a home
 /// network carry well (4K), and even on both sides as the encoders need.
 pub fn picture_size(panel: Panel) -> [u32; 2] {
@@ -581,12 +599,117 @@ pub fn picture_size(panel: Panel) -> [u32; 2] {
     [w, h].map(|side| ((f64::from(side) * fit) as u32) & !1)
 }
 
+/// The size pictures of a display `shown` pixels big go out at, to show on `panel`: no more
+/// pixels than the panel has (or `picture_size` allows), none the display hasn't got, and its
+/// shape. A display with more pixels than the screen it stands for is scaled down before
+/// encoding, so the network carries no more than the screen can show.
+pub fn encode_size(shown: [u32; 2], panel: Panel) -> [u32; 2] {
+    let most = picture_size(panel);
+    let [w, h] = shown.map(|side| f64::from(side.max(2)));
+    let fit = (f64::from(most[0]) / w).min(f64::from(most[1]) / h).min(1.0);
+    // Within a pixel or two of the display's own size, it is the display's own size.
+    if fit > 0.998 {
+        return shown.map(|side| side & !1);
+    }
+    [w, h].map(|side| ((side * fit).round() as u32).max(2) & !1)
+}
+
+/// The size, in a computer's units, that a screen `desk` points big on the desk takes on a
+/// computer with `ppu` units to a point: even, and within what a virtual display can be.
+pub fn units_for(desk: [f64; 2], ppu: f64) -> [u32; 2] {
+    let ppu = if ppu.is_finite() && ppu > 0.0 { ppu } else { 1.0 };
+    let [w, h] = desk.map(|side| (side * ppu).max(64.0));
+    let fit = (f64::from(MOST_UNITS[0]) / w).min(f64::from(MOST_UNITS[1]) / h).min(1.0);
+    [w, h].map(|side| ((side * fit / 2.0).round() as u32) * 2)
+}
+
+/// The biggest virtual display, a side: 8K.
+pub const MOST_UNITS: [u32; 2] = [7680, 4320];
+
+/// The pointer's news scaled from pictures `from` pixels big to `to`: where it is, and its
+/// shape.
+pub fn scale_pointer(
+    news: (Option<PointerAt>, Option<PointerShape>),
+    from: [u32; 2],
+    to: [u32; 2],
+) -> (Option<PointerAt>, Option<PointerShape>) {
+    if from == to {
+        return news;
+    }
+    let (at, shape) = news;
+    let scale = [0, 1].map(|axis| f64::from(to[axis]) / f64::from(from[axis].max(1)));
+    let at = at.map(|at| PointerAt {
+        at: [0, 1].map(|axis| (f64::from(at.at[axis]) * scale[axis]).round() as i32),
+        visible: at.visible,
+    });
+    (at, shape.map(|shape| scale_shape(&shape, scale)))
+}
+
+/// A point of the pointer's shape (its hotspot), scaled as `scale_pointer` scales the shape.
+pub fn scale_hotspot(hotspot: [i32; 2], from: [u32; 2], to: [u32; 2]) -> [i32; 2] {
+    [0, 1].map(|axis| (f64::from(hotspot[axis]) * f64::from(to[axis]) / f64::from(from[axis].max(1))).round() as i32)
+}
+
+/// The pointer's shape at `scale` its size, each new pixel the average of the ones it covers,
+/// weighed by how much of each it covers and how opaque that is, so edges stay clean.
+pub fn scale_shape(shape: &PointerShape, scale: [f64; 2]) -> PointerShape {
+    if !shape.sound() || scale.iter().any(|s| !s.is_finite() || *s <= 0.0) {
+        return shape.clone();
+    }
+    let [w, h] = shape.size;
+    let size =
+        [0, 1].map(|axis| ((f64::from(shape.size[axis]) * scale[axis]).round() as u32).clamp(1, PointerShape::MOST));
+    if size == shape.size {
+        return shape.clone();
+    }
+    let [nw, nh] = size;
+    let mut rgba = vec![0u8; nw as usize * nh as usize * 4];
+    // Where each new pixel's span starts and ends among the old ones, along one side.
+    let spans = |old: u32, new: u32| -> Vec<(f64, f64)> {
+        let step = f64::from(old) / f64::from(new);
+        (0..new).map(|i| (f64::from(i) * step, (f64::from(i + 1) * step).min(f64::from(old)))).collect()
+    };
+    let (xs, ys) = (spans(w, nw), spans(h, nh));
+    for (y, &(top, bottom)) in ys.iter().enumerate() {
+        for (x, &(left, right)) in xs.iter().enumerate() {
+            let mut sum = [0.0f64; 4];
+            let mut area = 0.0;
+            let mut row = top.floor();
+            while row < bottom {
+                let cover_y = (row + 1.0).min(bottom) - row.max(top);
+                let mut col = left.floor();
+                while col < right {
+                    let cover = cover_y * ((col + 1.0).min(right) - col.max(left));
+                    let at = (row as usize * w as usize + col as usize) * 4;
+                    let alpha = f64::from(shape.rgba[at + 3]) / 255.0;
+                    for (total, &value) in sum.iter_mut().zip(&shape.rgba[at..at + 3]) {
+                        *total += f64::from(value) * alpha * cover;
+                    }
+                    sum[3] += alpha * cover;
+                    area += cover;
+                    col += 1.0;
+                }
+                row += 1.0;
+            }
+            let out = (y * nw as usize + x) * 4;
+            if sum[3] > 0.0 {
+                for channel in 0..3 {
+                    rgba[out + channel] = (sum[channel] / sum[3]).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            rgba[out + 3] = (sum[3] / area.max(f64::EPSILON) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    PointerShape { size, rgba }
+}
+
 /// Of the sizes a display offers, the one to show a `want`-sized screen at: the same shape as
-/// near as there is, then the nearest in size. Only even sizes up to 4K, which the encoders take.
+/// near as there is, then the nearest in size. Only even sizes up to 8K.
 pub fn closest_size(offered: &[[u32; 2]], want: [u32; 2]) -> Option<[u32; 2]> {
     let shape = |[w, h]: [u32; 2]| (f64::from(w) / f64::from(h.max(1))).ln();
     let area = |[w, h]: [u32; 2]| (f64::from(w) * f64::from(h)).max(1.0).ln();
-    let fits = |&&[w, h]: &&[u32; 2]| w > 0 && h > 0 && w % 2 == 0 && h % 2 == 0 && w <= 3840 && h <= 2160;
+    let fits =
+        |&&[w, h]: &&[u32; 2]| w > 0 && h > 0 && w % 2 == 0 && h % 2 == 0 && w <= MOST_UNITS[0] && h <= MOST_UNITS[1];
     offered.iter().filter(fits).copied().min_by_key(|&size| {
         // Shapes within about 2% count as the same.
         let off_shape = ((shape(size) - shape(want)).abs() * 50.0).round() as u64;
@@ -607,7 +730,8 @@ mod tests {
         assert_eq!(closest_size(&offered, [3024, 1964]), Some([1920, 1200]));
         assert_eq!(closest_size(&offered, [3440, 1440]), Some([2560, 1440]), "the widest shape there is, nearest size");
         assert_eq!(closest_size(&offered, [2048, 1152]), Some([1920, 1080]));
-        assert_eq!(closest_size(&[[1365, 767], [5120, 2880]], [1366, 768]), None, "odd and too big are out");
+        assert_eq!(closest_size(&[[1365, 767], [8192, 4608]], [1366, 768]), None, "odd and too big are out");
+        assert_eq!(closest_size(&[[1920, 1080], [2880, 1620]], [2880, 1620]), Some([2880, 1620]), "past 4K is fine");
         assert_eq!(closest_size(&[], [1920, 1080]), None);
     }
 
@@ -618,6 +742,58 @@ mod tests {
         assert_eq!(picture_size(panel([5120, 2880])), [3840, 2160]);
         assert_eq!(picture_size(panel([1365, 767])), [1364, 766]);
         assert_eq!(picture_size(panel([6016, 3384])), [3840, 2160]);
+    }
+
+    #[test]
+    fn a_virtual_display_is_as_big_as_its_screen_on_the_desk() {
+        assert_eq!(units_for([1920.0, 1080.0], 1.5), [2880, 1620], "a PC at 150%");
+        assert_eq!(units_for([1470.0, 956.0], 1.5), [2206, 1434], "even on both sides");
+        assert_eq!(units_for([1280.0, 720.0], 1.0), [1280, 720], "a Mac borrowing a PC's screen");
+        assert_eq!(units_for([5120.0, 2880.0], 2.0), [7680, 4320], "within 8K, the same shape");
+    }
+
+    #[test]
+    fn pictures_go_out_at_the_screens_own_pixels() {
+        let panel = |pixels| Panel { pixels, hz: 60, scale: 1.0 };
+        assert_eq!(encode_size([2880, 1620], panel([1920, 1080])), [1920, 1080], "scaled down to the panel");
+        assert_eq!(encode_size([1920, 1080], panel([1920, 1080])), [1920, 1080]);
+        assert_eq!(encode_size([1280, 720], panel([1920, 1080])), [1280, 720], "never scaled up");
+        assert_eq!(encode_size([2206, 1434], panel([2940, 1912])), [2206, 1434]);
+        assert_eq!(encode_size([5120, 2880], panel([5120, 2880])), [3840, 2160], "within 4K");
+        assert_eq!(encode_size([2560, 1440], panel([1920, 1200])), [1920, 1080], "its own shape");
+    }
+
+    #[test]
+    fn the_pointer_scales_with_the_pictures() {
+        let at = PointerAt { at: [300, 150], visible: true };
+        let shape = PointerShape { size: [48, 48], rgba: [255, 255, 255, 255].repeat(48 * 48) };
+        let (moved, shaped) = scale_pointer((Some(at), Some(shape.clone())), [2880, 1620], [1920, 1080]);
+        assert_eq!(moved, Some(PointerAt { at: [200, 100], visible: true }));
+        let shaped = shaped.expect("a shape");
+        assert_eq!(shaped.size, [32, 32]);
+        assert!(shaped.sound());
+        assert!(shaped.rgba.iter().all(|&byte| byte == 255), "a solid shape stays solid");
+        assert_eq!(scale_hotspot([6, 9], [2880, 1620], [1920, 1080]), [4, 6]);
+        let same = scale_pointer((Some(at), Some(shape.clone())), [1920, 1080], [1920, 1080]);
+        assert_eq!(same, (Some(at), Some(shape)));
+    }
+
+    #[test]
+    fn a_scaled_pointer_keeps_clear_edges() {
+        // Black at the left half, see-through at the right: no grey seeps into the clear half.
+        let mut rgba = Vec::new();
+        for _ in 0..4 {
+            rgba.extend([0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 0, 255, 255, 255, 0]);
+        }
+        let shape = PointerShape { size: [4, 4], rgba };
+        let half = scale_shape(&shape, [0.5, 0.5]);
+        assert_eq!(half.size, [2, 2]);
+        assert_eq!(&half.rgba[..8], &[0, 0, 0, 255, 0, 0, 0, 0]);
+        // Three pixels into two: the middle one counts half to each.
+        let shape = PointerShape { size: [3, 1], rgba: vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 0] };
+        let two = scale_shape(&shape, [2.0 / 3.0, 1.0]);
+        assert_eq!(two.size, [2, 1]);
+        assert_eq!(two.rgba, vec![0, 0, 0, 255, 0, 0, 0, 85], "half an opaque pixel of a pixel and a half");
     }
 
     #[test]

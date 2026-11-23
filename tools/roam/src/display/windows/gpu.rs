@@ -1,8 +1,10 @@
 //! Pictures that stay on the graphics card, as game streaming keeps them: the duplicated
 //! desktop is copied card to card, the pointer drawn on with only its own patch coming off
-//! the card, and the card's video processor turns it into NV12 for the encoder. No full
-//! picture is read back or converted on the processor.
+//! the card, and the card's video processor turns it into NV12 for the encoder, scaling it
+//! down on the way where the pictures go out smaller than the display. No full picture is read
+//! back or converted on the processor.
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_FLAG, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VIDEO_ENCODER, D3D11_BOX,
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
@@ -38,6 +40,7 @@ pub struct Gpu {
     context: ID3D11DeviceContext,
     video: ID3D11VideoContext,
     processor: ID3D11VideoProcessor,
+    /// The display's size: the pictures may be smaller.
     size: [u32; 2],
     /// The desktop with the pointer on it, and the video processor's view of it.
     composed: ID3D11Texture2D,
@@ -53,7 +56,13 @@ pub struct Gpu {
 unsafe impl Send for Gpu {}
 
 impl Gpu {
-    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext, size: [u32; 2], fps: u32) -> Result<Self, String> {
+    pub fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        size: [u32; 2],
+        out: [u32; 2],
+        fps: u32,
+    ) -> Result<Self, String> {
         fn err(what: &'static str) -> impl Fn(windows::core::Error) -> String {
             move |err| format!("{what}: {}", err.message())
         }
@@ -66,8 +75,8 @@ impl Gpu {
             InputWidth: size[0],
             InputHeight: size[1],
             OutputFrameRate: rate,
-            OutputWidth: size[0],
-            OutputHeight: size[1],
+            OutputWidth: out[0],
+            OutputHeight: out[1],
             Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
         };
         // SAFETY: plain creation calls on a device we hold; everything made is owned here.
@@ -83,6 +92,11 @@ impl Gpu {
             let processor = video_device.CreateVideoProcessor(&enumerator, 0).map_err(err("No video processor"))?;
             video.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
             video.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+            // The whole display into the whole picture, scaled where they differ.
+            let whole = |[w, h]: [u32; 2]| RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+            video.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&whole(size)));
+            video.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&whole(out)));
+            video.VideoProcessorSetOutputTargetRect(&processor, true, Some(&whole(out)));
             video.VideoProcessorSetStreamColorSpace(
                 &processor,
                 0,
@@ -119,7 +133,7 @@ impl Gpu {
                 // The encoder reads these: say so where the card allows it.
                 let nv12 = texture(
                     device,
-                    size,
+                    out,
                     DXGI_FORMAT_NV12,
                     &[D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER, D3D11_BIND_RENDER_TARGET],
                 )?;

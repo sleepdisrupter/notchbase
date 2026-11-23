@@ -1,8 +1,8 @@
-# Gives the Virtual Display Driver room for more screens: sets how many it makes in its settings
-# file and restarts its device, which reads the file as it starts. Roam runs this as
-# administrator, hidden, only while none of the driver's screens is in use, and reads what
-# happened from room.log in $Folder.
-param([Parameter(Mandatory = $true)][string]$Folder, [int]$Monitors = 4)
+# Gets the Virtual Display Driver ready for more screens and sizes: sets how many it makes, and
+# adds any of -Sizes (2880x1620,...) its settings lack, then restarts its device, which reads
+# the file as it starts. Roam runs this as administrator, hidden, only while none of the
+# driver's screens is in use, and reads what happened from room.log in $Folder.
+param([Parameter(Mandatory = $true)][string]$Folder, [int]$Monitors = 4, [string]$Sizes = '')
 
 $ErrorActionPreference = 'Stop'
 $Log = Join-Path $Folder 'room.log'
@@ -26,9 +26,28 @@ try {
     [void][int]::TryParse($Count.InnerText.Trim(), [ref]$Had)
     if ($Had -lt $Monitors) {
         $Count.InnerText = "$Monitors"
-        $Xml.Save($File)
         Say "Screens in $File`: $Had to $Monitors"
     }
+    # Each size the lent screens take, so the pointer meets their edges where it would.
+    $List = $Xml.SelectSingleNode('//resolutions')
+    foreach ($Size in ($Sizes -split ',' | Where-Object { $_ -match '^\d+x\d+$' })) {
+        if (-not $List) { Say "No sizes in $File to add $Size to"; break }
+        $Width, $Height = $Size -split 'x'
+        $There = @($List.SelectNodes('resolution') | Where-Object {
+                $W = $_.SelectSingleNode('width'); $H = $_.SelectSingleNode('height')
+                $W -and $H -and $W.InnerText.Trim() -eq $Width -and $H.InnerText.Trim() -eq $Height
+            })
+        if ($There.Count -gt 0) { continue }
+        $Node = $Xml.CreateElement('resolution')
+        foreach ($Pair in @(@('width', $Width), @('height', $Height), @('refresh_rate', '60'))) {
+            $Child = $Xml.CreateElement($Pair[0])
+            $Child.InnerText = $Pair[1]
+            [void]$Node.AppendChild($Child)
+        }
+        [void]$List.AppendChild($Node)
+        Say "Size added: $Size"
+    }
+    $Xml.Save($File)
 
     $Devices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains $HardwareId })
     if ($Devices.Count -eq 0) { throw 'The display driver has no device' }

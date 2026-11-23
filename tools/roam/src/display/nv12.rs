@@ -1,6 +1,7 @@
 //! BGRA to NV12 for the H.264 encoder (as the recorder does, in src/record/windows/nv12.rs), and NV12 back to
 //! BGRA for drawing decoded pictures. BGRA to NV12 uses with integer BT.709 limited range math. Bands of row pairs convert in
-//! parallel, and an oversized area is first box-filtered to half size.
+//! parallel, and an oversized area is first box-filtered to half size, or to any smaller size
+//! by averaging what each new pixel covers.
 
 use std::num::NonZeroUsize;
 
@@ -32,7 +33,11 @@ impl Converter {
         if self.output == self.source {
             to_nv12(bgra, self.output, self.workers, &mut self.nv12);
         } else {
-            halve(bgra, self.source, self.output, &mut self.halved);
+            if self.output.map(|side| side * 2) == self.source {
+                halve(bgra, self.source, self.output, &mut self.halved);
+            } else {
+                shrink(bgra, self.source, self.output, self.workers, &mut self.halved);
+            }
             to_nv12(&self.halved, self.output, self.workers, &mut self.nv12);
         }
         &self.nv12
@@ -112,6 +117,66 @@ fn halve(bgra: &[u8], [width, _]: [usize; 2], [out_width, out_height]: [usize; 2
     }
 }
 
+/// Any smaller size: each new pixel the average of the old ones it covers, weighed by how
+/// much of each it covers. Bands of rows in parallel.
+fn shrink(bgra: &[u8], source: [usize; 2], output: [usize; 2], workers: usize, out: &mut [u8]) {
+    // Along one side: for each new pixel, the old ones it covers and how much of each, in
+    // 1/256ths of a pixel.
+    fn spans(old: usize, new: usize) -> Vec<Vec<(usize, u32)>> {
+        let step = old as f64 / new.max(1) as f64;
+        (0..new)
+            .map(|i| {
+                let (start, end) = (i as f64 * step, ((i + 1) as f64 * step).min(old as f64));
+                let mut covered = Vec::new();
+                let mut at = start.floor() as usize;
+                while (at as f64) < end && at < old {
+                    let cover = ((at + 1) as f64).min(end) - (at as f64).max(start);
+                    let weight = (cover * 256.0).round() as u32;
+                    if weight > 0 {
+                        covered.push((at, weight));
+                    }
+                    at += 1;
+                }
+                covered
+            })
+            .collect()
+    }
+    let (xs, ys) = (spans(source[0], output[0]), spans(source[1], output[1]));
+    let stride = source[0] * BYTES_PER_PIXEL;
+    let row = output[0] * BYTES_PER_PIXEL;
+    let rows = output[1].div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        for (band, lines) in out[..row * output[1]].chunks_mut(row * rows).enumerate() {
+            let (xs, ys) = (&xs, &ys);
+            scope.spawn(move || {
+                for (line, dst) in lines.chunks_exact_mut(row).enumerate() {
+                    let y = band * rows + line;
+                    for (x, px) in dst.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+                        let mut sum = [0u64; 3];
+                        let mut total = 0u64;
+                        for &(sy, wy) in &ys[y] {
+                            let base = sy * stride;
+                            for &(sx, wx) in &xs[x] {
+                                let weight = u64::from(wy * wx);
+                                let at = base + sx * BYTES_PER_PIXEL;
+                                for channel in 0..3 {
+                                    sum[channel] += u64::from(bgra[at + channel]) * weight;
+                                }
+                                total += weight;
+                            }
+                        }
+                        let total = total.max(1);
+                        for channel in 0..3 {
+                            px[channel] = ((sum[channel] + total / 2) / total) as u8;
+                        }
+                        px[3] = u8::MAX;
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// NV12 (BT.709, limited range, `stride` bytes a row in both planes, the luma plane `rows`
 /// tall, which a decoder may pad past `height`) to BGRA, rows of pairs in parallel.
 pub fn to_bgra(nv12: &[u8], [width, height]: [usize; 2], stride: usize, rows: usize, out: &mut [u8]) {
@@ -188,6 +253,25 @@ mod tests {
         let nv12 = Converter::new([2, 2], [2, 2]).convert(&frame).to_vec();
         assert_eq!(&nv12[..4], &[63, 16, 16, 63]);
         assert_eq!(&nv12[4..], &chroma(0, 0, 128));
+    }
+
+    #[test]
+    fn any_smaller_size_averages_what_it_covers() {
+        // Three columns into two: the middle one counts half to each side.
+        let mut frame = Vec::new();
+        for _ in 0..2 {
+            frame.extend([0, 0, 0, 255, 200, 200, 200, 255, 100, 100, 100, 255]);
+        }
+        let mut out = vec![0; 2 * 2 * 4];
+        shrink(&frame, [3, 2], [2, 2], 2, &mut out);
+        assert_eq!(&out[..8], &[67, 67, 67, 255, 133, 133, 133, 255]);
+        assert_eq!(&out[..8], &out[8..]);
+        // A solid picture stays solid at any size.
+        let solid_frame = solid([2880, 1620], [10, 20, 30, 255]);
+        let mut converter = Converter::new([2880, 1620], [1920, 1080]);
+        let nv12 = converter.convert(&solid_frame).to_vec();
+        assert_eq!(nv12.len(), 1920 * 1080 * 3 / 2);
+        assert!(nv12[..1920 * 1080].iter().all(|&y| y == luma(10, 20, 30)));
     }
 
     #[test]

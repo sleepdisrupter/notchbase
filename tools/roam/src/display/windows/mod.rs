@@ -65,28 +65,55 @@ impl Displays for Windows {
         if vdd::installed() { Ability::Ready } else { Ability::NeedsDriver }
     }
 
-    fn install(&self) -> Result<(), String> {
-        vdd::install()?;
+    fn install(&self, want: &Want) -> Result<(), String> {
+        vdd::install(&want.sizes())?;
         // The driver turns its monitors on as it starts; they stay off until they're wanted.
         let _ = monitor::detach_unused();
         Ok(())
     }
 
-    fn has_room(&self) -> bool {
-        vdd::has_room(monitor::in_use())
+    fn has_room(&self, want: &Want) -> bool {
+        vdd::has_room(monitor::in_use(), want.units)
     }
 
-    fn make_room(&self) -> Result<(), String> {
-        vdd::make_room(monitor::in_use)
+    fn make_room(&self, want: &Want) -> Result<(), String> {
+        vdd::make_room(monitor::in_use, &want.sizes())
     }
 
     fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
-        let (source, size) = monitor::claim(|free, all| ready_source(free, all, super::picture_size(want.panel)))?;
+        // As many pixels as the lent screen takes on the desk, so the pointer meets its edges
+        // where it meets the screen's own when nothing is lent.
+        let wanted = want.units;
+        let listed = vdd::offers(wanted) == Some(true);
+        let (source, size) = monitor::claim(|free, all| ready_source(free, all, wanted, listed))?;
         // Given back if it doesn't start.
         let claimed = Claimed(Some(source));
-        monitor::attach(&source, size, HZ, want.at)?;
+        let size = match monitor::attach(&source, size, HZ, want.at) {
+            Ok(()) => size,
+            Err(why) => {
+                // Windows didn't take that size after all: the nearest it offers.
+                let offered = offered_sizes(&source);
+                let near = super::closest_size(&offered, wanted).filter(|near| *near != size).ok_or(why)?;
+                monitor::attach(&source, near, HZ, want.at)?;
+                near
+            }
+        };
+        if size != wanted {
+            feed.note(format!(
+                "extended display: the display driver hasn't {}x{}, so it's {}x{}: the pointer crosses its edges a little off",
+                wanted[0], wanted[1], size[0], size[1]
+            ));
+        }
         // Windows may turn on the driver's other screens with this one: only this one stays.
         let _ = monitor::detach_unused();
+        // Things show at the size they'd have on the PC's own screens: scaled as much as the
+        // display has more pixels than its spot on the desk.
+        let desk_width = (f64::from(want.units[0]) / want.ppu).max(1.0);
+        let percent = monitor::nearest_scale(f64::from(size[0]) / desk_width);
+        match monitor::set_scale(&source, percent) {
+            Ok(now) => feed.note(format!("extended display: {}x{} at {now}% scale", size[0], size[1])),
+            Err(why) => feed.note(format!("extended display: couldn't set its scale to {percent}%: {why}")),
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(Mutex::new(None));
         let (opened, open) = mpsc::channel();
@@ -94,10 +121,11 @@ impl Displays for Windows {
             let (stop, failed, feed) = (stop.clone(), failed.clone(), feed.clone());
             let name = source.name;
             let apart = want.pointer_apart;
+            let panel = want.panel;
             std::thread::Builder::new()
                 .name("roam-display-capture".into())
                 .spawn(move || {
-                    let result = capture(&name, apart, &feed, &stop, &opened);
+                    let result = capture(&name, apart, panel, &feed, &stop, &opened);
                     if let Err(why) = result {
                         if let Ok(mut slot) = failed.lock() {
                             *slot = Some(why.clone());
@@ -151,13 +179,14 @@ impl Drop for Claimed {
 }
 
 /// Of the driver monitors not in use (`sources`, of `all` there are), one to show a
-/// `want`-sized screen on, and the size: the nearest the driver offers, since asking it for new
-/// sizes can knock it over. One that's off goes first, so a monitor the person turned on for
-/// something else stays theirs.
+/// `want`-sized screen on, and the size: that one when the driver's settings list it
+/// (`listed`), else the nearest it offers, since asking it for new sizes can knock it over. One
+/// that's off goes first, so a monitor the person turned on for something else stays theirs.
 fn ready_source(
     sources: &[monitor::Source],
     all: usize,
     want: [u32; 2],
+    listed: bool,
 ) -> Result<(monitor::Source, [u32; 2]), String> {
     if sources.is_empty() && all > 0 {
         return Err(if all < vdd::MONITORS {
@@ -173,31 +202,42 @@ fn ready_source(
     let off = sources.iter().filter(|s| !s.attached);
     let on = sources.iter().filter(|s| s.attached);
     let ordered: Vec<monitor::Source> = off.chain(on).copied().collect();
+    if listed && let Some(source) = ordered.first() {
+        return Ok((*source, want));
+    }
     for source in &ordered {
         let sizes: Vec<[u32; 2]> = monitor::modes(source).iter().map(|m| [m[0], m[1]]).collect();
         if let Some(size) = super::closest_size(&sizes, want) {
             return Ok((*source, size));
         }
     }
-    // Windows may not list the sizes of a monitor that's off: try the size wanted, and let
-    // turning it on say whether it works.
+    // Windows may not list the sizes of a monitor that's off: the nearest the driver's settings
+    // list, or else the size wanted, and turning it on says whether it works.
+    let size = vdd::listed().and_then(|sizes| super::closest_size(&sizes, want)).unwrap_or(want);
     ordered
         .first()
-        .map(|source| (*source, want))
+        .map(|source| (*source, size))
         .ok_or_else(|| "The display driver hasn't made its screen. Try again, and Roam reinstalls it".to_owned())
 }
 
-/// Captures the display and encodes it into `feed` until stopped. Answers the picture size
-/// on `opened` once it's going.
+/// The sizes the source offers: as Windows lists them, or else as the driver's settings do.
+fn offered_sizes(source: &monitor::Source) -> Vec<[u32; 2]> {
+    let listed: Vec<[u32; 2]> = monitor::modes(source).iter().map(|m| [m[0], m[1]]).collect();
+    if listed.is_empty() { vdd::listed().unwrap_or_default() } else { listed }
+}
+
+/// Captures the display and encodes it into `feed`, at no more pixels than `panel` has, until
+/// stopped. Answers the picture size on `opened` once it's going.
 fn capture(
     name: &[u16; 32],
     apart: bool,
+    panel: Panel,
     feed: &Feed,
     stop: &AtomicBool,
     opened: &mpsc::Sender<Result<[u32; 2], String>>,
 ) -> Result<(), String> {
     media::start()?;
-    let (mut duplicator, mut pictures, size) = open_capture(name, None, apart)?;
+    let (mut duplicator, mut pictures, shown, size) = open_capture(name, None, apart, panel)?;
     let _ = opened.send(Ok(size));
     if apart {
         feed.note("extended display: the pointer goes apart from the pictures, drawn by the lending computer".into());
@@ -221,7 +261,7 @@ fn capture(
                     feed.note(format!("extended display capture starts again: {why}"));
                     drop((duplicator, pictures));
                     std::thread::sleep(Duration::from_millis(100));
-                    (duplicator, pictures, _) = open_capture(name, Some(size), apart)?;
+                    (duplicator, pictures, _, _) = open_capture(name, Some(shown), apart, panel)?;
                     feed.ask_key();
                     continue;
                 }
@@ -254,10 +294,11 @@ fn capture(
         if feed.pointer_wanted() && apart {
             duplicator.pointer_apart();
         }
-        let (at, shape) = duplicator.take_pointer();
+        // In the pictures' pixels, which may be fewer than the display's.
+        let (at, shape) = super::scale_pointer(duplicator.take_pointer(), shown, size);
         feed.pointer(at, shape);
         if apart && let Some((hotspot, visible)) = duplicator.cursor() {
-            feed.set_cursor(Cursor { hotspot, visible, size });
+            feed.set_cursor(Cursor { hotspot: super::scale_hotspot(hotspot, shown, size), visible, size });
         }
         for data in or_restart!(pictures.drain(&mut duplicator)) {
             feed.push(Picture { key: h264::is_key(&data), data });
@@ -303,14 +344,16 @@ fn capture(
     Ok(())
 }
 
-/// Duplication of the display `name` and the way to encode it, once Windows has the display
-/// ready. When `size` is given, the display must still be that size. With `apart`, the
-/// pictures leave the pointer out, and it goes on its own.
+/// Duplication of the display `name` and the way to encode it for `panel`, once Windows has
+/// the display ready: and the display's size, and the pictures'. When `size` is given, the
+/// display must still be that size. With `apart`, the pictures leave the pointer out, and it
+/// goes on its own.
 fn open_capture(
     name: &[u16; 32],
     size: Option<[u32; 2]>,
     apart: bool,
-) -> Result<(duplicate::Duplicator, pictures::Pictures, [u32; 2]), String> {
+    panel: Panel,
+) -> Result<(duplicate::Duplicator, pictures::Pictures, [u32; 2], [u32; 2]), String> {
     let started = Instant::now();
     let mut duplicator = loop {
         match duplicate::Duplicator::open(name) {
@@ -329,8 +372,10 @@ fn open_capture(
     if apart {
         duplicator.pointer_apart();
     }
-    let pictures = pictures::Pictures::new(&mut duplicator, [width, height], HZ)?;
-    Ok((duplicator, pictures, [width, height]))
+    let shown = [width, height];
+    let out = super::encode_size(shown, panel);
+    let pictures = pictures::Pictures::new(&mut duplicator, shown, out, HZ)?;
+    Ok((duplicator, pictures, shown, out))
 }
 
 /// The driver's monitor while it's in use. Dropping it stops the capture and turns the

@@ -23,6 +23,8 @@ enum Route {
 pub struct Pictures {
     route: Route,
     encoder: Encoder,
+    /// The display's size, and the pictures', which may be smaller.
+    shown: [u32; 2],
     size: [u32; 2],
     fps: u32,
     /// On the card route: when the first picture went in, and whether one came out.
@@ -41,13 +43,13 @@ pub struct Step {
 }
 
 impl Pictures {
-    pub fn new(duplicator: &mut Duplicator, size: [u32; 2], fps: u32) -> Result<Self, String> {
+    pub fn new(duplicator: &mut Duplicator, shown: [u32; 2], size: [u32; 2], fps: u32) -> Result<Self, String> {
         let mut notes = Vec::new();
         let on_card = if std::env::var_os(OFF_CARD).is_some() {
             Err(format!("{OFF_CARD} is set"))
         } else {
             let (device, context) = duplicator.device();
-            Gpu::new(device, context, size, fps)
+            Gpu::new(device, context, shown, size, fps)
                 .and_then(|gpu| Ok((gpu, Encoder::on_card(size, fps, device, duplicator.luid())?)))
         };
         let (route, encoder) = match on_card {
@@ -57,11 +59,17 @@ impl Pictures {
             }
             Err(why) => {
                 notes.push(format!("extended display pictures come off the graphics card: {why}"));
-                (Route::Processor(nv12::Converter::new(size, size)), Encoder::new(size, fps)?)
+                (Route::Processor(nv12::Converter::new(shown, size)), Encoder::new(size, fps)?)
             }
         };
         notes.push(format!("extended display encoder: {}", encoder.about));
-        Ok(Self { route, encoder, size, fps, first_in: None, came_out: false, notes })
+        if shown != size {
+            notes.push(format!(
+                "extended display: {}x{} scaled to {}x{} for the lent screen",
+                shown[0], shown[1], size[0], size[1]
+            ));
+        }
+        Ok(Self { route, encoder, shown, size, fps, first_in: None, came_out: false, notes })
     }
 
     pub fn take_notes(&mut self) -> Vec<String> {
@@ -146,7 +154,7 @@ impl Pictures {
         let rate = self.encoder.rate();
         self.encoder = Encoder::new(self.size, self.fps)?;
         self.encoder.set_rate(rate);
-        self.route = Route::Processor(nv12::Converter::new(self.size, self.size));
+        self.route = Route::Processor(nv12::Converter::new(self.shown, self.size));
         self.notes.push(format!("extended display encoder: {}", self.encoder.about));
         Ok(())
     }

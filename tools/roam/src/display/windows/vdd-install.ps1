@@ -3,7 +3,7 @@
 # NefCon creates the driver's device. Any earlier device and driver package go first, since the
 # driver in the project's 25.5.2 setup never makes a screen. Roam runs this as administrator,
 # hidden, and reads what happened from install.log in $Folder. Downloads are pinned by SHA-256.
-param([Parameter(Mandatory = $true)][string]$Folder, [int]$Monitors = 1)
+param([Parameter(Mandatory = $true)][string]$Folder, [int]$Monitors = 1, [string]$Sizes = '')
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -53,6 +53,35 @@ try {
         }
     } catch {
         Say "Couldn't set how many screens the driver makes: $($_.Exception.Message)"
+    }
+    # And the sizes the lent screens take, so the pointer meets their edges where it would.
+    try {
+        $Xml = New-Object System.Xml.XmlDocument
+        $Xml.PreserveWhitespace = $true
+        $Xml.Load($Kept)
+        $List = $Xml.SelectSingleNode('//resolutions')
+        $Added = 0
+        foreach ($Size in ($Sizes -split ',' | Where-Object { $_ -match '^\d+x\d+$' })) {
+            if (-not $List) { break }
+            $Width, $Height = $Size -split 'x'
+            $There = @($List.SelectNodes('resolution') | Where-Object {
+                    $W = $_.SelectSingleNode('width'); $H = $_.SelectSingleNode('height')
+                    $W -and $H -and $W.InnerText.Trim() -eq $Width -and $H.InnerText.Trim() -eq $Height
+                })
+            if ($There.Count -gt 0) { continue }
+            $Node = $Xml.CreateElement('resolution')
+            foreach ($Pair in @(@('width', $Width), @('height', $Height), @('refresh_rate', '60'))) {
+                $Child = $Xml.CreateElement($Pair[0])
+                $Child.InnerText = $Pair[1]
+                [void]$Node.AppendChild($Child)
+            }
+            [void]$List.AppendChild($Node)
+            $Added++
+            Say "Size added: $Size"
+        }
+        if ($Added -gt 0) { $Xml.Save($Kept) }
+    } catch {
+        Say "Couldn't add the screens' sizes: $($_.Exception.Message)"
     }
     # Roam adds sizes to the settings without administrator rights.
     & icacls.exe $Settings /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null

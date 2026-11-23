@@ -275,16 +275,26 @@ impl Core {
     /// Where the virtual display for `display` of `peer` goes: its top left where that screen
     /// sits on the desk, in this computer's units.
     fn virtual_at(&self, peer: Id, display: u8) -> Option<[i32; 2]> {
-        let id = hex(&peer);
-        let placement = self.placements.iter().find(|p| p.id == id)?;
-        let theirs = self.peers.get(&peer)?;
-        let computer = Computer::new(id, theirs.displays.clone(), theirs.ppu, placement.at);
-        let screen = *computer.desk_displays().get(usize::from(display))?;
+        self.virtual_spot(peer, display).map(|(at, _)| at)
+    }
+
+    /// Where the virtual display for `display` of `peer` goes, in this computer's units, and
+    /// that screen on the desk.
+    fn virtual_spot(&self, peer: Id, display: u8) -> Option<([i32; 2], Rect)> {
+        let screen = *self.peer_desk_screens(peer)?.get(usize::from(display))?;
         let mine = hex(&self.identity.id);
         let my_spot = self.placements.iter().find(|p| p.id == mine).map_or([0.0, 0.0], |p| p.at);
         let (real, ppu) = self.real_screens();
         let [x, y] = Computer::new("me", real, ppu, my_spot).from_desk([screen.x, screen.y]);
-        Some([x.round() as i32, y.round() as i32])
+        Some(([x.round() as i32, y.round() as i32], screen))
+    }
+
+    /// Every screen of `peer` where it sits on the desk, lent or not.
+    fn peer_desk_screens(&self, peer: Id) -> Option<Vec<Rect>> {
+        let id = hex(&peer);
+        let placement = self.placements.iter().find(|p| p.id == id)?;
+        let theirs = self.peers.get(&peer)?;
+        Some(Computer::new(id, theirs.displays.clone(), theirs.ppu, placement.at).desk_displays())
     }
 
     fn next_serial(&mut self) -> u32 {
@@ -395,7 +405,27 @@ impl Core {
             hz: u32::from(hz).clamp(24, 240),
             scale: if scale.is_finite() { scale.clamp(1.0, 4.0) } else { 1.0 },
         };
-        let at = self.virtual_at(peer, display).unwrap_or_default();
+        // As big as the screen is on the desk, in this computer's units, so the pointer meets
+        // its edges where it meets the screen's own when it isn't lent.
+        let ppu = self.real_screens().1;
+        let (at, units) = match self.virtual_spot(peer, display) {
+            Some((at, screen)) => (at, display::units_for([screen.w, screen.h], ppu)),
+            None => (
+                [0, 0],
+                display::units_for(
+                    [panel.pixels[0], panel.pixels[1]].map(|side| f64::from(side) / f64::from(panel.scale)),
+                    ppu,
+                ),
+            ),
+        };
+        let also: Vec<[u32; 2]> = self
+            .peer_desk_screens(peer)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != usize::from(display))
+            .map(|(_, screen)| display::units_for([screen.w, screen.h], ppu))
+            .collect();
         let name = self.who(peer);
         let screen = self.screen_name(peer, display);
         // The other computer draws the pointer itself, where it can: it then moves without
@@ -432,7 +462,7 @@ impl Core {
             peer,
             serial,
             display,
-            want: Want { name: system_name, panel, at, pointer_apart },
+            want: Want { name: system_name, panel, at, units, ppu, also, pointer_apart },
             screen,
             route,
             routes,
@@ -444,8 +474,8 @@ impl Core {
             udp,
         };
         self.note(&format!(
-            "{name} lends its display {display}: {}x{} at {} Hz, scale {}; placing it at ({}, {})",
-            panel.pixels[0], panel.pixels[1], panel.hz, panel.scale, at[0], at[1]
+            "{name} lends its display {display}: {}x{} at {} Hz, scale {}; making it {}x{} at ({}, {}), as it is on the desk",
+            panel.pixels[0], panel.pixels[1], panel.hz, panel.scale, units[0], units[1], at[0], at[1]
         ));
         let started = std::thread::Builder::new().name("roam-host".into()).spawn(move || host(job));
         let Some(entry) = self.extended.get_mut(&key) else { return };
@@ -1074,13 +1104,14 @@ impl Upkeep {
 /// for a while. Answers why it stopped.
 fn run_host(job: &HostJob) -> Result<String, String> {
     if job.install {
-        job.displays.install()?;
+        job.displays.install(&job.want)?;
         job.working("Starting the display");
     }
-    if !job.feed.stopped() && !job.displays.has_room() {
-        // Once, so that any number of screens can be displays later without asking again.
-        job.working("Making room for more screens in the display driver. Say Yes when Windows asks");
-        if let Err(why) = job.displays.make_room() {
+    if !job.feed.stopped() && !job.displays.has_room(&job.want) {
+        // Once, so that any number of screens, at their sizes, can be displays later without
+        // asking again.
+        job.working("Getting the display driver ready for this screen. Say Yes when Windows asks");
+        if let Err(why) = job.displays.make_room(&job.want) {
             job.note(format!("the display driver has no more room: {why}"));
         }
         job.working("Starting the display");

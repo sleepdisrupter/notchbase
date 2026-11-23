@@ -5,10 +5,11 @@
 use std::sync::Mutex;
 
 use windows::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
-    QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
-    SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_TYPE,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+    DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SetDisplayConfig,
 };
 use windows::Win32::Foundation::{ERROR_SUCCESS, POINTL};
 use windows::Win32::Graphics::Gdi::{
@@ -276,4 +277,67 @@ fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<[u16; 32]> {
     name.header.id = path.sourceInfo.id;
     // SAFETY: `name` is sized as its header says.
     (unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } == 0).then_some(name.viewGdiDeviceName)
+}
+
+/// The scales Windows offers a screen, in percent, in its order.
+const SCALES: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+
+/// What Windows answers about a source's scale, as steps from the one it recommends: the
+/// lowest, the one it has, and the highest. (Not in Windows' headers; the Settings app uses it.)
+#[repr(C)]
+struct ScaleGet {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    lowest: i32,
+    now: i32,
+    highest: i32,
+}
+
+#[repr(C)]
+struct ScaleSet {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    step: i32,
+}
+
+/// Of Windows' scales, the nearest to `scale` (1.5 for 150%).
+pub fn nearest_scale(scale: f64) -> u32 {
+    let percent = if scale.is_finite() { scale * 100.0 } else { 100.0 };
+    SCALES.into_iter().min_by_key(|&s| (f64::from(s) - percent).abs().round() as u64).unwrap_or(100)
+}
+
+/// Sets the scale of what's shown on the source (`percent`, as Display settings has it), so
+/// a screen with more pixels than the one it stands for shows things at the size they'd have
+/// there. Windows keeps it for that screen. Answers the scale it has now.
+pub fn set_scale(source: &Source, percent: u32) -> Result<u32, String> {
+    let (paths, _) = active_paths()?;
+    let path = paths
+        .iter()
+        .find(|path| source_name(path).is_some_and(|name| text(&name) == text(&source.name)))
+        .ok_or("Windows has no path for the virtual display")?;
+    let header = |kind: i32, size: usize| DISPLAYCONFIG_DEVICE_INFO_HEADER {
+        r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE(kind),
+        size: size as u32,
+        adapterId: path.sourceInfo.adapterId,
+        id: path.sourceInfo.id,
+    };
+    let mut got = ScaleGet { header: header(-3, std::mem::size_of::<ScaleGet>()), lowest: 0, now: 0, highest: 0 };
+    // SAFETY: `got` starts with the header, and is as big as it says.
+    let code = unsafe { DisplayConfigGetDeviceInfo(&mut got.header) };
+    if code != 0 {
+        return Err(format!("Windows didn't say the virtual display's scale (code {code})"));
+    }
+    // The lowest is 100%, so the recommended one is that many steps up.
+    let recommended = got.lowest.unsigned_abs() as usize;
+    let at = |step: i32| SCALES.get((recommended as i64 + i64::from(step)).max(0) as usize).copied().unwrap_or(100);
+    let wanted = SCALES.iter().position(|&s| s == percent).unwrap_or(0) as i32 - recommended as i32;
+    let step = wanted.clamp(got.lowest, got.highest);
+    if step == got.now {
+        return Ok(at(step));
+    }
+    let set = ScaleSet { header: header(-4, std::mem::size_of::<ScaleSet>()), step };
+    // SAFETY: as above.
+    let code = unsafe { DisplayConfigSetDeviceInfo(&set.header) };
+    if code != 0 {
+        return Err(format!("Windows didn't take {percent}% for the virtual display (code {code})"));
+    }
+    Ok(at(step))
 }

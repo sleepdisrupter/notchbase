@@ -27,10 +27,15 @@ impl Displays for Mac {
     }
 
     fn host(&self, want: &Want, feed: Feed) -> Result<Box<dyn Hosted>, String> {
-        let size = super::picture_size(want.panel);
-        // A Retina-style screen gets a Retina-style display: the same pixels, half the points.
-        let hidpi = want.panel.scale >= 1.5;
-        let display = screen::Virtual::new(&format!("{} (Roam)", want.name), size, HZ, hidpi)?;
+        // As many points as the lent screen takes on the desk, so the pointer crosses its edges
+        // where it crosses the screen's own when nothing is lent. A Retina-style screen gets a
+        // Retina-style display, twice the pixels; the pictures go out at the screen's own.
+        let points = want.units.map(|side| side.max(64) & !1);
+        let hidpi =
+            want.panel.scale >= 1.5 && points[0] * 2 <= super::MOST_UNITS[0] && points[1] * 2 <= super::MOST_UNITS[1];
+        let pixels = if hidpi { points.map(|side| side * 2) } else { points };
+        let size = super::encode_size(pixels, want.panel);
+        let display = screen::Virtual::new(&format!("{} (Roam)", want.name), pixels, HZ, hidpi)?;
         display.place(want.at);
         let capture = capture::Capture::start(display.id(), size, HZ, feed)?;
         Ok(Box::new(Virtual { capture: Some(capture), display, size }))
