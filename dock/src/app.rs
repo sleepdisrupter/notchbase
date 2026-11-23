@@ -1142,7 +1142,8 @@ impl App {
     /// Downloads and the music playing, onto every dock's tiles.
     fn step_ambient(&mut self) {
         let fetching = self.downloads.as_ref().map(|w| w.now()).unwrap_or_default();
-        let beat = self.pulse.step(self.dock.config.music_pulse && !self.away, self.dock.time);
+        let beat =
+            self.pulse.step(self.dock.config.music_pulse && !self.away, self.dock.config.music_beat, self.dock.time);
         self.dock.set_downloads(&fetching, &self.recent);
         self.dock.set_beat(beat);
         for seat in &mut self.seats {

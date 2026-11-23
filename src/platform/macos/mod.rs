@@ -32,7 +32,7 @@ pub use interaction::{
     mouse_held, pressed_within, set_click_through, watch_presses_elsewhere,
 };
 pub use lock_screen::{leave_lock_screen, show_on_lock_screen};
-pub use notch::{hardware_notch, virtual_display};
+pub use notch::hardware_notch;
 pub use process::process_alive;
 pub use system::{
     KEY_JOINER, MODIFIER_LABELS, default_data_dir, default_local_data_dir, known_dir, let_hooks_hear_our_windows, open,

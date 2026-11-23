@@ -53,10 +53,6 @@ pub fn until_vblank() -> Option<std::time::Duration> {
     None
 }
 
-pub fn virtual_display(_monitor: &MonitorHandle) -> bool {
-    false
-}
-
 pub fn hardware_notch(_monitor: &MonitorHandle) -> Option<egui::Vec2> {
     None
 }

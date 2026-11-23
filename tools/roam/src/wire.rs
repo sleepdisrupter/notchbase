@@ -5,8 +5,7 @@
 //! Every packet starts with `RM`, the protocol version and a kind. Beacons and the handshake are
 //! in the clear; everything after the handshake is sealed with the session's keys.
 
-use crate::align::{Band, Guide, Mark};
-use crate::layout::{Edge, Rect};
+use crate::layout::Rect;
 
 pub const MAGIC: [u8; 2] = *b"RM";
 pub const VERSION: u8 = 1;
@@ -70,20 +69,6 @@ pub struct Beacon {
     pub open: bool,
     /// Already controlled by another computer.
     pub busy: bool,
-    /// Can lend its screens to another computer as extended displays.
-    pub lends: bool,
-    /// Draws the host's pointer itself on a screen it lends, from news sent apart.
-    pub draws_pointer: bool,
-    /// Takes that pointer's place from the session's packets too (`Body::pointer`), not only
-    /// from the picture stream.
-    pub fast_pointer: bool,
-    /// Takes a lent screen's pictures over UDP when the host offers (`Down::UdpPlease`).
-    pub udp_pictures: bool,
-    /// Shows line-up guides over its screens when told (`Message::Guide`).
-    pub aligns: bool,
-    /// Lends several of its screens at once, telling their picture streams apart by the stream
-    /// number's top byte (`display::stream::number`) and their pointers by `Pointer::display`.
-    pub lends_many: bool,
     pub ppu: f32,
     pub displays: Vec<Rect>,
     pub name: String,
@@ -166,14 +151,9 @@ impl Packet {
                 out.bytes(&beacon.key);
                 out.u16(beacon.port);
                 out.u8(beacon.os.code());
-                out.u8(u8::from(beacon.open)
-                    | (u8::from(beacon.busy) << 1)
-                    | (u8::from(beacon.lends) << 2)
-                    | (u8::from(beacon.draws_pointer) << 3)
-                    | (u8::from(beacon.fast_pointer) << 4)
-                    | (u8::from(beacon.udp_pictures) << 5)
-                    | (u8::from(beacon.aligns) << 6)
-                    | (u8::from(beacon.lends_many) << 7));
+                // The other bits said, in older versions, what of their extended displays and
+                // line-up guides a computer took part in: always clear now, so no older one asks.
+                out.u8(u8::from(beacon.open) | (u8::from(beacon.busy) << 1));
                 out.f32(beacon.ppu);
                 let displays = &beacon.displays[..beacon.displays.len().min(16)];
                 out.u8(displays.len() as u8);
@@ -248,12 +228,6 @@ impl Packet {
                     os,
                     open: flags & 1 != 0,
                     busy: flags & 2 != 0,
-                    lends: flags & 4 != 0,
-                    draws_pointer: flags & 8 != 0,
-                    fast_pointer: flags & 16 != 0,
-                    udp_pictures: flags & 32 != 0,
-                    aligns: flags & 64 != 0,
-                    lends_many: flags & 128 != 0,
                     ppu,
                     displays,
                     name,
@@ -335,39 +309,6 @@ pub enum Message {
     Edge,
     /// Files are being dragged here: the cursor may take them back across.
     Dragging,
-    /// From the controller: show its picture on this display of yours, as its extended display.
-    /// Only sent to computers whose beacon says they lend their screens.
-    Lend {
-        display: u8,
-    },
-    /// The display will show it: its size in pixels, how often it refreshes, and its pixels
-    /// per point.
-    Lent {
-        display: u8,
-        pixels: [u16; 2],
-        hz: u8,
-        scale: f32,
-    },
-    /// Either side: the display is no longer lent, with why, in a few words.
-    Unlend {
-        display: u8,
-        why: String,
-    },
-    /// From the controller, while it lines the screens up: what to show over one of your
-    /// screens, from the set numbered `serial`. Only sent to computers whose beacon says they
-    /// align.
-    Guide {
-        serial: u16,
-        guide: Guide,
-    },
-    /// The set numbered `serial` is all here: show it on these screens, and nothing on the rest.
-    /// None takes every guide away.
-    Guided {
-        serial: u16,
-        displays: Vec<u8>,
-    },
-    /// Where the cursor would cross on your screens, in place of the marks before.
-    Marks(Vec<Mark>),
 }
 
 const ENTER: u8 = 1;
@@ -382,12 +323,7 @@ const BYE: u8 = 9;
 const DRAG: u8 = 10;
 const EDGE: u8 = 11;
 const DRAGGING: u8 = 12;
-const LEND: u8 = 13;
-const LENT: u8 = 14;
-const UNLEND: u8 = 15;
-const GUIDE: u8 = 16;
-const GUIDED: u8 = 17;
-const MARKS: u8 = 18;
+// 13 to 18 carried extended displays and line-up guides in older versions: not to be used again.
 
 /// How much of a clipboard goes in one message.
 pub const CLIP_CHUNK: usize = 900;
@@ -440,57 +376,6 @@ impl Message {
             Message::Drag => w.u8(DRAG),
             Message::Edge => w.u8(EDGE),
             Message::Dragging => w.u8(DRAGGING),
-            Message::Lend { display } => {
-                w.u8(LEND);
-                w.u8(*display);
-            }
-            Message::Lent { display, pixels, hz, scale } => {
-                w.u8(LENT);
-                w.u8(*display);
-                w.u16(pixels[0]);
-                w.u16(pixels[1]);
-                w.u8(*hz);
-                w.f32(*scale);
-            }
-            Message::Unlend { display, why } => {
-                w.u8(UNLEND);
-                w.u8(*display);
-                w.text(why, 160);
-            }
-            Message::Guide { serial, guide } => {
-                w.u8(GUIDE);
-                w.u16(*serial);
-                w.u8(guide.display);
-                w.u8(guide.colour);
-                w.text(&guide.title, 64);
-                w.text(&guide.detail, 80);
-                let bands = &guide.bands[..guide.bands.len().min(crate::align::MOST_BANDS)];
-                w.u8(bands.len() as u8);
-                for band in bands {
-                    w.u8(band.edge.code());
-                    w.f32(band.from);
-                    w.f32(band.to);
-                    w.u8(band.colour);
-                    w.text(&band.label, 48);
-                }
-            }
-            Message::Guided { serial, displays } => {
-                w.u8(GUIDED);
-                w.u16(*serial);
-                let displays = &displays[..displays.len().min(16)];
-                w.u8(displays.len() as u8);
-                w.bytes(displays);
-            }
-            Message::Marks(marks) => {
-                w.u8(MARKS);
-                let marks = &marks[..marks.len().min(8)];
-                w.u8(marks.len() as u8);
-                for mark in marks {
-                    w.u8(mark.display);
-                    w.u8(mark.edge.code() | (u8::from(mark.arrives) << 4));
-                    w.u16((mark.along.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16);
-                }
-            }
         }
         *out = w.0;
     }
@@ -526,49 +411,6 @@ impl Message {
             DRAG => Message::Drag,
             EDGE => Message::Edge,
             DRAGGING => Message::Dragging,
-            LEND => Message::Lend { display: input.u8()? },
-            LENT => Message::Lent {
-                display: input.u8()?,
-                pixels: [input.u16()?, input.u16()?],
-                hz: input.u8()?,
-                scale: input.f32()?,
-            },
-            UNLEND => Message::Unlend { display: input.u8()?, why: input.text()? },
-            GUIDE => {
-                let serial = input.u16()?;
-                let display = input.u8()?;
-                let colour = input.u8()?;
-                let title = input.text()?;
-                let detail = input.text()?;
-                let count = input.u8()? as usize;
-                let mut bands = Vec::with_capacity(count.min(crate::align::MOST_BANDS));
-                for _ in 0..count {
-                    let edge = Edge::from_code(input.u8()?)?;
-                    let (from, to) = (input.f32()?, input.f32()?);
-                    let colour = input.u8()?;
-                    let label = input.text()?;
-                    if from.is_finite() && to.is_finite() && bands.len() < crate::align::MOST_BANDS {
-                        bands.push(Band { edge, from: from.clamp(0.0, 1.0), to: to.clamp(0.0, 1.0), colour, label });
-                    }
-                }
-                Message::Guide { serial, guide: Guide { display, colour, title, detail, bands } }
-            }
-            GUIDED => {
-                let serial = input.u16()?;
-                let count = input.u8()? as usize;
-                Message::Guided { serial, displays: input.take(count)?.to_vec() }
-            }
-            MARKS => {
-                let count = input.u8()? as usize;
-                let mut marks = Vec::with_capacity(count.min(8));
-                for _ in 0..count {
-                    let display = input.u8()?;
-                    let code = input.u8()?;
-                    let along = f32::from(input.u16()?) / f32::from(u16::MAX);
-                    marks.push(Mark { display, edge: Edge::from_code(code & 15)?, along, arrives: code & 16 != 0 });
-                }
-                Message::Marks(marks)
-            }
             _ => return None,
         })
     }
@@ -580,17 +422,6 @@ impl Message {
 pub struct Motion {
     pub seq: u32,
     pub at: [f32; 2],
-}
-
-/// Where the host's pointer is on a screen the other computer lends it, in that screen's
-/// picture pixels (the pointer image's top left). The newest wins, like `Motion`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pointer {
-    pub seq: u32,
-    pub at: [i32; 2],
-    pub visible: bool,
-    /// Which of the lending computer's screens it's on: `None` from a host that lends only one.
-    pub display: Option<u8>,
 }
 
 /// The inside of a sealed packet.
@@ -606,14 +437,7 @@ pub struct Body {
     pub motion: Option<Motion>,
     /// Reliable messages, each with its number.
     pub messages: Vec<(u32, Message)>,
-    /// After the messages, where older versions stop reading: they never see it.
-    pub pointer: Option<Pointer>,
 }
-
-/// Marks the pointer's news after a body's messages.
-const POINTER_NEWS: u8 = 1;
-/// The bytes the pointer's news takes.
-pub const POINTER_SIZE: usize = 15;
 
 impl Body {
     pub fn encode(&self) -> Vec<u8> {
@@ -637,17 +461,6 @@ impl Body {
             out.extend_from_slice(&seq.to_le_bytes());
             message.encode(&mut out);
         }
-        if let Some(pointer) = self.pointer {
-            out.push(POINTER_NEWS);
-            out.extend_from_slice(&pointer.seq.to_le_bytes());
-            out.extend_from_slice(&pointer.at[0].to_le_bytes());
-            out.extend_from_slice(&pointer.at[1].to_le_bytes());
-            out.push(u8::from(pointer.visible));
-            // Last, where an older version stops reading.
-            if let Some(display) = pointer.display {
-                out.push(display);
-            }
-        }
         out
     }
 
@@ -667,17 +480,9 @@ impl Body {
             let seq = input.u32()?;
             messages.push((seq, Message::decode(&mut input)?));
         }
-        // Anything after the messages is news a newer version added; what isn't known is left.
-        let pointer = match input.u8() {
-            Some(POINTER_NEWS) => (|| {
-                let seq = input.u32()?;
-                let at = [input.u32()? as i32, input.u32()? as i32];
-                let visible = input.u8()? != 0;
-                Some(Pointer { seq, at, visible, display: input.u8() })
-            })(),
-            _ => None,
-        };
-        Some(Body { ack, time, echo, held, motion, messages, pointer })
+        // Anything after the messages is news another version added (an older one sent its
+        // extended display's pointer there): it's left.
+        Some(Body { ack, time, echo, held, motion, messages })
     }
 }
 
@@ -772,12 +577,6 @@ mod tests {
                 os: Os::Windows,
                 open: true,
                 busy: false,
-                lends: true,
-                draws_pointer: true,
-                fast_pointer: true,
-                udp_pictures: true,
-                aligns: true,
-                lends_many: true,
                 ppu: 1.5,
                 displays: vec![Rect::new(-1920.0, 0.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
                 name: "Desk PC".into(),
@@ -815,45 +614,32 @@ mod tests {
                 (13, Message::Drag),
                 (14, Message::Edge),
                 (15, Message::Dragging),
-                (16, Message::Lend { display: 1 }),
-                (17, Message::Lent { display: 1, pixels: [2560, 1440], hz: 60, scale: 1.0 }),
-                (18, Message::Unlend { display: 1, why: "Stopped on the Mac".into() }),
-                (
-                    19,
-                    Message::Guide {
-                        serial: 7,
-                        guide: Guide {
-                            display: 1,
-                            colour: 2,
-                            title: "Desk PC".into(),
-                            detail: "Main screen · 1920 × 1080".into(),
-                            bands: vec![Band {
-                                edge: Edge::Top,
-                                from: 0.25,
-                                to: 1.0,
-                                colour: 3,
-                                label: "MacBook · LG".into(),
-                            }],
-                        },
-                    },
-                ),
-                (20, Message::Guided { serial: 7, displays: vec![0, 1] }),
-                (21, Message::Marks(vec![Mark { display: 1, edge: Edge::Bottom, along: 1.0, arrives: true }])),
             ],
-            pointer: Some(Pointer { seq: 3, at: [-4, 1080], visible: true, display: Some(1) }),
         };
         assert_eq!(Body::decode(&body.encode()), Some(body.clone()));
-        // A version that knows no pointer news still reads the rest.
-        let bytes = body.encode();
-        assert_eq!(bytes.len(), Body { pointer: None, ..body.clone() }.encode().len() + POINTER_SIZE);
-        // News from a host that lends one screen only says no screen, and reads the same.
-        let older = Body { pointer: Some(Pointer { display: None, ..body.pointer.unwrap() }), ..body.clone() };
-        assert_eq!(Body::decode(&older.encode()), Some(older.clone()));
-        assert_eq!(older.encode().len(), bytes.len() - 1);
-        // A version that knows no screen in the pointer's news reads the rest of it as before.
-        let mut seen = bytes.clone();
-        seen.pop();
-        assert_eq!(Body::decode(&seen).and_then(|b| b.pointer).map(|p| p.display), Some(None));
+        // News an older version put after the messages is left.
+        let mut older = body.encode();
+        older.extend_from_slice(&[1, 3, 0, 0, 0, 252, 255, 255, 255, 56, 4, 0, 0, 1, 1]);
+        assert_eq!(Body::decode(&older), Some(body));
+    }
+
+    #[test]
+    fn old_flags_are_ignored() {
+        let beacon = Beacon {
+            id: [0; 8],
+            key: [0; 32],
+            port: 1,
+            os: Os::Mac,
+            open: true,
+            busy: false,
+            ppu: 1.0,
+            displays: vec![],
+            name: "Mac".into(),
+        };
+        let mut bytes = Packet::Beacon(beacon.clone()).encode();
+        // An older version's beacon: it lends its screens and shows line-up guides.
+        bytes[2 + 1 + 1 + 8 + 32 + 2 + 1] |= 4 | 8 | 16 | 32 | 64 | 128;
+        assert_eq!(Packet::decode(&bytes), Some(Packet::Beacon(beacon)));
     }
 
     #[test]
@@ -873,12 +659,6 @@ mod tests {
             os: Os::Mac,
             open: false,
             busy: true,
-            lends: false,
-            draws_pointer: false,
-            fast_pointer: false,
-            udp_pictures: false,
-            aligns: false,
-            lends_many: false,
             ppu: 1.0,
             displays: vec![],
             name: "é".repeat(40),

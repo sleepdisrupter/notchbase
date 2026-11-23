@@ -38,32 +38,6 @@ pub fn hardware_notch(_monitor: &MonitorHandle) -> Option<egui::Vec2> {
     None
 }
 
-/// Whether `monitor` is a virtual display (Roam's extended display, from the Virtual Display Driver). Its pictures show
-/// on another computer's screen, where a notch would sit over that computer's own and catch the clicks made there.
-pub fn virtual_display(monitor: &MonitorHandle) -> bool {
-    use windows_sys::Win32::Graphics::Gdi::{DISPLAY_DEVICEW, EnumDisplayDevicesW};
-    const DRIVERS: [&str; 3] = ["virtual display driver", "iddsampledriver", "mttvdd"];
-    let Some(name) = monitor.name() else { return false };
-    let text = |wide: &[u16]| {
-        let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
-        String::from_utf16_lossy(&wide[..end])
-    };
-    for index in 0.. {
-        // SAFETY: a zeroed DISPLAY_DEVICEW with its size set, as the call expects.
-        let mut device: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
-        device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-        if unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut device, 0) } == 0 {
-            return false;
-        }
-        if text(&device.DeviceName) != name {
-            continue;
-        }
-        let about = format!("{} {}", text(&device.DeviceString), text(&device.DeviceID)).to_ascii_lowercase();
-        return DRIVERS.iter().any(|driver| about.contains(driver));
-    }
-    false
-}
-
 pub fn videos_dir() -> Option<PathBuf> {
     known_dir(KnownDir::Videos)
 }

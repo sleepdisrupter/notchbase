@@ -1,8 +1,7 @@
 //! Puts Roam's packets at the front of the Wi-Fi queue, the way calls and game streams do.
 //!
 //! Wi-Fi keeps four queues: voice, video, ordinary and background. A packet in the voice queue
-//! goes out first and waits the shortest for the air, so the mouse and keyboard go there and
-//! an extended display's pictures go in the video queue, ahead of downloads.
+//! goes out first and waits the shortest for the air, so the mouse and keyboard go there.
 //!
 //! Each system wants its own way of saying so:
 //! - Windows ignores the type-of-service byte an ordinary program sets on its packets. Only its
@@ -18,16 +17,13 @@ use std::net::SocketAddr;
 pub enum Traffic {
     /// The mouse and keyboard: small, and wanted at once.
     Voice,
-    /// An extended display's pictures.
-    Video,
 }
 
 impl Traffic {
-    /// The type-of-service byte: expedited forwarding for voice, AF41 for video.
+    /// The type-of-service byte: expedited forwarding for voice.
     pub fn tos(self) -> u32 {
         match self {
             Traffic::Voice => 0xB8,
-            Traffic::Video => 0x88,
         }
     }
 }
@@ -85,7 +81,6 @@ fn first(traffic: Traffic, result: Result<(), String>) -> Option<String> {
     told.push(traffic);
     let what = match traffic {
         Traffic::Voice => "the mouse and keyboard",
-        Traffic::Video => "extended display pictures",
     };
     Some(match result {
         Ok(()) => format!("Wi-Fi priority for {what}: on"),
@@ -101,8 +96,7 @@ mod platform {
 
     use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
     use windows_sys::Win32::NetworkManagement::QoS::{
-        QOS_NON_ADAPTIVE_FLOW, QOS_TRAFFIC_TYPE, QOS_VERSION, QOSAddSocketToFlow, QOSCreateHandle,
-        QOSTrafficTypeAudioVideo, QOSTrafficTypeVoice,
+        QOS_NON_ADAPTIVE_FLOW, QOS_TRAFFIC_TYPE, QOS_VERSION, QOSAddSocketToFlow, QOSCreateHandle, QOSTrafficTypeVoice,
     };
     use windows_sys::Win32::Networking::WinSock::{SOCKADDR, SOCKET};
 
@@ -133,7 +127,6 @@ mod platform {
         let result = handle().and_then(|handle| {
             let kind: QOS_TRAFFIC_TYPE = match traffic {
                 Traffic::Voice => QOSTrafficTypeVoice,
-                Traffic::Video => QOSTrafficTypeAudioVideo,
             };
             let address = to.map(socket2::SockAddr::from);
             let destination = address.as_ref().map_or(std::ptr::null(), |a| a.as_ptr().cast::<SOCKADDR>());
@@ -168,7 +161,6 @@ mod platform {
 
     const SOL_SOCKET: i32 = 0xffff;
     const SO_NET_SERVICE_TYPE: i32 = 0x1116;
-    const NET_SERVICE_TYPE_VI: i32 = 3;
     const NET_SERVICE_TYPE_VO: i32 = 4;
 
     unsafe extern "C" {
@@ -178,7 +170,6 @@ mod platform {
     pub(super) fn mark(socket: &socket2::SockRef<'_>, _to: Option<SocketAddr>, traffic: Traffic) -> Option<String> {
         let kind = match traffic {
             Traffic::Voice => NET_SERVICE_TYPE_VO,
-            Traffic::Video => NET_SERVICE_TYPE_VI,
         };
         // SAFETY: an int option on a live socket.
         let done = unsafe {

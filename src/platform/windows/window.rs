@@ -64,18 +64,18 @@ pub fn overlay_window_attributes(monitor: &MonitorHandle) -> WindowAttributes {
         .with_position(monitor.position())
 }
 
-pub fn configure_overlay_window(window: &Window, monitor: &MonitorHandle) {
+pub fn configure_overlay_window(window: &Window, _monitor: &MonitorHandle) {
     update_ex_style(window, WS_EX_TOOLWINDOW, WS_EX_APPWINDOW);
-    keep_out_of_captures(window, monitor);
+    keep_out_of_captures(window);
 }
 
 pub fn dim_window_attributes(monitor: &MonitorHandle) -> WindowAttributes {
     overlay_window_attributes(monitor).with_title("notchbase recording")
 }
 
-pub fn configure_dim_window(window: &Window, monitor: &MonitorHandle) {
+pub fn configure_dim_window(window: &Window, _monitor: &MonitorHandle) {
     update_ex_style(window, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, WS_EX_APPWINDOW);
-    keep_out_of_captures(window, monitor);
+    keep_out_of_captures(window);
 }
 
 pub fn raise_window(window: &Window) {
@@ -88,17 +88,11 @@ pub fn keep_on_top(window: &Window) {
     raise_window(window);
 }
 
-/// Leaves the window out of screen captures, except on a virtual display: Roam's extended display is itself a capture
-/// shown on another computer, where a window left out shows as a dark screen (or not at all) and the picker drawn over
-/// it can't be seen. The picker hides itself before it takes the shot, so it never ends up in one anyway.
-fn keep_out_of_captures(window: &Window, monitor: &MonitorHandle) {
+/// Leaves the window out of screen captures. The picker hides itself before it takes the shot, so it never ends up in
+/// one anyway.
+fn keep_out_of_captures(window: &Window) {
     let Some(hwnd) = hwnd(window) else { return };
-    let affinity = if std::env::var_os(OVERLAY_IN_CAPTURES).is_some() || super::virtual_display(monitor) {
-        WDA_NONE
-    } else {
-        WDA_EXCLUDEFROMCAPTURE
-    };
-    // Set either way: the same window can move from a real screen to a virtual one.
+    let affinity = if std::env::var_os(OVERLAY_IN_CAPTURES).is_some() { WDA_NONE } else { WDA_EXCLUDEFROMCAPTURE };
     unsafe { SetWindowDisplayAffinity(hwnd, affinity) };
 }
 

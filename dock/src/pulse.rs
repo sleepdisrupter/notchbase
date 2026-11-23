@@ -1,6 +1,7 @@
-//! The music pulse: while Spotify or Music plays, its icon swells gently on the beat. The beat comes from that app's
-//! own sound, heard through ScreenCaptureKit with the Screen Recording permission the dock already has, and only
-//! while it plays. When the sound can't be heard, the icon breathes slowly instead.
+//! The music pulse: while Spotify or Music plays, its icon swells gently on the beat. On a Mac the beat comes from that
+//! app's own sound, heard through ScreenCaptureKit with the Screen Recording permission the dock already has, and only
+//! while it plays and `music_beat` is on (macOS shows its recording indicator meanwhile). When the sound isn't heard,
+//! the icon breathes slowly instead.
 
 /// How much the icon grows on a full beat.
 pub const SWELL: f32 = 0.06;
@@ -161,13 +162,23 @@ mod mac {
         }
 
         /// The player to pulse and its beat now, or nothing. Starts and stops listening to it as it plays and
-        /// pauses; `enabled` off stops everything.
-        pub fn step(&mut self, enabled: bool, time: f32) -> Option<(i32, f32)> {
+        /// pauses; `enabled` off stops everything. With `listen` off nothing is heard, so nothing records the
+        /// screen: a player that says it plays breathes instead.
+        pub fn step(&mut self, enabled: bool, listen: bool, time: f32) -> Option<(i32, f32)> {
             if !enabled {
                 self.capture = None;
                 self.probing = None;
                 self.playing = None;
                 return None;
+            }
+            if !listen {
+                self.capture = None;
+                self.probing = None;
+                if self.checked.is_none_or(|at| at.elapsed() > CHECK) {
+                    self.checked = Some(Instant::now());
+                    self.playing = self.said_playing();
+                }
+                return self.playing.map(|pid| (pid, breath(time)));
             }
             if self.checked.is_none_or(|at| at.elapsed() > CHECK) {
                 self.checked = Some(Instant::now());
@@ -228,6 +239,14 @@ mod mac {
             };
             self.listen(pid);
             Some(pid)
+        }
+
+        /// The player that last said it plays, without listening to any.
+        fn said_playing(&self) -> Option<i32> {
+            let states = self.states.lock().ok()?;
+            PLAYERS.iter().find_map(|&(bundle, _)| {
+                if states.get(bundle) == Some(&true) { crate::mac::running_pid(bundle) } else { None }
+            })
         }
 
         fn listen(&mut self, pid: i32) {

@@ -4,7 +4,7 @@
 use winit::event_loop::ActiveEventLoop;
 use winit::monitor::MonitorHandle;
 
-use super::imp::{hardware_notch, virtual_display};
+use super::imp::hardware_notch;
 
 const SIMULATED_NOTCH: &str = "NOTCHBASE_NOTCH";
 
@@ -26,9 +26,7 @@ pub fn placements(event_loop: &ActiveEventLoop, everywhere: bool) -> Vec<Placeme
     if !everywhere {
         return main.into_iter().collect();
     }
-    // A virtual display shows on another computer's screen: a notch there would cover that computer's own.
-    let mut all: Vec<Placement> =
-        event_loop.available_monitors().filter(|monitor| !virtual_display(monitor)).map(place_on).collect();
+    let mut all: Vec<Placement> = event_loop.available_monitors().map(place_on).collect();
     if let Some(main) = main
         && let Some(i) = all.iter().position(|placement| placement.monitor == main.monitor)
     {

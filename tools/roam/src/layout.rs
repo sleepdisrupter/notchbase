@@ -279,8 +279,7 @@ pub(crate) fn beyond(desk: &[Computer], on: usize, at: [f64; 2], edge: Edge, cor
         return None;
     }
     let point = computer.to_desk(at);
-    // Measured from the screen the cursor is on, not the whole computer: a computer showing
-    // another's screen as an extended display reaches round that computer's other screens.
+    // Measured from the screen the cursor is on, not the whole computer.
     let from = computer
         .desk_displays()
         .into_iter()

@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::crypto::{Agreed, Cipher};
-use crate::wire::{Body, MAX_PACKET, Message, Motion, POINTER_SIZE, Packet, Pointer};
+use crate::wire::{Body, MAX_PACKET, Message, Motion, Packet};
 
 /// Messages at most this big are repeated in every packet until acknowledged.
 const SMALL: usize = 24;
@@ -30,8 +30,6 @@ struct Waiting {
 
 pub struct Incoming {
     pub motion: Option<Motion>,
-    /// Where the host's pointer is on a screen lent to it, when that's newer than before.
-    pub pointer: Option<Pointer>,
     /// The sender's clock when it sent this, in microseconds (wrapping).
     pub time: u32,
     pub messages: Vec<Message>,
@@ -51,11 +49,6 @@ pub struct Link {
     early: BTreeMap<u32, Message>,
     motion: u32,
     motion_in: Option<u32>,
-    /// The host's pointer on a screen the other computer lends (which one, where, and whether it
-    /// shows), to go in the next packet.
-    pub pointer: Option<(Option<u8>, [i32; 2], bool)>,
-    pointer_seq: u32,
-    pointer_in: Option<u32>,
     peer_time: Option<(u32, u64)>,
     rtt: Option<f64>,
     pub heard: u64,
@@ -90,9 +83,6 @@ impl Link {
             early: BTreeMap::new(),
             motion: 0,
             motion_in: None,
-            pointer: None,
-            pointer_seq: 0,
-            pointer_in: None,
             peer_time: None,
             rtt: None,
             heard: now,
@@ -155,12 +145,8 @@ impl Link {
             Some((time, received)) => (time, now.saturating_sub(received).min(u64::from(u32::MAX)) as u32),
             None => (0, 0),
         };
-        let pointer = self.pointer.take().map(|(display, at, visible)| {
-            self.pointer_seq = self.pointer_seq.wrapping_add(1);
-            Pointer { seq: self.pointer_seq, at, visible, display }
-        });
-        let mut body = Body { ack: self.expect, time: now as u32, echo, held, motion, messages: Vec::new(), pointer };
-        let mut room = MAX_PACKET - 16 - 16 - 32 - POINTER_SIZE;
+        let mut body = Body { ack: self.expect, time: now as u32, echo, held, motion, messages: Vec::new() };
+        let mut room = MAX_PACKET - 16 - 16 - 32;
         let after = self.resend_after();
         for waiting in self.waiting.iter_mut().take(LOOK) {
             if waiting.size > room {
@@ -214,11 +200,7 @@ impl Link {
         if let Some(motion) = motion {
             self.motion_in = Some(motion.seq);
         }
-        let pointer = body.pointer.filter(|pointer| self.pointer_in.is_none_or(|last| newer(pointer.seq, last)));
-        if let Some(pointer) = pointer {
-            self.pointer_in = Some(pointer.seq);
-        }
-        Some(Incoming { motion, pointer, time: body.time, messages })
+        Some(Incoming { motion, time: body.time, messages })
     }
 
     fn fresh(&self, seq: u64) -> bool {

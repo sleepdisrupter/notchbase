@@ -58,6 +58,9 @@ pub struct Config {
     pub displays: Displays,
     /// While Spotify or Music plays, its icon swells gently on the beat.
     pub music_pulse: bool,
+    /// On a Mac, the beat comes from the player's own sound. Hearing it takes ScreenCaptureKit, so macOS shows its
+    /// screen recording indicator the whole time music plays: off (as it starts), the icon breathes slowly instead.
+    pub music_beat: bool,
     /// Settings for one app that differ from the ones above, by the app's path. Set from its menu's Options.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<PathBuf, AppSettings>,
@@ -179,6 +182,7 @@ impl Default for Config {
             stack_sort: StackSort::Added,
             displays: Displays::Primary,
             music_pulse: true,
+            music_beat: false,
             apps: BTreeMap::new(),
         }
     }

@@ -17,16 +17,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-mod extend;
-mod line_up;
-
-use extend::{ExtendEvent, Extended, Lending};
-pub use extend::{ExtendedView, LendingView};
-pub use line_up::Coloured;
-
 use crate::bulk::{self, Arrived, Content, Hello};
 use crate::crypto::{self, Ephemeral, Handshake, Identity, commit, hex, unhex};
-use crate::display::{self, Ability, Displays};
 use crate::input::{self, Copied, Input, Platform, Play, Swipe};
 use crate::keys;
 use crate::layout::{self, Computer, Rect, Step};
@@ -83,8 +75,6 @@ const EDGE_TOLD_EVERY: u64 = 5 * SECOND;
 const DRAG_ID: u32 = 1 << 31;
 /// How many received copies of files are kept, newest first.
 const KEEP_RECEIVED: usize = 4;
-/// How often the computer checks whether it can make virtual displays.
-const ABILITY_EVERY: u64 = 5 * SECOND;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
@@ -96,9 +86,6 @@ pub struct Prefs {
     pub modifiers: keys::Modifiers,
     pub addresses: Vec<String>,
     pub fast_wifi: bool,
-    /// Whether the cursor crosses to other computers. Off, the mouse and keyboard stay on this
-    /// one, and extended displays (this computer's own screens) still work.
-    pub roam: bool,
 }
 
 impl Default for Prefs {
@@ -112,7 +99,6 @@ impl Default for Prefs {
             modifiers: keys::Modifiers::Same,
             addresses: Vec::new(),
             fast_wifi: true,
-            roam: true,
         }
     }
 }
@@ -146,31 +132,9 @@ pub enum Control {
     Release,
     /// Ask the system for the permission Roam is missing.
     AskPermission,
-    /// Show this display (by its place in the computer's list) of a computer we control as an
-    /// extended display of this one.
-    Extend {
-        id: String,
-        display: u8,
-    },
-    /// Stop showing that computer's screen here (`None`: every one of its screens), or forget
-    /// why it couldn't be.
-    Unextend {
-        id: String,
-        display: Option<u8>,
-    },
-    /// Stop lending this computer's screens to the computer controlling it.
-    StopLending,
-    /// Put line-up guides over every screen on the desk, or take them down.
-    LineUp(bool),
-    /// Take down the line-up guides another computer put on this one's screens, until it
-    /// lines up again.
-    HideGuides,
     /// Tests: stop hearing the network, as if Wi-Fi dropped out.
     #[cfg(test)]
     Deaf(bool),
-    /// Tests: cut the lent screen's picture stream, as a network hiccup does.
-    #[cfg(test)]
-    CutStream,
     /// Tests: lose the packets this computer sends straight to the other one, as Wi-Fi does for
     /// a while after a PC hops to its router's other band.
     #[cfg(test)]
@@ -209,8 +173,6 @@ enum Event {
     },
     /// A line for the log, from another thread.
     Note(String),
-    /// Word from the threads carrying extended displays.
-    Extend(ExtendEvent),
     /// Slow lookups, done on their own thread: the computer's name, the typed addresses and
     /// the networks it's on.
     Looked {
@@ -249,10 +211,6 @@ pub struct PeerView {
     pub displays: Vec<Rect>,
     pub ppu: f64,
     pub open: bool,
-    /// Can lend its screens as extended displays.
-    pub lends: bool,
-    /// Can lend several at once.
-    pub lends_many: bool,
     pub nearby: bool,
     pub paired: bool,
     pub link: LinkState,
@@ -315,20 +273,6 @@ pub struct Status {
     pub transfer: Option<Transfer>,
     /// The last big copy that came in.
     pub landed: Option<Landed>,
-    /// Whether this computer can make virtual displays for other computers' screens.
-    pub ability: Ability,
-    /// Other computers' screens shown here as extended displays.
-    pub extended: Vec<ExtendedView>,
-    /// This computer's screens, lent to another computer as its extended displays.
-    pub lending: Vec<LendingView>,
-    /// Line-up guides are up on every screen on the desk, coloured like this.
-    pub lining_up: bool,
-    pub coloured: Vec<Coloured>,
-    /// Another computer's line-up guides are up on this one's screens.
-    pub guided_by: Option<String>,
-    /// The desk as this computer moved it itself, when the person moved an extended display in
-    /// the system's display settings: numbered, newest last, for the editor to take on.
-    pub moved: Option<(u32, Vec<Placement>)>,
 }
 
 /// A running engine. Dropping it stops everything and gives the mouse and keyboard back.
@@ -344,23 +288,11 @@ impl Engine {
         desk: Vec<Placement>,
         port: u16,
     ) -> (Engine, Receiver<Status>) {
-        Self::start_with(data, platform, display::native(), prefs, desk, port)
-    }
-
-    /// Starts with `displays` making and lending extended displays.
-    pub fn start_with(
-        data: PathBuf,
-        platform: Box<dyn Platform>,
-        displays: Arc<dyn Displays>,
-        prefs: Prefs,
-        desk: Vec<Placement>,
-        port: u16,
-    ) -> (Engine, Receiver<Status>) {
         let (events, inbox) = mpsc::channel();
         let (status_out, status) = mpsc::channel();
         let sender = events.clone();
         let spawned = std::thread::Builder::new().name("roam".into()).spawn(move || {
-            let mut core = Core::new(data, platform, displays, prefs, desk, port, sender, status_out);
+            let mut core = Core::new(data, platform, prefs, desk, port, sender, status_out);
             core.run(inbox);
         });
         if let Err(err) = spawned {
@@ -387,12 +319,6 @@ struct Peer {
     addr: SocketAddr,
     open: bool,
     busy: bool,
-    lends: bool,
-    draws_pointer: bool,
-    fast_pointer: bool,
-    udp_pictures: bool,
-    aligns: bool,
-    lends_many: bool,
     displays: Vec<Rect>,
     ppu: f64,
     seen: u64,
@@ -612,33 +538,6 @@ struct Core {
     steady_at: u64,
     log: Option<std::fs::File>,
     gaps: Gaps,
-    // Extended displays.
-    displays: Arc<dyn Displays>,
-    ability: Ability,
-    ability_at: u64,
-    /// Other computers' screens this computer shows as extended displays, by computer and
-    /// which of its screens.
-    extended: HashMap<(Id, u8), Extended>,
-    /// This computer's screens, lent to the computer controlling it.
-    lending: Vec<Lending>,
-    extend_serial: u32,
-    /// When the virtual displays move to where the desk now has their screens: a moment after
-    /// the desk last changed, so a run of changes moves them once.
-    place_due: Option<u64>,
-    /// When this computer's own screens last changed: the desk the editor sends may not show it
-    /// yet, so where the virtual displays are isn't read as the person moving them till later.
-    real_changed_at: u64,
-    /// This computer's own screens as last seen: a screen not among them may be a virtual
-    /// display its host hasn't placed yet.
-    known_real: Vec<Rect>,
-    /// The desk as moved here, for the editor: see `Status::moved`.
-    moved: Option<(u32, Vec<Placement>)>,
-    /// The extended display this computer's cursor is over, whose lending computer is told
-    /// where the pointer is the quick way, and where it was last said to be.
-    pointer_over: Option<((Id, u8), [i32; 2])>,
-    /// Lining the screens up: this computer leading, or following another's.
-    leading: Option<line_up::Leading>,
-    following: Option<line_up::Following>,
     #[cfg(test)]
     deaf: bool,
     /// Tests: see `Control::LoseDirect`.
@@ -650,7 +549,6 @@ impl Core {
     fn new(
         data: PathBuf,
         platform: Box<dyn Platform>,
-        displays: Arc<dyn Displays>,
         prefs: Prefs,
         placements: Vec<Placement>,
         port: u16,
@@ -726,19 +624,6 @@ impl Core {
             steady_at: 0,
             log: None,
             gaps: Gaps::default(),
-            ability: displays.ability(),
-            displays,
-            ability_at: 0,
-            extended: HashMap::new(),
-            lending: Vec::new(),
-            extend_serial: 0,
-            place_due: None,
-            real_changed_at: 0,
-            known_real: Vec::new(),
-            moved: None,
-            pointer_over: None,
-            leading: None,
-            following: None,
             #[cfg(test)]
             deaf: false,
             lose_direct: false,
@@ -846,9 +731,6 @@ impl Core {
     }
 
     fn shut_down(&mut self) {
-        self.line_up(false);
-        self.unfollow(None);
-        self.shut_down_displays();
         self.go_home(None);
         self.release_played();
         for (id, session) in &mut self.sessions {
@@ -900,7 +782,6 @@ impl Core {
                 }
             }
             Event::Note(text) => self.note(&text),
-            Event::Extend(event) => self.extend_event(event),
             Event::Looked { name, addresses, networks } => {
                 self.host_name = name;
                 self.typed = addresses;
@@ -919,12 +800,6 @@ impl Core {
         if self.smoother.pending() {
             next = next.min(now + FRAME);
         }
-        if let Some(((peer, _), _)) = self.pointer_over
-            && let Some(Phase::Live { link }) = self.sessions.get(&peer).map(|s| &s.phase)
-            && link.pointer.is_some()
-        {
-            next = next.min((link.sent + COALESCE).max(now + 100));
-        }
         if self.moving
             && let Some(sent) = self.away_link_sent()
         {
@@ -932,9 +807,6 @@ impl Core {
         }
         if matches!(self.cursor, Cursor::Away { .. }) || self.here {
             next = next.min(now + BUSY_EVERY / 2);
-        }
-        if let Some(line_up) = self.line_up_deadline() {
-            next = next.min(line_up.max(now + 100));
         }
         next
     }
@@ -983,15 +855,9 @@ impl Core {
             self.screens_at = now + SCREENS_EVERY;
             let screens = self.platform.screens();
             if screens != self.screens {
-                let before = self.real_screens();
                 self.screens = screens;
-                let after = self.real_screens();
-                if after != before {
-                    self.real_changed_at = now;
-                }
-                self.known_real = after.0;
                 self.note(&format!("this computer's screens: {}", screens_words(&self.screens.0, self.screens.1)));
-                let (displays, ppu) = self.real_screens();
+                let (displays, ppu) = self.screens.clone();
                 for session in self.sessions.values_mut() {
                     if session.side == Side::Controlled
                         && let Some(link) = session.live()
@@ -999,7 +865,6 @@ impl Core {
                         link.queue(Message::Screens { ppu: ppu as f32, displays: displays.clone() });
                     }
                 }
-                self.followed_screens_changed();
             }
         }
         let away = matches!(self.cursor, Cursor::Away { .. });
@@ -1017,12 +882,6 @@ impl Core {
             self.lookup_at = now + LOOKUP_EVERY;
             self.look_up();
         }
-        if now >= self.ability_at {
-            self.ability_at = now + ABILITY_EVERY;
-            self.ability = self.displays.ability();
-        }
-        self.check_extended(now);
-        self.line_up_tick(now);
         if matches!(self.cursor, Cursor::Away { .. }) {
             // Tell the mouse and keyboard Roam is still here, and notice if they let go.
             self.platform.alive();
@@ -1082,10 +941,8 @@ impl Core {
         }
         for id in ended {
             self.note(&format!("no word from {} for 8 s: session over", self.who(id)));
-            // Only the network went: what's lent between them waits for it to come back. No
-            // goodbye: if the other one still hears this one, a goodbye would end its displays for
-            // good, while without one it hears Reset (or a new offer) and holds on the same way.
-            self.hold_displays(id);
+            // No goodbye: if the other one still hears this one, it hears Reset (or a new offer)
+            // and starts over.
             self.end_session(id, true);
         }
         // Stalled: bring the cursor home, let go of held keys.
@@ -1124,8 +981,7 @@ impl Core {
         let mut notes = Vec::new();
         for (id, session) in &mut self.sessions {
             let addr = session.addr;
-            let pointing = self.pointer_over.is_some_and(|((over, _), _)| over == *id);
-            let busy = away == Some(*id) || (here && session.side == Side::Controlled) || pointing;
+            let busy = away == Some(*id) || (here && session.side == Side::Controlled);
             match &mut session.phase {
                 Phase::Pairing { link, .. } | Phase::Live { link } => {
                     let mine = away == Some(*id);
@@ -1134,7 +990,6 @@ impl Core {
                     let every = if busy { BUSY_EVERY } else { IDLE_EVERY };
                     let still = mine && self.moving && motion.is_none() && since >= STILL;
                     let send = (mine && motion.is_some() && paced)
-                        || (link.pointer.is_some() && paced)
                         || (urgent && mine)
                         || link.due(now)
                         || since >= every
@@ -1194,7 +1049,7 @@ impl Core {
 
     fn beacon(&mut self, to: Option<SocketAddr>) {
         let Some(socket) = self.socket.clone() else { return };
-        let (displays, ppu) = self.real_screens();
+        let (displays, ppu) = self.screens.clone();
         let busy = self.sessions.values().any(|s| s.side == Side::Controlled && s.is_live());
         let beacon = Packet::Beacon(Beacon {
             id: self.identity.id,
@@ -1203,12 +1058,6 @@ impl Core {
             os: Os::here(),
             open: self.prefs.open,
             busy,
-            lends: self.displays.lends(),
-            draws_pointer: self.displays.draws_pointer(),
-            fast_pointer: self.displays.draws_pointer(),
-            udp_pictures: self.displays.lends(),
-            aligns: self.displays.aligns(),
-            lends_many: self.displays.lends(),
             ppu: ppu as f32,
             displays,
             name: self.name(),
@@ -1269,12 +1118,6 @@ impl Core {
             addr,
             open: beacon.open,
             busy: beacon.busy,
-            lends: beacon.lends,
-            draws_pointer: beacon.draws_pointer,
-            fast_pointer: beacon.fast_pointer,
-            udp_pictures: beacon.udp_pictures,
-            aligns: beacon.aligns,
-            lends_many: beacon.lends_many,
             displays: beacon.displays,
             ppu: f64::from(beacon.ppu),
             seen: now,
@@ -1353,8 +1196,6 @@ impl Core {
                     && self.sessions.get(&id).is_some_and(|s| s.side == Side::Controller && from == s.addr)
                 {
                     self.note(&format!("{} has no such session (it restarted?): starting over", self.who(id)));
-                    // The session lapsed over there: what's lent waits for the new one.
-                    self.hold_displays(id);
                     self.end_session(id, false);
                     self.offer_to_desk(now);
                 }
@@ -1438,8 +1279,6 @@ impl Core {
         if self.sessions.get(&id).is_some_and(|s| s.side == Side::Controlled) {
             // A new session from the same controller replaces the old one (it restarted).
             self.note(&format!("{} started a new session: replacing the old one", self.who(id)));
-            // Its old session lapsed: a screen lent to it carries on in the new one.
-            self.hold_displays(id);
             self.end_session(id, false);
         }
         self.sessions.remove(&id);
@@ -1550,12 +1389,6 @@ impl Core {
                     addr: from,
                     open: false,
                     busy: false,
-                    lends: false,
-                    draws_pointer: false,
-                    fast_pointer: false,
-                    udp_pictures: false,
-                    aligns: false,
-                    lends_many: false,
                     displays: Vec::new(),
                     ppu: 1.0,
                     seen: now,
@@ -1584,9 +1417,6 @@ impl Core {
             peer.seen = now;
         }
         let controlled = side == Side::Controlled && existing.is_live();
-        if let Some(pointer) = incoming.pointer {
-            self.lent_pointer(id, pointer);
-        }
         let mut motion = incoming.motion.map(|m| m.at);
         if controlled && self.here && motion.is_none() {
             // A packet without movement: the controller's mouse is still.
@@ -1649,34 +1479,6 @@ impl Core {
                 self.note(&format!("{} said goodbye", self.who(id)));
                 self.end_session(id, true);
             }
-            Message::Lent { display, pixels, hz, scale } if side == Side::Controller && live => {
-                self.lent(id, display, pixels, hz, scale);
-            }
-            Message::Unlend { display, why } if side == Side::Controller => {
-                if let Some(entry) = self.extended.remove(&(id, display)) {
-                    let failed = entry.state != extend::State::Running;
-                    self.note(&format!("{} stopped lending its display {display}: {why}", self.who(id)));
-                    if let Some(feed) = &entry.feed {
-                        feed.stop();
-                    }
-                    if self.pointer_over.is_some_and(|(over, _)| over == (id, display)) {
-                        self.pointer_over = None;
-                    }
-                    if failed {
-                        self.extended.insert(
-                            (id, display),
-                            Extended { state: extend::State::Failed(why), feed: None, place: None, ..entry },
-                        );
-                    }
-                }
-            }
-            Message::Lend { display } if side == Side::Controlled && live => self.lend(id, display),
-            Message::Unlend { display, why } if side == Side::Controlled => {
-                if self.lending.iter().any(|l| l.to == id && l.display == display) {
-                    self.note(&format!("{} no longer shows its picture on display {display}: {why}", self.who(id)));
-                    self.stop_lending(Some(display), None);
-                }
-            }
             Message::Screens { ppu, displays } if side == Side::Controller => {
                 let words = screens_words(&displays, f64::from(ppu));
                 if let Some(peer) = self.peers.get_mut(&id) {
@@ -1687,11 +1489,6 @@ impl Core {
                         self.note(&format!("{}'s screens: {words}", self.who(id)));
                     }
                 }
-            }
-            message @ (Message::Guide { .. } | Message::Guided { .. } | Message::Marks(_))
-                if side == Side::Controlled && live =>
-            {
-                self.guide_message(id, message);
             }
             _ if !live => {}
             // From here on: the controlled side, hearing its controller.
@@ -1811,7 +1608,7 @@ impl Core {
             peer.refused = None;
         }
         if side == Side::Controlled {
-            let (displays, ppu) = self.real_screens();
+            let (displays, ppu) = self.screens.clone();
             if let Some(link) = self.sessions.get_mut(&id).and_then(Session::live) {
                 link.queue(Message::Screens { ppu: ppu as f32, displays });
             }
@@ -1825,8 +1622,6 @@ impl Core {
         {
             self.go_home(None);
         }
-        self.session_ended_displays(id);
-        self.line_up_session_ended(id);
         let Some(mut session) = self.sessions.remove(&id) else { return };
         if session.side == Side::Controlled {
             self.stalled = false;
@@ -1890,8 +1685,8 @@ impl Core {
         let mut ids = Vec::new();
         let mine = hex(&self.identity.id);
         let my_spot = self.placements.iter().find(|p| p.id == mine).map_or([0.0, 0.0], |p| p.at);
-        let me = self.me_on_desk(my_spot);
-        desk.push(me.clone());
+        let (displays, ppu) = self.screens.clone();
+        desk.push(Computer::new("me", displays, ppu, my_spot));
         ids.push(None);
         for placement in &self.placements {
             let Some(id) = unhex::<8>(&placement.id) else { continue };
@@ -1904,12 +1699,7 @@ impl Core {
             if peer.displays.is_empty() {
                 continue;
             }
-            let Some(computer) =
-                self.peer_on_desk(id, placement.id.clone(), peer.displays.clone(), peer.ppu, placement.at, &me)
-            else {
-                continue;
-            };
-            desk.push(computer);
+            desk.push(Computer::new(placement.id.clone(), peer.displays.clone(), peer.ppu, placement.at));
             ids.push(Some(id));
         }
         (desk, ids)
@@ -1990,11 +1780,6 @@ impl Core {
         match self.cursor {
             Cursor::Home => {
                 let Input::Move { at, delta } = input else { return };
-                self.quick_pointer(Some(at));
-                self.line_up_marks(None, at, now);
-                if !self.prefs.roam {
-                    return;
-                }
                 // Only the left button may be held across, and only while dragging files.
                 let dragging = self.held_buttons == 1;
                 if (self.held_buttons != 0 && !dragging) || self.locked {
@@ -2092,7 +1877,6 @@ impl Core {
                 };
                 match step {
                     Step::Stay(next) => {
-                        self.line_up_marks(Some(peer), next, now);
                         self.cursor = Cursor::Away { peer, at: next, left_from };
                         if next != at {
                             // Sent as soon as the pacing allows (see `flush`).
@@ -2160,8 +1944,6 @@ impl Core {
     }
 
     fn enter(&mut self, peer: Id, arrive: [f64; 2], left_from: [f64; 2], now: u64) {
-        // Off this computer's screens, virtual ones too.
-        self.quick_pointer(None);
         let Some(link) = self.sessions.get_mut(&peer).and_then(Session::live) else { return };
         link.queue(Message::Enter { at: [arrive[0] as f32, arrive[1] as f32] });
         let rtt = link.rtt().map_or(-1.0, |us| us / 1000.0);
@@ -2455,10 +2237,6 @@ impl Core {
         match control {
             Control::Prefs(prefs) => {
                 let closed = self.prefs.open && !prefs.open;
-                if !prefs.roam && matches!(self.cursor, Cursor::Away { .. }) {
-                    self.note("roaming turned off: the cursor comes home");
-                    self.go_home(None);
-                }
                 self.smoother.set_on(prefs.smoothing);
                 let retype = self.prefs.addresses != prefs.addresses || self.prefs.name != prefs.name;
                 self.prefs = prefs;
@@ -2490,7 +2268,6 @@ impl Core {
                     self.note(&format!("the desk: {}", spots.join(", ")));
                 }
                 self.placements = placements;
-                self.place_extended();
                 let placed = self.placed();
                 let gone: Vec<Id> = self
                     .sessions
@@ -2539,26 +2316,6 @@ impl Core {
                 }
             }
             Control::Home => self.go_home(None),
-            Control::Extend { id, display } => {
-                if let Some(id) = unhex::<8>(&id) {
-                    self.extend(id, display);
-                }
-            }
-            Control::Unextend { id, display } => {
-                if let Some(id) = unhex::<8>(&id) {
-                    let why = format!("Disconnected on {}", self.name());
-                    match display {
-                        Some(display) => self.unextend(id, display, &why),
-                        None => self.unextend_all(id, &why),
-                    }
-                }
-            }
-            Control::StopLending => {
-                let why = format!("Stopped on {}", self.name());
-                self.stop_lending(None, Some(&why));
-            }
-            Control::LineUp(on) => self.line_up(on),
-            Control::HideGuides => self.hide_followed(),
             Control::AskPermission => {
                 self.platform.ask_permission();
                 self.listen_at = 0;
@@ -2567,8 +2324,6 @@ impl Core {
             Control::Deaf(deaf) => self.deaf = deaf,
             #[cfg(test)]
             Control::LoseDirect(lose) => self.lose_direct = lose,
-            #[cfg(test)]
-            Control::CutStream => self.cut_lent_stream(),
             Control::Release => {
                 let controlled: Vec<Id> =
                     self.sessions.iter().filter(|(_, s)| s.side == Side::Controlled).map(|(id, _)| *id).collect();
@@ -2581,7 +2336,7 @@ impl Core {
     }
 
     fn status(&mut self, now: u64) -> Status {
-        let (displays, ppu) = self.real_screens();
+        let (displays, ppu) = self.screens.clone();
         let me = PeerView {
             id: hex(&self.identity.id),
             name: self.name(),
@@ -2589,8 +2344,6 @@ impl Core {
             displays,
             ppu,
             open: self.prefs.open,
-            lends: self.displays.lends(),
-            lends_many: self.displays.lends(),
             nearby: true,
             paired: true,
             link: LinkState::None,
@@ -2648,8 +2401,6 @@ impl Core {
                 displays: peer.displays.clone(),
                 ppu: peer.ppu,
                 open: peer.open && !peer.busy,
-                lends: peer.lends,
-                lends_many: peer.lends_many,
                 nearby,
                 paired: self.paired.contains_key(&id),
                 link,
@@ -2683,13 +2434,6 @@ impl Core {
             addresses,
             transfer: self.transfer.as_ref().map(|(_, _, t)| t.clone()),
             landed: self.landed.clone(),
-            ability: self.ability.clone(),
-            extended: self.extended_views(),
-            lending: self.lending_views(),
-            lining_up: self.lining_up(),
-            coloured: self.coloured(),
-            guided_by: self.guided_by(),
-            moved: self.moved.clone(),
         }
     }
 }
@@ -2803,9 +2547,6 @@ fn receive_bulk(
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut header = [0u8; 12];
     stream.read_exact(&mut header)?;
-    if let Some(hello) = display::stream::Hello::parse(&header) {
-        return extend::view(stream, hello, events);
-    }
     let hello = Hello::parse(&header)?;
     let (answer, key) = mpsc::channel();
     events.send(Event::Bulk { session: hello.session, answer }).map_err(std::io::Error::other)?;

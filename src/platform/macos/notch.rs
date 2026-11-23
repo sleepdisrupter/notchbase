@@ -26,16 +26,3 @@ pub fn hardware_notch(monitor: &MonitorHandle) -> Option<egui::Vec2> {
     let width = screen_width - left - right;
     (width > 0.0 && width < screen_width * MAX_NOTCH_SHARE_OF_WIDTH).then(|| egui::vec2(width as f32, top as f32))
 }
-
-/// Whether `monitor` is a virtual display Roam made for another computer's screen (vendor "RO", as Roam names it). Its
-/// pictures show on that computer, where a notch would sit over its own and catch the clicks made there.
-pub fn virtual_display(monitor: &MonitorHandle) -> bool {
-    use winit::platform::macos::MonitorHandleExtMacOS as _;
-    const ROAM_VENDOR: u32 = 0x524F;
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGDisplayVendorNumber(display: u32) -> u32;
-    }
-    // SAFETY: a plain query of a display the system listed.
-    unsafe { CGDisplayVendorNumber(monitor.native_id()) == ROAM_VENDOR }
-}

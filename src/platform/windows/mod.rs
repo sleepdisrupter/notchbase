@@ -43,7 +43,7 @@ pub fn leave_lock_screen(_window: &winit::window::Window) {}
 pub use process::process_alive;
 pub use system::{
     KEY_JOINER, MODIFIER_LABELS, default_data_dir, default_local_data_dir, hardware_notch, known_dir,
-    let_hooks_hear_our_windows, local_time, open, run_as_admin, setup_event_loop, videos_dir, virtual_display,
+    let_hooks_hear_our_windows, local_time, open, run_as_admin, setup_event_loop, videos_dir,
 };
 pub use window::{
     configure_dim_window, configure_notch_window, configure_overlay_window, dim_window_attributes, keep_on_top,
