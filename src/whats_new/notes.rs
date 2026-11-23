@@ -46,6 +46,16 @@ const TALK: &str = "Hold fn and talk to type";
 const TALK: &str = "Hold Ctrl + Win and talk";
 const GROQ: &str = "Add your free Groq key in the Dictation tool";
 const TAP: &str = "Double-tap the key to talk hands-free";
+#[cfg(target_os = "macos")]
+const LIVE: &str = "Double-tap fn to type as you talk";
+#[cfg(not(target_os = "macos"))]
+const LIVE: &str = "Double-tap Ctrl + Win to type as you talk";
+#[cfg(target_os = "macos")]
+const STOP: &str = "Press fn or Esc to stop";
+#[cfg(not(target_os = "macos"))]
+const STOP: &str = "Press Ctrl + Win or Esc to stop";
+const EVERY_APP_TYPES: &str = "Dictation types into every app";
+const CLIPBOARD: &str = "Your clipboard is left alone";
 const TERMS: &str = "It learns your names and terms";
 #[cfg(target_os = "macos")]
 const FIXES: &str = "Words you correct are spelled your way next time";
@@ -53,6 +63,14 @@ const FIXES: &str = "Words you correct are spelled your way next time";
 const FIXES: &str = "Words you say often are spelled your way next time";
 
 pub(super) static NOTES: &[Release] = &[
+    Release {
+        version: "0.30.1",
+        picture: None,
+        changes: &[
+            Change { glyph: Glyph::Waveform, title: LIVE, caption: STOP },
+            Change { glyph: Glyph::Keyboard, title: EVERY_APP_TYPES, caption: CLIPBOARD },
+        ],
+    },
     Release {
         version: "0.30.0",
         picture: None,
