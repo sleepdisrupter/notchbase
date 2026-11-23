@@ -484,7 +484,7 @@ fn sample_alert() -> NoticeNode {
 fn sample_live() -> LiveNode {
     let leading = notchbase_sdk::element::lower_static(dot(Tone::Red, 9.0));
     let trailing = notchbase_sdk::element::lower_static(timer(now_ms().saturating_sub(SAMPLE_ELAPSED_MS)));
-    LiveNode { leading, trailing, controls: None }
+    LiveNode { leading, trailing, controls: None, urgent: false }
 }
 
 fn sample_device(connected: bool) -> DeviceNotice {
@@ -506,7 +506,7 @@ fn sample_recording() -> Activity {
 fn sample_timer() -> Activity {
     let leading = notchbase_sdk::element::lower_static(ring(0.62).size(13.0).tone(Tone::Orange));
     let trailing = notchbase_sdk::element::lower_static(timer(now_ms() + 4 * 60_000).remaining());
-    Activity::Tool(ToolSlot(SAMPLE_SLOT.0 + 1), LiveNode { leading, trailing, controls: None })
+    Activity::Tool(ToolSlot(SAMPLE_SLOT.0 + 1), LiveNode { leading, trailing, controls: None, urgent: false })
 }
 
 fn sample_agent(mood: Mood) -> Activity {

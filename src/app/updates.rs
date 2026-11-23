@@ -249,7 +249,9 @@ fn in_order(
     tools: impl Iterator<Item = Activity>,
     updater: Option<Activity>,
 ) -> Vec<Activity> {
-    videos.chain(agent.map(Activity::Agent)).chain(tools).chain(updater).collect()
+    let mut all: Vec<Activity> = videos.chain(agent.map(Activity::Agent)).chain(tools).chain(updater).collect();
+    all.sort_by_key(|activity| !activity.urgent());
+    all
 }
 
 fn updating(progress: f32) -> LiveNode {
@@ -261,7 +263,7 @@ fn updating(progress: f32) -> LiveNode {
         wrap: false,
         align: Align::Start,
     };
-    LiveNode { leading: ring, trailing: Node::Text(text), controls: None }
+    LiveNode { leading: ring, trailing: Node::Text(text), controls: None, urgent: false }
 }
 
 fn detail(status: &Status) -> String {

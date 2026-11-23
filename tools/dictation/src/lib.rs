@@ -524,11 +524,11 @@ impl<B: Backend> Tool for Dictation<B> {
                     button("").icon(Icon::Checkmark).on_press(Msg::Toggle),
                 ]
                 .spacing(6.0);
-                Some(Live::new(mic, trailing).controls(controls))
+                Some(Live::new(mic, trailing).controls(controls).urgent())
             }
             Phase::Writing => {
                 let mic = icon(Icon::Microphone).size(GLYPH).tone(Tone::Secondary);
-                Some(Live::new(mic, text("Writing").secondary()))
+                Some(Live::new(mic, text("Writing").secondary()).urgent())
             }
         }
     }

@@ -157,6 +157,7 @@ Keep controls to one or two icon-only buttons (`button("").icon(…)` draws a sm
 
 - A `timer` in a live activity keeps counting on its own; you don't need to tick.
 - notchbase shows up to three live activities: one in the middle and two ears beside it (a playing song takes the middle).
+- Add `.urgent()` for something the user is doing right now, like talking to Dictation: it takes the middle ahead of every other activity, a download or a new song, while it lasts. Use it sparingly.
 - A notice or message temporarily covers the live activity; it comes back when they expire.
 - Hovering the notch opens it as usual, and the live activity fades out while the notch is open.
 - Return `None` to end it. The notch shrinks back.

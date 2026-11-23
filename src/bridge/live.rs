@@ -14,6 +14,13 @@ pub enum Activity {
     Lock(bool),
 }
 
+impl Activity {
+    /// Something the user is doing right now, like dictation: it goes ahead of everything else.
+    pub fn urgent(&self) -> bool {
+        matches!(self, Activity::Tool(_, live) if live.urgent)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoLive {
     pub id: u64,

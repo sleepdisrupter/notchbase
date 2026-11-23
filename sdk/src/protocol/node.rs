@@ -398,6 +398,9 @@ pub struct LiveNode {
     pub trailing: Node,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controls: Option<Node>,
+    /// Shown ahead of every other activity and of music while it lasts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub urgent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

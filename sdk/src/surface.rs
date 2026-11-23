@@ -115,11 +115,19 @@ pub struct Live<Msg> {
     leading: Element<Msg>,
     trailing: Element<Msg>,
     controls: Option<Element<Msg>>,
+    urgent: bool,
 }
 
 impl<Msg> Live<Msg> {
     pub fn new(leading: impl Into<Element<Msg>>, trailing: impl Into<Element<Msg>>) -> Self {
-        Self { leading: leading.into(), trailing: trailing.into(), controls: None }
+        Self { leading: leading.into(), trailing: trailing.into(), controls: None, urgent: false }
+    }
+
+    /// Puts it ahead of every other activity and of music while it lasts, for something the user is doing right
+    /// now, like talking to dictation.
+    pub fn urgent(mut self) -> Self {
+        self.urgent = true;
+        self
     }
 
     pub fn controls(mut self, controls: impl Into<Element<Msg>>) -> Self {
@@ -132,6 +140,7 @@ impl<Msg> Live<Msg> {
             leading: self.leading.lower(handlers),
             trailing: self.trailing.lower(handlers),
             controls: self.controls.map(|controls| controls.lower(handlers)),
+            urgent: self.urgent,
         }
     }
 }

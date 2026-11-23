@@ -70,9 +70,11 @@ impl Notch {
 
     pub(super) fn combine_activities(&mut self) {
         let lock = self.lock_activity();
+        let (urgent, others): (Vec<&Activity>, Vec<&Activity>) =
+            self.app_activities.iter().partition(|activity| activity.urgent());
         let (downloads, rest): (Vec<&Activity>, Vec<&Activity>) =
-            self.app_activities.iter().partition(|activity| matches!(activity, Activity::Video(_)));
-        let combined: Vec<Activity> = lock.iter().chain(downloads).chain(rest).cloned().collect();
+            others.into_iter().partition(|activity| matches!(activity, Activity::Video(_)));
+        let combined: Vec<Activity> = lock.iter().chain(urgent).chain(downloads).chain(rest).cloned().collect();
         if combined != self.activities {
             self.video.follow(&combined);
             self.downloading.follow(&combined, self.preview.is_none());
@@ -82,7 +84,11 @@ impl Notch {
     }
 
     pub(super) fn music_leads(&self) -> bool {
-        self.music_playing() && self.music_until.is_some() && !self.activities.is_empty() && !self.download_leads()
+        self.music_playing()
+            && self.music_until.is_some()
+            && !self.activities.is_empty()
+            && !self.download_leads()
+            && !self.activities.first().is_some_and(Activity::urgent)
     }
 
     fn download_leads(&self) -> bool {
@@ -486,7 +492,7 @@ pub(super) mod tests {
         let leading = Node::Dot { color: Tone::Red.color(), size: 9.0 };
         let trailing =
             Node::Timer { at: since, mode: TimerMode::Elapsed, style: TextStyle::Value, tone: Tone::Primary };
-        Activity::Tool(ToolSlot(3), LiveNode { leading, trailing, controls: None })
+        Activity::Tool(ToolSlot(3), LiveNode { leading, trailing, controls: None, urgent: false })
     }
 
     pub(in crate::notch) fn claude() -> Activity {
@@ -554,7 +560,7 @@ pub(super) mod tests {
             style: Default::default(),
             on_press: Some(notchbase_sdk::protocol::HandlerId(7)),
         };
-        Activity::Tool(ToolSlot(3), LiveNode { leading, trailing, controls: Some(hide) })
+        Activity::Tool(ToolSlot(3), LiveNode { leading, trailing, controls: Some(hide), urgent: false })
     }
 
     #[test]
@@ -717,6 +723,22 @@ pub(super) mod tests {
         n.set_locked(false);
         n.lock_tick(Instant::now() + Duration::from_secs(2));
         assert!(matches!(n.live.as_ref().map(|live| &live.activity), Some(Activity::Video(_))));
+    }
+
+    #[test]
+    fn dictation_leads_over_everything() {
+        let mut n = island();
+        let Activity::Tool(slot, mut live) = recording(now_ms()) else { unreachable!() };
+        live.urgent = true;
+        let dictating = Activity::Tool(ToolSlot(slot.0 + 1), live);
+        n.set_now_playing(Some(&crate::notch::tests::fixtures::song(true, 10.0)));
+        n.set_activities(vec![claude(), download(), recording(0), dictating.clone()]);
+        assert_eq!(n.live.as_ref().map(|live| &live.activity), Some(&dictating), "in the middle, ahead of a download");
+        assert!(!n.music_leads(), "and ahead of a new song");
+        assert!(matches!(n.activities.as_slice(), [a, Activity::Video(_), ..] if *a == dictating));
+
+        n.set_locked(true);
+        assert!(matches!(n.activities.as_slice(), [Activity::Lock(false), a, ..] if *a == dictating));
     }
 
     #[test]
