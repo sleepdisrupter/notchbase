@@ -76,6 +76,14 @@ pub struct Edge {
     pub right: f32,
 }
 
+/// The edge at height `y`, between the two edges either side of it.
+fn edge_at(edges: &[Edge], y: f32) -> Edge {
+    let below = edges.iter().position(|e| e.y >= y).unwrap_or(edges.len() - 1);
+    let (a, b) = (edges[below.saturating_sub(1)], edges[below]);
+    let k = if b.y > a.y { ((y - a.y) / (b.y - a.y)).clamp(0.0, 1.0) } else { 1.0 };
+    Edge { y, left: lerp(a.left, b.left, k), right: lerp(a.right, b.right, k) }
+}
+
 impl Flight {
     pub fn new(way: Way, id: u32, window: Rect, tile: Rect, picture: Option<egui::ColorImage>) -> Self {
         Self {
@@ -220,25 +228,38 @@ impl Flight {
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    /// The liquid under the picture: bands following its bend, melted together, and at the very end a faint neck
-    /// joining it to the tile.
+    /// The liquid under the picture: slices that follow its bent sides exactly, between rounded caps at the top and
+    /// bottom, and at the very end a faint neck joining it to the tile.
     pub fn blobs(&self) -> Vec<crate::liquid::Blob> {
-        let edges = self.edges();
-        let k = self.progress();
+        use crate::liquid::Blob;
         // At the window the glass hides just inside the picture, so it can't peek out at its rounded corners.
+        let k = self.progress();
         let inset = 3.0 * (1.0 - smoothstep(0.0, 0.15, k));
-        let corner = self.corner();
-        let mut out = Vec::new();
-        for band in edges.chunks(STRIPS / 8 + 1).collect::<Vec<_>>().windows(1) {
-            let band = band[0];
-            let (Some(first), Some(last)) = (band.first(), band.last()) else { continue };
-            let left = band.iter().map(|e| e.left).fold(f32::MAX, f32::min);
-            let right = band.iter().map(|e| e.right).fold(f32::MIN, f32::max);
-            let rect = Rect::from_min_max(pos2(left, first.y), pos2(right, last.y)).shrink(inset);
-            if rect.is_positive() {
-                out.push(crate::liquid::Blob::rect(rect, corner.min(rect.height() * 0.5), 10.0));
-            }
+        let edges: Vec<Edge> = self
+            .edges()
+            .into_iter()
+            .map(|e| Edge { y: e.y, left: e.left + inset, right: (e.right - inset).max(e.left + inset) })
+            .collect();
+        let (Some(&top), Some(&bottom)) = (edges.first(), edges.last()) else { return Vec::new() };
+        let (top, bottom) = (Edge { y: top.y + inset, ..top }, Edge { y: bottom.y - inset, ..bottom });
+        if bottom.y - top.y < 1.0 {
+            return Vec::new();
         }
+        let corner = self.corner().min((bottom.y - top.y) * 0.25);
+        let slice = |a: Edge, b: Edge, radius: f32| {
+            Blob::slice(a.y, b.y, egui::Rangef::new(a.left, a.right), egui::Rangef::new(b.left, b.right), radius)
+        };
+        // The rounded ends reach twice their corner in; the slices between start half way into them, under their
+        // inner corners.
+        let mut out = vec![
+            slice(top, edge_at(&edges, top.y + corner * 2.0), corner),
+            slice(edge_at(&edges, bottom.y - corner * 2.0), bottom, corner),
+        ];
+        let (from, to) = (top.y + corner, bottom.y - corner);
+        let mut cuts = vec![edge_at(&edges, from)];
+        cuts.extend(edges.iter().copied().filter(|e| e.y > from && e.y < to));
+        cuts.push(edge_at(&edges, to));
+        out.extend(cuts.windows(2).filter(|pair| pair[1].y > pair[0].y).map(|pair| slice(pair[0], pair[1], 0.0)));
         let body = self.shape();
         let reach = smoothstep(0.6, 0.88, k) * (1.0 - smoothstep(0.95, 1.0, k));
         let gap = self.tile.center().y - body.max.y;
@@ -249,7 +270,7 @@ impl Flight {
                 pos2(x - width * 0.5, body.max.y - 4.0),
                 pos2(x + width * 0.5, self.tile.center().y),
             );
-            out.push(crate::liquid::Blob::rect(neck, width * 0.5, 10.0 * reach));
+            out.push(Blob::rect(neck, width * 0.5, 10.0 * reach));
         }
         out
     }
@@ -414,6 +435,34 @@ mod tests {
         assert!(start.picture_alpha() > 0.99 && start.glass_alpha() < 0.01, "no black blob at the tile");
         up.revealing = true;
         assert_eq!(up.glass_alpha(), 0.0, "no black under the picture as it fades onto the window");
+    }
+
+    #[test]
+    fn the_glass_follows_the_bent_sides_without_steps() {
+        // What it did before: the glass under the picture was a stack of square bars, with gaps between them and
+        // steps sticking out past the curve, plain to see once the picture melts into it or when there's none.
+        for way in [Way::Down, Way::Up] {
+            let mut f = flight(way);
+            for _ in 0..HELD_FRAMES {
+                f.step(1.0 / 120.0);
+            }
+            while !f.arrived() {
+                f.step(1.0 / 120.0);
+                let blobs = f.blobs();
+                let (top, bottom) = (f.edge(0.0).y, f.edge(1.0).y);
+                let ends = f.corner() * 2.0 + 4.0;
+                for n in 0..STRIPS * 4 {
+                    let e = f.edge((n as f32 + 0.5) / (STRIPS * 4) as f32);
+                    if e.y < top + ends || e.y > bottom - ends || e.right - e.left < 12.0 {
+                        continue;
+                    }
+                    for (inside, outside) in [(e.left + 5.0, e.left - 2.0), (e.right - 5.0, e.right + 2.0)] {
+                        assert!(crate::liquid::distance(&blobs, pos2(inside, e.y)) < 0.0, "a gap at {e:?}");
+                        assert!(crate::liquid::distance(&blobs, pos2(outside, e.y)) > 0.0, "a step out at {e:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
