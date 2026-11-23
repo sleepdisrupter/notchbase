@@ -36,6 +36,7 @@ These pages explain how the app works so you can find your way around the code. 
 - [Volume and Media Keys](Volume-and-Media-Keys.md): intercepting volume, brightness and media keys and the volume and brightness HUDs.
 - [System tools](System-Tools.md): battery and charger alerts, the camera and microphone indicator with a mute button, browser downloads, the lock screen, and Keep Awake.
 - [Alerts](Alerts.md): the bundled Alerts tool, which turns requests to a local webhook into notch notifications.
+- [Dictation](Dictation.md): hold fn (Ctrl+Win on Windows) and talk. Groq's Whisper, the tidy-up, and the glossary that learns your words.
 - [Calendar](Calendar.md): your next meeting as a live activity with a Join button, today's agenda, secret iCal links on every platform, and Apple Calendar (with adding and editing events) on macOS.
 - [Installing](Installing.md): installing notchbase as an app, opening at login, uninstalling, the app icon.
 - [Updates](Updates.md): automatic updates from GitHub releases, the What's New notes a release carries and shows once, and per-platform builds.

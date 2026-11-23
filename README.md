@@ -68,6 +68,7 @@ Everything on screen is painted by hand and animated with real springs, so it mo
 
 **And a little more:**
 
+- **Dictation**: hold fn (Ctrl + Win on Windows) and talk, and Groq's Whisper types it where your cursor is. It learns your names and terms. Bring your own free Groq key.
 - **Stats**: CPU, GPU, memory and disk at a glance, plus how much of your Claude or ChatGPT plan is left this week.
 - **Per-app volume**: turn down one app without touching the rest.
 - **Calendar**: your next meeting with a countdown and a **Join** button, plus a month view with today's agenda.
@@ -130,6 +131,7 @@ On a Mac, the notch opens by itself on a short **Welcome** walkthrough that asks
 | Screenshot an area | `Ctrl+Option+S` | `Ctrl+Alt+S` |
 | Record the screen | `Ctrl+Option+R` | `Ctrl+Alt+R` |
 | Timer | `Ctrl+Option+T` | `Ctrl+Alt+T` |
+| Dictation (hold to talk, tap for hands-free) | `fn` | `Ctrl+Win` |
 
 Rest the pointer on a tool's icon on the Tools page to see or change its shortcut.
 

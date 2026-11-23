@@ -8,10 +8,11 @@ use notchbase_sdk::protocol::{
 use super::*;
 use crate::config::{Config, ToolConfig, hotkey};
 
-const BUNDLED: [&str; 12] = [
+const BUNDLED: [&str; 13] = [
     "color-picker",
     "screenshot",
     "screen-recorder",
+    "dictation",
     "timer",
     "keep-awake",
     "roam",

@@ -44,6 +44,7 @@ battery = { path = "tools/battery" }
 calendar = { path = "tools/calendar" }
 camera-mic = { path = "tools/camera-mic" }
 color-picker = { path = "tools/color-picker" }
+dictation = { path = "tools/dictation" }
 downloads = { path = "tools/downloads" }
 egui.workspace = true
 egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links"] }

@@ -252,6 +252,7 @@ mod tests {
             "color-picker",
             "screenshot",
             "screen-recorder",
+            "dictation",
             "timer",
             "keep-awake",
             "roam",

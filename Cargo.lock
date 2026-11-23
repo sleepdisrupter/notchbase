@@ -781,6 +781,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
+name = "dictation"
+version = "0.1.0"
+dependencies = [
+ "flacenc",
+ "notchbase-net",
+ "notchbase-sdk",
+ "notchbase-wasapi",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "serde",
+ "serde_json",
+ "ureq",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2163,6 +2180,7 @@ dependencies = [
  "calendar",
  "camera-mic",
  "color-picker",
+ "dictation",
  "downloads",
  "egui",
  "egui-winit",

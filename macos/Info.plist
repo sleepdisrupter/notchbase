@@ -31,7 +31,7 @@
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>notchbase shows when your Bluetooth headphones, keyboards and other devices connect, with their battery level.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>notchbase records your microphone in screen recordings when you turn it on.</string>
+	<string>notchbase records your microphone for dictation, and in screen recordings when you turn it on.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>notchbase shows your next meeting in the notch with a button to join it.</string>
 	<key>NSCalendarsUsageDescription</key>

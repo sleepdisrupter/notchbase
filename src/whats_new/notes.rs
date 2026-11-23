@@ -40,7 +40,28 @@ const OPEN: &str = "Read or fork it at github.com/sleepdisrupter/notchbase";
 const PIN: &str = "Right-click anything in Find to pin it";
 const PINNED: &str = "Drag one to put them in your order";
 
+#[cfg(target_os = "macos")]
+const TALK: &str = "Hold fn and talk to type anywhere";
+#[cfg(not(target_os = "macos"))]
+const TALK: &str = "Hold Ctrl and Win and talk to type anywhere";
+const GROQ: &str = "Add your free Groq key in the Dictation tool";
+const TAP: &str = "Tap the key to talk hands-free";
+const TERMS: &str = "Dictation learns the names and terms you use";
+#[cfg(target_os = "macos")]
+const FIXES: &str = "Words you correct are spelled your way next time";
+#[cfg(not(target_os = "macos"))]
+const FIXES: &str = "Words you say often are spelled your way next time";
+
 pub(super) static NOTES: &[Release] = &[
+    Release {
+        version: "0.30.0",
+        picture: None,
+        changes: &[
+            Change { glyph: Glyph::Microphone, title: TALK, caption: GROQ },
+            Change { glyph: Glyph::Waveform, title: "Keep listening without holding", caption: TAP },
+            Change { glyph: Glyph::Spark, title: TERMS, caption: FIXES },
+        ],
+    },
     Release {
         version: "0.24.0",
         picture: None,
