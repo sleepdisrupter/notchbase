@@ -111,10 +111,10 @@ impl Dock {
         self.bars.iter().find(|b| b.key == key).map_or(0.0, |b| b.shown.value.clamp(0.0, 1.0))
     }
 
-    pub(super) fn paint_tile_bar(&self, painter: &egui::Painter, key: &str, at: Pos2) {
+    pub(super) fn paint_tile_bar(&self, painter: &egui::Painter, key: &str, at: Pos2, tile: f32) {
         if let Some(b) = self.bars.iter().find(|b| b.key == key) {
             let fill = (!b.glide).then_some(b.fill.value.clamp(0.0, 1.0));
-            paint_bar(painter, at, fill, b.shown.value.clamp(0.0, 1.0), self.time);
+            paint_bar(painter, at, tile, fill, b.shown.value.clamp(0.0, 1.0), self.time);
         }
     }
 
@@ -138,28 +138,36 @@ impl Dock {
 }
 
 /// The thin bar under a tile: a track with the part done filled in, or a light gliding along it when how far along
-/// isn't known.
-pub(super) fn paint_bar(painter: &egui::Painter, at: Pos2, fill: Option<f32>, alpha: f32, time: f32) {
+/// isn't known. It's [`WIDTH`] long under icons from 32 points up and half the icon under smaller ones, so it stays
+/// inside the icon's art.
+pub(super) fn paint_bar(painter: &egui::Painter, at: Pos2, tile: f32, fill: Option<f32>, alpha: f32, time: f32) {
     if alpha <= 0.0 {
         return;
     }
-    let track = Rect::from_center_size(at, vec2(WIDTH, HEIGHT));
+    let width = bar_width(tile);
+    let track = Rect::from_center_size(at, vec2(width, HEIGHT));
     painter.rect_filled(track, HEIGHT * 0.5, white(0.16 * alpha));
     match fill {
         Some(f) => {
-            let done = Rect::from_min_size(track.min, vec2((WIDTH * f).max(HEIGHT), HEIGHT));
+            let done = Rect::from_min_size(track.min, vec2((width * f).max(HEIGHT), HEIGHT));
             painter.rect_filled(done, HEIGHT * 0.5, white(0.8 * alpha));
         }
         None => {
             let phase = 0.5 - 0.5 * (time * std::f32::consts::TAU / 1.4).cos();
-            let x = lerp(track.left() + 3.0, track.right() - 3.0, phase);
+            let light = width * 0.375;
+            let x = lerp(track.left() + light * 0.5, track.right() - light * 0.5, phase);
             painter.rect_filled(
-                Rect::from_center_size(pos2(x, at.y), vec2(6.0, HEIGHT)),
+                Rect::from_center_size(pos2(x, at.y), vec2(light, HEIGHT)),
                 HEIGHT * 0.5,
                 white(0.75 * alpha),
             );
         }
     }
+}
+
+/// The bar's length under an icon `tile` points wide.
+pub(super) fn bar_width(tile: f32) -> f32 {
+    (tile * 0.5).clamp(10.0, WIDTH)
 }
 
 #[cfg(test)]
@@ -259,5 +267,15 @@ mod tests {
         assert!(d.beat_of(d.tiles.iter().find(|t| t.pid == Some(7)).unwrap()) <= 1.06 + 1e-6);
         d.set_beat(None);
         assert!(!d.ambient());
+    }
+
+    #[test]
+    fn the_bar_stays_inside_a_small_icon() {
+        assert_eq!(bar_width(48.0), WIDTH, "standard icons keep the standard bar");
+        assert_eq!(bar_width(32.0), WIDTH);
+        for tile in [16.0_f32, 20.0, 24.0, 28.0] {
+            let art = tile * (1.0 - 2.0 * super::super::ART_INSET);
+            assert!(bar_width(tile) <= art, "{tile} pt: the bar fits under the art");
+        }
     }
 }

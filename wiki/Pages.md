@@ -231,7 +231,7 @@ macOS only, from the **Dock** row of General. It shows [notchbase dock](../dock/
 
 | Group | Rows |
 | --- | --- |
-| Appearance | Icon size (32 to 96 pt), Magnification, Glass (Light, Smoked, Dark), App names |
+| Appearance | Icon size (16 to 96 pt), Magnification, Glass (Light, Smoked, Dark), App names |
 | Behaviour | Hide in full screen, Keep windows clear, Window previews, Mission Control (Stay or Fade) |
 | Animations | Open effect, Minimize effect (Liquid or macOS), Minimize time (0.25 to 0.8 s, Liquid only) |
 | Cmd+Tab | Dock's own switcher |

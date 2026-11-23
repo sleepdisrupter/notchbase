@@ -117,7 +117,7 @@ impl Shot {
         let icon_y = size.y - 4.0 - 7.0 - dock.config.tile_size * 0.5;
         let nth_x = |dock: &Dock, n: usize| {
             let count = dock.tiles.len() as f32;
-            let slot = dock.config.tile_size * 1.12;
+            let slot = dock.config.tile_size + 8.0;
             size.x * 0.5 - count * slot * 0.5 + slot * (n as f32 + 0.5)
         };
         match self.scene.as_str() {

@@ -38,7 +38,7 @@ const SEPARATOR: f32 = 16.0;
 /// The separator's popup, which belongs to no tile.
 const SEPARATOR_KEY: &str = "::separator";
 /// How small and large dragging the separator makes the icons, and the standard size.
-const SMALLEST: f32 = 32.0;
+const SMALLEST: f32 = 16.0;
 const LARGEST: f32 = 96.0;
 const STANDARD: f32 = 48.0;
 /// How far either side of the separator's line still grabs it.
@@ -46,7 +46,8 @@ const SEPARATOR_GRAB: f32 = 7.0;
 const DRAG_START: f32 = 5.0;
 const HOLD_FOR_MENU: f32 = 0.55;
 const REMOVE_ABOVE: f32 = 64.0;
-/// How far the hovered icon lifts, in points.
+/// How far the hovered icon lifts, in points, from 32 point icons up. Smaller icons lift proportionally less, so a
+/// 16 point icon doesn't jump a quarter of its own height.
 const HOVER_LIFT: f32 = 4.0;
 /// How far past its edge the pointer may go before the lifted icon hands over to its neighbour.
 const HOVER_HOLD: f32 = 4.0;
@@ -444,6 +445,11 @@ impl Dock {
     /// An icon's scale now: grown while hovered, a touch smaller while pressed.
     fn scale_of(&self, t: &Tile) -> f32 {
         1.0 + (self.peak() - 1.0) * t.hover.value - 0.08 * t.down.value
+    }
+
+    /// How far the hovered icon lifts: [`HOVER_LIFT`], scaled down with icons smaller than 32 points.
+    fn hover_lift(&self) -> f32 {
+        HOVER_LIFT * (self.tile_size() / 32.0).clamp(0.5, 1.0)
     }
 
     fn slot_width(&self) -> f32 {
@@ -2121,7 +2127,7 @@ impl Dock {
             let gulp = t.gulp.value;
             // A dropped-in app hops off the cradle: stretched while it flies, squashed for a moment as it lands.
             let fall = t.fall.value;
-            let lift = HOVER_LIFT * hover + gulp.max(0.0) + fall;
+            let lift = self.hover_lift() * hover + gulp.max(0.0) + fall;
             let squash = if t.fall.is_settled() {
                 1.0
             } else {
@@ -2178,9 +2184,9 @@ impl Dock {
             icons.push((i, icon, smoothstep(0.0, 0.6, p)));
 
             if t.kind == Kind::Folder {
-                self.paint_progress(painter, i, pos2(cx, dot_y));
+                self.paint_progress(painter, i, pos2(cx, dot_y), tile);
             }
-            self.paint_tile_bar(painter, &t.key, pos2(cx, dot_y));
+            self.paint_tile_bar(painter, &t.key, pos2(cx, dot_y), tile);
             let t = &self.tiles[i];
             // A download's bar takes the running dot's place while it shows.
             let dot_alpha = 1.0 - self.bar_shown(&t.key);
@@ -2300,7 +2306,7 @@ impl Dock {
         let pointer = self.pointer;
         let icon_bottom = self.icon_bottom();
         // A floating panel clears the hovered icon's rise, not just the dock's edge.
-        let float_bottom = (self.icon_top(self.peak()) - HOVER_LIFT - PAD_TOP).min(self.body_top());
+        let float_bottom = (self.icon_top(self.peak()) - self.hover_lift() - PAD_TOP).min(self.body_top());
         let float = self.config.popup_attach == crate::config::PopupAttach::Float;
         let body_top = self.body_top();
         let tile_size = self.tile_size();
@@ -2461,7 +2467,7 @@ impl Dock {
         let size_x = self.size.x;
         let pointer = self.pointer;
         // A floating panel clears the hovered icon's rise, not just the dock's edge.
-        let float_bottom = (self.icon_top(self.peak()) - HOVER_LIFT - PAD_TOP).min(self.body_top());
+        let float_bottom = (self.icon_top(self.peak()) - self.hover_lift() - PAD_TOP).min(self.body_top());
         let float = self.config.popup_attach == crate::config::PopupAttach::Float;
         let body_top = self.body_top();
         let tile_size = self.tile_size();
@@ -3161,6 +3167,25 @@ mod tests {
 
     fn total_width(dock: &Dock) -> f32 {
         dock.place().0.iter().map(|p| p.width).sum()
+    }
+
+    #[test]
+    fn the_smallest_dock_keeps_its_icons_and_dots_inside_the_body() {
+        let mut d = pinned_dock("smallest");
+        d.config.tile_size = SMALLEST;
+        d.config = std::mem::take(&mut d.config).sane();
+        assert_eq!(d.config.tile_size, 16.0, "the config takes 16 point icons as they are");
+        d.step(DT);
+        let body = Rect::from_min_max(pos2(0.0, d.body_top()), pos2(d.size.x, d.bottom()));
+        for i in 0..d.tiles.len() {
+            let icon = d.icon_rect(i);
+            assert!(body.contains_rect(icon), "icon {i} sits inside the body at rest");
+        }
+        let dot_y = (d.icon_bottom() - SMALLEST * ART_INSET + d.bottom()) * 0.5;
+        assert!(dot_y > d.icon_bottom() - SMALLEST * ART_INSET && dot_y < d.bottom(), "the dots sit below the art");
+        assert_eq!(d.hover_lift(), HOVER_LIFT * 0.5, "a 16 point icon lifts half as far");
+        d.config.tile_size = 48.0;
+        assert_eq!(d.hover_lift(), HOVER_LIFT, "standard icons lift as before");
     }
 
     #[test]

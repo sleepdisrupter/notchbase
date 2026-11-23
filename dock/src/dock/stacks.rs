@@ -21,8 +21,8 @@ use notchbase_paint::font;
 use notchbase_paint::spring::{POINT_PRECISION, Spring, SpringConfig, UNIT_PRECISION, lerp, smoothstep};
 
 use super::{
-    Blob, DRAG_START, Dock, Effect, FLOAT_GAP, HOVER_LIFT, Kind, NECK_GAP, OOZE, OOZE_SHUT, PAD_TOP, PLATE, Placed,
-    Popup, PopupKind, divider_ink, ellipsize, icon_options, neck, panel_now, shaded_text,
+    Blob, DRAG_START, Dock, Effect, FLOAT_GAP, Kind, NECK_GAP, OOZE, OOZE_SHUT, PAD_TOP, PLATE, Placed, Popup,
+    PopupKind, divider_ink, ellipsize, icon_options, neck, panel_now, shaded_text,
 };
 use crate::config::StackSort;
 use crate::os;
@@ -870,7 +870,7 @@ impl Dock {
         };
         let float = self.config.popup_attach == crate::config::PopupAttach::Float;
         let body_top = self.body_top();
-        let float_bottom = (self.icon_top(self.peak()) - HOVER_LIFT - PAD_TOP).min(body_top);
+        let float_bottom = (self.icon_top(self.peak()) - self.hover_lift() - PAD_TOP).min(body_top);
         let at = At {
             float,
             cx: slot.center(),
@@ -1411,11 +1411,11 @@ impl Dock {
     }
 
     /// Downloads still arriving: a small bar under the tile, a light gliding along it.
-    pub(super) fn paint_progress(&self, painter: &egui::Painter, i: usize, at: Pos2) {
+    pub(super) fn paint_progress(&self, painter: &egui::Painter, i: usize, at: Pos2, tile: f32) {
         if self.stacks.get(&self.tiles[i].path).is_none_or(|s| s.partial == 0) {
             return;
         }
-        super::ambient::paint_bar(painter, at, None, 1.0, self.time);
+        super::ambient::paint_bar(painter, at, tile, None, 1.0, self.time);
     }
 }
 

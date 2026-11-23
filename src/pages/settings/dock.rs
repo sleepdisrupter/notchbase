@@ -95,7 +95,7 @@ pub(super) fn ui(ctx: &mut PageCtx<'_>, dock: &DockView, actions: &mut Vec<Actio
     let rows = group(ctx, &mut top, "Appearance", GROUPS[0]);
     let [size, magnify, glass, names] = rows[..] else { return outcome(back) };
     let row = Row { rect: size, title: "Icon size", detail: "How big the icons are at rest" };
-    if let Some(next) = stepper(ctx, &row, id("size"), [f64::from(dock.tile_size), 32.0, 96.0, 4.0], "pt", can) {
+    if let Some(next) = stepper(ctx, &row, id("size"), [f64::from(dock.tile_size), 16.0, 96.0, 4.0], "pt", can) {
         change(DockChange::TileSize(next as f32));
     }
     flag(ctx, (magnify, "Magnification", "Icons swell gently under the pointer"), dock.magnification, can)
