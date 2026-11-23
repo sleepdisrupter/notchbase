@@ -709,6 +709,59 @@ pub fn dock_items(dock_pid: i32) -> Vec<(String, String, [f64; 4])> {
     out
 }
 
+/// The badges the system Dock shows on its apps (unread counts and the like), even while it's hidden: each app's
+/// bundle path, its title, and the badge's text. Needs Accessibility.
+pub fn dock_badges(dock_pid: i32) -> Vec<crate::badges::Badge> {
+    unsafe extern "C" {
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+        fn CFURLCopyFileSystemPath(url: *const c_void, style: isize) -> *const c_void;
+        fn CFURLGetTypeID() -> usize;
+    }
+    const POSIX_PATHS: isize = 0;
+    let path_of = |item: AxElement| {
+        let url = copy(item, ns_string!("AXURL"))?;
+        let path = (unsafe { CFGetTypeID(url) } == unsafe { CFURLGetTypeID() })
+            .then(|| unsafe { CFURLCopyFileSystemPath(url, POSIX_PATHS) })
+            .filter(|path| !path.is_null());
+        unsafe { CFRelease(url) };
+        let path = path?;
+        let text = unsafe { &*(path as *const NSString) }.to_string();
+        unsafe { CFRelease(path) };
+        Some(std::path::PathBuf::from(text))
+    };
+    let mut out = Vec::new();
+    let app = unsafe { AXUIElementCreateApplication(dock_pid) };
+    if app.is_null() {
+        return out;
+    }
+    let children = copy(app, ns_string!("AXChildren"));
+    unsafe { CFRelease(app) };
+    let Some(children) = children else { return out };
+    for i in 0..unsafe { CFArrayGetCount(children) } {
+        let child = unsafe { CFArrayGetValueAtIndex(children, i) };
+        if text(child, ns_string!("AXRole")) != "AXList" {
+            continue;
+        }
+        let Some(items) = copy(child, ns_string!("AXChildren")) else { continue };
+        for n in 0..unsafe { CFArrayGetCount(items) } {
+            let item = unsafe { CFArrayGetValueAtIndex(items, n) };
+            let label = text(item, ns_string!("AXStatusLabel"));
+            if label.trim().is_empty() || text(item, ns_string!("AXSubrole")) != "AXApplicationDockItem" {
+                continue;
+            }
+            out.push(crate::badges::Badge {
+                path: path_of(item),
+                title: text(item, ns_string!("AXTitle")),
+                label: label.trim().to_owned(),
+            });
+        }
+        unsafe { CFRelease(items) };
+    }
+    unsafe { CFRelease(children) };
+    out
+}
+
 /// Real key presses, as if typed, for trying the switcher by hand. Words: `cmd` (Cmd down), `up` (Cmd up), `tab`,
 /// `shift-tab`, `esc`, `left`, `right`, `wait` (a quarter second).
 pub fn post_keys(script: &str) {

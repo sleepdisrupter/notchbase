@@ -301,6 +301,8 @@ pub struct Dock {
     /// The running apps as last told, so a new pin shows straight away.
     running: Vec<os::Running>,
     pub trash_full: bool,
+    /// The badges apps show on their icons.
+    pub badges: Vec<crate::badges::Badge>,
     /// How many icons may still be redrawn this frame.
     icon_budget: u32,
     confirm_empty: bool,
@@ -391,6 +393,7 @@ impl Dock {
             bursts: Vec::new(),
             running: Vec::new(),
             trash_full: false,
+            badges: Vec::new(),
             icon_budget: 3,
             confirm_empty: false,
             effects: Vec::new(),
@@ -2695,6 +2698,11 @@ impl Dock {
             }
             let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
             painter.image(tex.id(), rect, uv, Color32::WHITE.gamma_multiply(alpha));
+        }
+        if t.kind == Kind::App
+            && let Some(label) = crate::badges::for_app(&self.badges, &t.path, &t.name)
+        {
+            crate::badges::paint(painter, rect.shrink(rect.width() * ART_INSET), label, alpha);
         }
     }
 }

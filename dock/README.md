@@ -34,6 +34,9 @@ droplet, and a quitting app's slot pinches off and melts back in.
 - Drag an app to reorder it. Pull it up and away from the dock to remove it.
 - Drop files on an app to open them with it, or on the Trash to trash them. Drop an `.app` on the dock to keep it there.
 - Running dots update live as apps launch and quit, from NSWorkspace notifications.
+- Apps' badges (unread counts and the like) show as red pills on their icons' top right, like the Dock's. They're read
+  every second off the hidden system Dock through Accessibility (`AXStatusLabel`), so they need that permission too
+  (`badges.rs`, `titlebar::dock_badges`).
 - Rest on a running app's icon for about a third of a second and its open windows show side by side above it, with
   their titles. Click one to bring it to the front (a minimized one is restored), or use its close button. Move along
   the dock and the panel glides to the next app. It goes a moment after the pointer leaves the icon and the panel.
@@ -121,6 +124,8 @@ The scenes are `rest`, `hover`, `tooltip-ooze`, `menu`, `menu-claude`, `menu-cha
   or closing one through Accessibility.
 - `avoid.rs`: keeps zoomed, filled and tiled windows above the dock.
 - `glass.rs`: the blur behind the dark glass, masked to the liquid's outline.
+- `flight.rs`: minimizing and restoring; the liquid under the window is slices that follow its bent sides exactly
+  (`Blob::slice` in `liquid.rs`), between rounded ends.
 - `mac.rs`: AppKit (running apps, icons, opening, the Trash, the pointer, windows).
 
 Springs and fonts come from `crates/paint`, the same ones the notch uses. Frames are drawn only while something moves,

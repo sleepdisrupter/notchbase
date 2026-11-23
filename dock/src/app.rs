@@ -40,6 +40,8 @@ const WINDOW_LOOKUP: Duration = Duration::from_millis(25);
 const SYSTEM_DOCK_POLL: Duration = Duration::from_millis(20);
 /// How often minimized windows are looked for: soon enough that a tile arrives as the window lands in the dock.
 const MINIMIZED_POLL: Duration = Duration::from_millis(400);
+/// How often the apps' badges are read off the system Dock.
+const BADGES_POLL: Duration = Duration::from_secs(1);
 /// How often to look for a zoomed window under the dock.
 /// Where the hidden system Dock's Trash is, x in points (f32 bits; 0 until known).
 static SYSTEM_TRASH_X: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -176,6 +178,8 @@ pub struct App {
     apps_changed: Arc<AtomicBool>,
     /// Minimized windows, from their own watch thread.
     minimized: Arc<std::sync::Mutex<Option<Vec<crate::minimized::Minimized>>>>,
+    /// New badges from the system Dock, for the tick to take.
+    badges: Arc<std::sync::Mutex<Option<Vec<crate::badges::Badge>>>>,
     /// Windows flying down into their tiles or back up out of them.
     flights: Vec<Flight>,
     /// Windows the dock minimized, parked out of sight in the screen's corner while they're down: their app, the
@@ -287,6 +291,7 @@ pub fn run(dir: PathBuf) -> Result<(), String> {
         left_since: None,
         apps_changed: Arc::new(AtomicBool::new(true)),
         minimized: Arc::default(),
+        badges: Arc::default(),
         flights: Vec::new(),
         parked: HashMap::new(),
         jobs: Vec::new(),
@@ -492,6 +497,31 @@ impl App {
             }
         });
 
+        // The apps' badges are read off the system Dock, which keeps them even while it's hidden; a change wakes the loop.
+        let found = Arc::clone(&self.badges);
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("dock badges".into()).spawn(move || {
+            let mut last = Vec::new();
+            loop {
+                let now = if crate::titlebar::trusted() {
+                    let dock = mac::running_pid("com.apple.dock");
+                    objc2::rc::autoreleasepool(|_| dock.map(crate::titlebar::dock_badges).unwrap_or_default())
+                } else {
+                    Vec::new()
+                };
+                if now != last {
+                    last.clone_from(&now);
+                    if let Ok(mut slot) = found.lock() {
+                        *slot = Some(now);
+                    }
+                    if proxy.send_event(()).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(BADGES_POLL);
+            }
+        });
+
         // Minimized windows are watched on a thread of their own too; a change wakes the loop to refresh the tiles.
         let found = Arc::clone(&self.minimized);
         let proxy = self.proxy.clone();
@@ -642,6 +672,7 @@ impl App {
         let mut dock = Dock::new(self.dock.config.clone(), self.dir.clone(), win.gl.size()).live();
         dock.dark = self.dock.dark;
         dock.trash_full = self.dock.trash_full;
+        dock.badges.clone_from(&self.dock.badges);
         if let Some(m) = &self.last_minimized {
             dock.set_minimized(m.clone());
         }
@@ -741,6 +772,13 @@ impl App {
         let now = Instant::now();
         let mut slow = Slow::new();
         let minimized = self.minimized.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(badges) = self.badges.lock().ok().and_then(|mut slot| slot.take()) {
+            for seat in &mut self.seats {
+                seat.dock.badges.clone_from(&badges);
+            }
+            self.dock.badges = badges;
+            self.needs_frame = true;
+        }
         if let Some(down) = &minimized {
             self.unpark_restored(down);
         }

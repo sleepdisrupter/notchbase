@@ -6,6 +6,8 @@
 
 // The dock itself, the same on both systems: its drawing, tiles, menus, stacks, flights and settings.
 #[cfg(any(target_os = "macos", windows))]
+mod badges;
+#[cfg(any(target_os = "macos", windows))]
 mod clock;
 #[cfg(any(target_os = "macos", windows))]
 mod config;
