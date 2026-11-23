@@ -1,7 +1,7 @@
 //! macOS: an event tap hears fn (or the right ⌥ or ⌘), AudioQueue records the microphone at
-//! 16 kHz, Accessibility reads the text around the cursor, and the words go in with ⌘V from a
-//! pasteboard that's put back the way it was. All of it needs the Accessibility permission,
-//! which notchbase already asks for its volume and media keys.
+//! 16 kHz, Accessibility reads the text around the cursor, and the words go in as keystrokes
+//! that carry the text, leaving the clipboard alone. All of it needs the Accessibility
+//! permission, which notchbase already asks for its volume and media keys.
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
@@ -12,12 +12,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use objc2::msg_send;
-use objc2::rc::{Retained, autoreleasepool};
-use objc2::runtime::{AnyClass, ProtocolObject};
-use objc2_app_kit::{
-    NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSPasteboardWriting, NSSound, NSWorkspace,
-};
-use objc2_foundation::{NSArray, NSData, NSString};
+use objc2::rc::autoreleasepool;
+use objc2::runtime::AnyClass;
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString, NSSound, NSWorkspace};
+use objc2_foundation::NSString;
 
 use super::{Cue, Hotkey, KeySink, Platform, Problem, Recording, Surroundings, Tape, Typed};
 use crate::sound::{Converter, RATE, level};
@@ -136,6 +134,7 @@ unsafe extern "C" {
 }
 
 const HID_TAP: u32 = 0;
+const SESSION_TAP: u32 = 1;
 const HEAD: u32 = 0;
 const ACTIVE: u32 = 0;
 const KEY_DOWN: u32 = 10;
@@ -145,17 +144,16 @@ const TAP_DISABLED_BY_INPUT: u32 = 0xFFFF_FFFF;
 const KEYCODE: u32 = 9;
 const AUTOREPEAT: u32 = 8;
 const HID_STATE: i32 = 1;
-const COMBINED_STATE: i32 = 0;
+const PRIVATE_STATE: i32 = -1;
 
 const FN_CODE: i64 = 63;
 const RIGHT_OPTION_CODE: i64 = 61;
 const RIGHT_COMMAND_CODE: i64 = 54;
 const ESCAPE_CODE: i64 = 53;
-const V_CODE: u16 = 9;
+const RETURN_CODE: u16 = 36;
 const SECONDARY_FN: u64 = 0x80_0000;
 const RIGHT_OPTION: u64 = 0x40;
 const RIGHT_COMMAND: u64 = 0x10;
-const COMMAND: u64 = 0x10_0000;
 
 const LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
 const SIGNED_PACKED: u32 = 0x4 | 0x8;
@@ -173,8 +171,8 @@ const AX_TIMEOUT: f32 = 0.25;
 /// Text read on each side of the cursor.
 const BEFORE_CHARS: isize = 1500;
 const AFTER_CHARS: isize = 400;
-/// The pasteboard is put back once the app has had this long to paste.
-const RESTORE_AFTER: Duration = Duration::from_millis(500);
+/// The most characters one keystroke carries.
+const CHUNK: usize = 20;
 const CUE_VOLUME: f32 = 0.22;
 const EDITABLE_ROLES: [&str; 5] = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXWebArea"];
 
@@ -225,16 +223,20 @@ impl Platform for Native {
 
     fn type_text(&self, text: &str, reread: bool) -> Result<Typed, String> {
         let focus = Focus::now();
-        if focus.as_ref().is_some_and(|focus| !focus.editable()) {
+        if let Some(focus) = focus.as_ref().filter(|focus| !focus.editable()) {
+            let role = string_attribute(focus.element.0, "AXRole").unwrap_or_default();
             // Nothing to type into: leave the words on the clipboard instead.
             autoreleasepool(|_| {
                 let pasteboard = NSPasteboard::generalPasteboard();
                 pasteboard.clearContents();
                 pasteboard.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
             });
-            return Err("no text field".into());
+            return Err(format!("no text field ({role})"));
         }
-        paste(text);
+        if focus.is_none() {
+            crate::log::note("no focused element: typing anyway");
+        }
+        keystrokes(text);
         let reread = focus.filter(|_| reread).map(|focus| {
             let read: Box<dyn FnMut() -> Option<String> + Send> = Box::new(move || focus.value());
             read
@@ -407,95 +409,51 @@ impl Focus {
     }
 }
 
-/// What was on the pasteboard, so it can be put back after pasting.
-struct Saved {
-    items: Vec<Vec<(Retained<NSString>, Retained<NSData>)>>,
-}
-
-impl Saved {
-    fn take(pasteboard: &NSPasteboard) -> Self {
-        let items = pasteboard.pasteboardItems().map_or_else(Vec::new, |items| {
-            items
-                .iter()
-                .map(|item| {
-                    item.types().iter().filter_map(|kind| item.dataForType(&kind).map(|data| (kind, data))).collect()
-                })
-                .collect()
-        });
-        Self { items }
-    }
-
-    fn put_back(self, pasteboard: &NSPasteboard) {
-        pasteboard.clearContents();
-        if self.items.is_empty() {
-            return;
-        }
-        let items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = self
-            .items
-            .into_iter()
-            .map(|kinds| {
-                let item = NSPasteboardItem::new();
-                for (kind, data) in kinds {
-                    item.setData_forType(&data, &kind);
-                }
-                ProtocolObject::from_retained(item)
-            })
-            .collect();
-        pasteboard.writeObjects(&NSArray::from_retained_slice(&items));
-    }
-}
-
-/// Pastes `text` with ⌘V, then puts the pasteboard back unless something else changed it.
-fn paste(text: &str) {
-    let (saved, ours) = autoreleasepool(|_| {
-        let pasteboard = NSPasteboard::generalPasteboard();
-        let saved = Saved::take(&pasteboard);
-        pasteboard.clearContents();
-        pasteboard.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
-        // Clipboard managers skip what's marked like this, so dictation doesn't fill their history.
-        let empty = NSData::new();
-        for kind in ["org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType"] {
-            pasteboard.setData_forType(Some(&empty), &NSString::from_str(kind));
-        }
-        (Saved { items: saved.items }, pasteboard.changeCount())
-    });
-    press_paste();
-    let saved = SendSaved(saved);
-    let _ = thread::Builder::new().name("notchbase dictation pasteboard".into()).spawn(move || {
-        thread::sleep(RESTORE_AFTER);
-        let saved = saved;
-        autoreleasepool(|_| {
-            let pasteboard = NSPasteboard::generalPasteboard();
-            if pasteboard.changeCount() == ours {
-                saved.0.put_back(&pasteboard);
-            }
-        });
-    });
-}
-
-struct SendSaved(Saved);
-
-// The pasteboard's data objects are immutable once copied, so they can move between threads.
-unsafe impl Send for SendSaved {}
-
-fn press_paste() {
+/// Types `text` as keystrokes that carry the characters themselves, so it works whatever the
+/// keyboard layout, needs no Paste menu, and leaves the clipboard alone. A line break is Return.
+fn keystrokes(text: &str) {
     unsafe {
-        let source = CGEventSourceCreate(COMBINED_STATE);
-        let v: [u16; 1] = [u16::from(b'v')];
-        for down in [true, false] {
-            let event = CGEventCreateKeyboardEvent(source, V_CODE, down);
-            if event.is_null() {
-                continue;
+        let source = CGEventSourceCreate(PRIVATE_STATE);
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                key(source, RETURN_CODE, &[]);
             }
-            CGEventSetFlags(event, COMMAND);
-            CGEventKeyboardSetUnicodeString(event, 1, v.as_ptr());
-            CGEventPost(HID_TAP, event);
-            CFRelease(event);
+            let units: Vec<u16> = line.encode_utf16().collect();
+            let mut from = 0;
+            while from < units.len() {
+                let mut to = (from + CHUNK).min(units.len());
+                // Never split a surrogate pair between two keystrokes.
+                if to < units.len() && (0xDC00..0xE000).contains(&units[to]) {
+                    to -= 1;
+                }
+                key(source, 0, &units[from..to]);
+                from = to;
+            }
         }
         if !source.is_null() {
             CFRelease(source);
         }
     }
+}
+
+/// One key pressed and let go, with no modifiers, typing `units` if there are any.
+unsafe fn key(source: Ref, code: u16, units: &[u16]) {
+    for down in [true, false] {
+        let event = unsafe { CGEventCreateKeyboardEvent(source, code, down) };
+        if event.is_null() {
+            continue;
+        }
+        unsafe {
+            CGEventSetFlags(event, 0);
+            if !units.is_empty() {
+                CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
+            }
+            CGEventPost(SESSION_TAP, event);
+            CFRelease(event);
+        }
+    }
+    // Some apps drop keystrokes that come all at once.
+    thread::sleep(Duration::from_millis(2));
 }
 
 fn microphone_denied() -> bool {
@@ -626,7 +584,10 @@ extern "C" fn tapped(_proxy: Ref, kind: u32, event: Ref, user: *mut c_void) -> R
             if watched.held.swap(down, Ordering::Relaxed) != down {
                 (watched.keys)(if down { Key::Down } else { Key::Up });
             }
-            event
+            // fn on its own is dictation's: the system never sees it, so a press or double press
+            // can't open the emoji picker, switch the input source or call up Siri on the way.
+            // Keys pressed with fn still carry it.
+            if watched.hotkey == Hotkey::Fn { null_mut() } else { event }
         }
         KEY_DOWN => {
             if unsafe { CGEventGetIntegerValueField(event, AUTOREPEAT) } != 0 {

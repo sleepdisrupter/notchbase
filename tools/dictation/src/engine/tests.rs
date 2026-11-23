@@ -133,13 +133,26 @@ fn silence_types_nothing() {
 const TAP_AND_A_BIT: Duration = Duration::from_millis(crate::trigger::TAP.as_millis() as u64 + 30);
 
 #[test]
-fn tap_locks_and_escape_cancels() {
+fn double_tap_locks_and_escape_cancels() {
     let (_engine, reports, fake, dir) = started("gsk_test");
     wait_for_watch(&fake);
     press(&fake, Key::Down);
     press(&fake, Key::Up);
+    press(&fake, Key::Down);
+    press(&fake, Key::Up);
     until(&reports, |report| matches!(report, Report::Listening { locked: true, .. }));
     press(&fake, Key::Escape);
+    until(&reports, |report| *report == Report::Idle);
+    assert!(fake.0.lock().unwrap().typed.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn single_tap_is_dropped() {
+    let (_engine, reports, fake, dir) = started("gsk_test");
+    wait_for_watch(&fake);
+    press(&fake, Key::Down);
+    press(&fake, Key::Up);
     until(&reports, |report| *report == Report::Idle);
     assert!(fake.0.lock().unwrap().typed.is_empty());
     let _ = std::fs::remove_dir_all(dir);

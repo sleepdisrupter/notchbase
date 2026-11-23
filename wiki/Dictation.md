@@ -7,17 +7,17 @@ Hold a key and talk, and what you said is typed where your cursor is. The bundle
 | | macOS | Windows |
 | --- | --- | --- |
 | Hold to talk, let go to type | **fn** (🌐) | **Ctrl + Win** |
-| Tap to keep listening, tap again to type | the same key, pressed for less than a third of a second | the same chord |
-| Throw it away | **Esc** while listening | **Esc** while listening |
+| Double-tap to keep listening and type as you talk, press again to stop | the same key, tapped twice | the same chord |
+| Stop and throw away what isn't typed yet | **Esc** while listening | **Esc** while listening |
 | Other keys | right ⌥ or right ⌘ | right Ctrl or right Alt |
 
-The key is set under **Settings › Tools › Dictation**. The **Start or finish dictation** shortcut, the tile's page and the live activity's ✓ do the same as a tap. Laptops handle fn themselves on Windows and never pass it on, which is why the PC uses a chord; Ctrl + Win does nothing in Windows on its own, and the Start menu is kept from opening when you let go.
+The key is set under **Settings › Tools › Dictation**. The **Start or finish dictation** shortcut, the tile's page and the live activity's ✓ do the same as a double tap. A single tap on its own does nothing, so a stray press of fn never dictates. Laptops handle fn themselves on Windows and never pass it on, which is why the PC uses a chord; Ctrl + Win does nothing in Windows on its own, and the Start menu is kept from opening when you let go.
 
-A held key that turns out to be part of a shortcut (fn with an arrow, Ctrl + Win + →) is not dictation: the recording is thrown away. Hands-free listening that hears no speech for 10 seconds stops by itself, and a recording stops after 20 minutes.
+A held key that turns out to be part of a shortcut (fn with an arrow, Ctrl + Win + →) is not dictation: the recording is thrown away. Hands-free, each phrase is typed as soon as you pause after it, and the rest when you press the key again. Hands-free listening that hears no speech for 10 seconds stops by itself, and a recording stops after 20 minutes.
 
 While listening, the closed notch shows a red microphone and a meter (with a lock when hands-free), and pointing at it shows ✗ and ✓. "Writing" follows until the words are typed.
 
-On a Mac, set **System Settings › Keyboard › Press 🌐 key to** to **Do Nothing**, or every press of fn also opens the emoji picker or switches the input source. The tool says so, with a button to that page, until it's set.
+On a Mac, fn on its own is kept from the system while it's the dictation key, so it doesn't open the emoji picker or switch the input source as well. Keys pressed together with fn still work. If the system still reacts to it, set **System Settings › Keyboard › Press 🌐 key to** to **Do Nothing**; the tool offers a button to that page.
 
 ## Setting up
 
@@ -43,6 +43,7 @@ On a Mac it needs Accessibility (to hear fn and to paste) and the microphone, an
 - The microphone starts on the key press, and the connection to Groq is opened while you talk, so no TLS handshake waits for the words.
 - Silence before and after the speech is cut, quiet speech is lifted, and it's sent as 16 kHz FLAC, half the size of WAV.
 - A long dictation is cut at a pause every 24 seconds or so, and each part is written down while you keep talking. Only the last part is left when you let go.
+- Hands-free, a phrase is sent once you've paused for 0.6 seconds after it, and typed as soon as it's back, while you say the next one.
 - Whisper usually answers in under a second. The tidy-up is skipped if it would take more than 2.5 seconds.
 
 ## How it's reliable
@@ -52,7 +53,7 @@ On a Mac it needs Accessibility (to hear fn and to paste) and the microphone, an
 - Whisper's well-known inventions in silence ("Thank you.", "Thanks for watching!") and segments it doubts itself are dropped, and nothing is sent at all when no speech was heard.
 - The tidy-up model's answer is checked before it's used: if it answered the text instead of cleaning it, rewrote it, or swapped in a word that sounds nothing like what was said, Whisper's words are typed instead.
 - Typing waits for the dictation key to be let go, so letters never become shortcuts.
-- On a Mac the words are pasted, and the clipboard is put back as it was half a second later (marked so clipboard managers skip it). With no text field focused they're left on the clipboard and the notch says so. Windows types them as Unicode keystrokes and leaves the clipboard alone. The last few dictations are on the tool's page, with **Copy**.
+- The words are typed as keystrokes that carry the text itself, so any keyboard layout works and the clipboard is left alone. With no text field focused they're put on the clipboard instead and the notch says so. The last few dictations are on the tool's page, with **Copy**.
 
 ## How it learns your words
 
@@ -72,12 +73,14 @@ Words are also fitted to the cursor: a space after a word, no capital mid-senten
 | Piece | Where |
 | --- | --- |
 | The tool: settings, tile, page, live activity, notices | `tools/dictation/src/lib.rs` |
-| Hold, tap, shortcut and Escape | `trigger.rs` |
+| Hold, double tap, shortcut and Escape | `trigger.rs` |
 | The engine thread: sessions, parts, delivery, learning | `engine.rs` |
 | Speech detection, trimming, cutting at pauses, resampling | `sound.rs`, `flac.rs` |
 | Groq: Whisper, retries, the tidy-up model | `groq.rs` |
 | Dropping inventions, checking the tidy-up, fitting to the cursor | `clean.rs` |
 | The glossary, the fixer, learning | `glossary.rs`, `diff.rs`, `words.rs` |
 | Keys, microphone, text around the cursor, typing, sounds | `platform/macos.rs`, `platform/windows.rs` |
+
+What dictation did (keys, microphone, Groq's answers, where it typed, never the words or the key) goes to `dictation/dictation.log` in the data folder.
 
 `cargo test -p dictation` runs everything offline. Two tests talk to Groq and are ignored: give them a key in `GROQ_API_KEY` (and a 16 kHz mono WAV in `NOTCHBASE_DICTATION_WAV` for `real_speech_is_written`) and run them with `--ignored`.

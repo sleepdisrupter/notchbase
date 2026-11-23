@@ -113,6 +113,23 @@ pub fn pause_after(samples: &[i16], after: usize) -> Option<usize> {
     best
 }
 
+/// How many frames of loudness last `length`.
+pub fn frames_in(length: std::time::Duration) -> usize {
+    (length.as_millis() as usize * RATE / 1000).div_ceil(FRAME)
+}
+
+/// Where to cut once speech has been followed by a pause at least `pause` frames long that is
+/// still going: the end of a phrase, so it can be typed while the next is said. The cut leaves a
+/// little of the quiet with the phrase.
+pub fn ended_pause(samples: &[i16], pause: usize) -> Option<usize> {
+    let loudness = frames(samples);
+    let threshold = threshold(&loudness);
+    let quiet = loudness.iter().rev().take_while(|db| **db < threshold).count();
+    let spoken = loudness.len() - quiet;
+    let voiced = loudness[..spoken].iter().filter(|db| **db >= threshold).count();
+    (quiet >= pause && voiced >= SPEECH_MIN).then(|| (spoken + quiet.min(TAIL / FRAME)) * FRAME)
+}
+
 /// Converts interleaved 16-bit audio at any rate to 16 kHz mono.
 #[derive(Debug)]
 #[cfg_attr(not(any(windows, target_os = "macos", test)), allow(dead_code))]
@@ -161,6 +178,19 @@ mod tests {
     fn hiss(seconds: f32) -> Vec<i16> {
         let count = (seconds * RATE as f32) as usize;
         (0..count).map(|i| ((i * 7919 % 61) as i16 - 30) * 3).collect()
+    }
+
+    #[test]
+    fn a_finished_phrase_is_cut_after_its_pause() {
+        let pause = frames_in(std::time::Duration::from_millis(600));
+        let phrase = [hiss(0.3), tone(1.2, 0.3)].concat();
+        assert_eq!(ended_pause(&[phrase.clone(), hiss(0.3)].concat(), pause), None, "still a short breath");
+        let samples = [phrase.clone(), hiss(0.8)].concat();
+        let at = ended_pause(&samples, pause).expect("the phrase is over");
+        assert!(at > phrase.len() && at <= phrase.len() + TAIL + FRAME, "{at}");
+        assert_eq!(ended_pause(&[hiss(0.3), tone(0.1, 0.3), hiss(1.0)].concat(), pause), None, "a bump");
+        assert_eq!(ended_pause(&hiss(2.0), pause), None, "nothing said");
+        assert_eq!(ended_pause(&tone(2.0, 0.3), pause), None, "still talking");
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Dictation: hold fn (Ctrl+Win on Windows) and talk, or tap it to keep listening hands-free.
+//! Dictation: hold fn (Ctrl+Win on Windows) and talk, or double-tap it to keep listening and
+//! type as you talk.
 //! Groq's Whisper writes it down with the user's own key, a quick model tidies it, and the
 //! words are typed where the cursor is. It learns the user's terms as they go: the ones they
 //! add, the ones they correct, the ones they keep saying and the ones on screen.
@@ -9,6 +10,7 @@ pub mod engine;
 mod flac;
 mod glossary;
 mod groq;
+mod log;
 pub mod platform;
 mod sound;
 mod trigger;
@@ -248,8 +250,8 @@ impl<B: Backend> Dictation<B> {
     fn how_to(&self) -> Element<Msg> {
         let caps = self.prefs.hotkey.caps().to_vec();
         let state = match self.phase {
-            Phase::Idle => text("Hold to talk, tap to keep listening").secondary(),
-            Phase::Listening { locked: true, .. } => text("Listening, tap again to finish").tone(Tone::Red),
+            Phase::Idle => text("Hold to talk, double-tap to type as you talk").secondary(),
+            Phase::Listening { locked: true, .. } => text("Typing as you talk, press again to stop").tone(Tone::Red),
             Phase::Listening { .. } => text("Listening, let go to finish").tone(Tone::Red),
             Phase::Writing => text("Writing…").secondary(),
         };
@@ -341,7 +343,7 @@ impl<B: Backend> Tool for Dictation<B> {
             )
             .setting(
                 SettingSpec::choice(HOTKEY, "Dictation key", Hotkey::CHOICES, hotkey)
-                    .detail("Hold it to talk, or tap it to keep listening until you tap it again"),
+                    .detail("Hold it to talk, or double-tap it to type as you talk until you press it again or Esc"),
             )
             .setting(
                 SettingSpec::choice(MODEL, "Whisper", [("accurate", "Most accurate"), ("fast", "Fastest")], "accurate")

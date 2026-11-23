@@ -131,7 +131,7 @@ On a Mac, the notch opens by itself on a short **Welcome** walkthrough that asks
 | Screenshot an area | `Ctrl+Option+S` | `Ctrl+Alt+S` |
 | Record the screen | `Ctrl+Option+R` | `Ctrl+Alt+R` |
 | Timer | `Ctrl+Option+T` | `Ctrl+Alt+T` |
-| Dictation (hold to talk, tap for hands-free) | `fn` | `Ctrl+Win` |
+| Dictation (hold to talk, double-tap to type as you talk) | `fn` | `Ctrl+Win` |
 
 Rest the pointer on a tool's icon on the Tools page to see or change its shortcut.
 

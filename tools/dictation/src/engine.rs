@@ -14,6 +14,7 @@ use crate::clean;
 use crate::flac;
 use crate::glossary::{Glossary, Source, from_screen};
 use crate::groq::{Ask, Failure, Groq};
+use crate::log;
 use crate::platform::{Cue, Hotkey, Platform, Problem, Recording, Surroundings, Tape, Typed};
 use crate::sound::{self, RATE};
 use crate::trigger::{Act, Key, Trigger};
@@ -24,6 +25,13 @@ const METER: usize = RATE / 20;
 /// Parts of a long recording are at least this long, and cut at the next pause.
 const PART: usize = RATE * 24;
 const CUT_EVERY: Duration = Duration::from_millis(500);
+/// Hands-free listening types as you talk: a phrase is sent once it is at least this long and a
+/// pause this long has followed it.
+const LIVE_PHRASE: usize = RATE * 3 / 4;
+const LIVE_PAUSE: Duration = Duration::from_millis(600);
+/// A phrase that runs on with no such pause is cut at a shorter one after this long.
+const LIVE_PART: usize = RATE * 12;
+const CHECK_LIVE_EVERY: Duration = Duration::from_millis(150);
 /// Hands-free listening that hears nothing for this long stops by itself.
 const SILENT_STOP: Duration = Duration::from_secs(10);
 const LONGEST: Duration = Duration::from_secs(20 * 60);
@@ -90,6 +98,13 @@ impl Engine {
     pub fn start(dir: PathBuf, platform: Box<dyn Platform>, prefs: Prefs) -> (Self, Receiver<Report>) {
         let (input, inputs) = mpsc::channel();
         let (reports, updates) = mpsc::channel();
+        log::open(&dir);
+        log::note(format_args!(
+            "started {}, key {:?}, {}",
+            env!("CARGO_PKG_VERSION"),
+            prefs.hotkey,
+            if prefs.key.trim().is_empty() { "no Groq key" } else { "Groq key set" }
+        ));
         let glossary = Glossary::load(dir.join("dictation").join("glossary.json"));
         let mut core = Core::new(platform, prefs, glossary, input.clone(), reports);
         let _ = thread::Builder::new().name("notchbase dictation".into()).spawn(move || core.run(&inputs));
@@ -118,6 +133,11 @@ struct Session {
     screen: Vec<String>,
     heard_speech: bool,
     checked: Instant,
+    /// Hands-free: each part is typed as soon as it's written.
+    as_you_talk: bool,
+    /// The parts typed so far, and what they typed.
+    typed: usize,
+    words: Vec<String>,
 }
 
 /// What's needed to try a failed recording again.
@@ -186,6 +206,7 @@ impl Core {
                 Ok(Input::Quit) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(Input::Key(key)) => {
                     let act = self.trigger.see(key, Instant::now());
+                    log::note(format_args!("key {key:?}: {act:?}"));
                     self.act(act);
                 }
                 Ok(Input::Control(control)) => self.control(control),
@@ -207,8 +228,12 @@ impl Core {
         });
         self.watched_at = Some(Instant::now());
         match self.platform.watch(hotkey, sink, self.listening.clone()) {
-            Ok(()) => self.watching = Some(hotkey),
+            Ok(()) => {
+                log::note(format_args!("watching {hotkey:?}"));
+                self.watching = Some(hotkey);
+            }
             Err(problem) => {
+                log::note(format_args!("can't watch {hotkey:?}: {}", problem.says));
                 self.watching = None;
                 self.set_problem(Some(problem));
                 return;
@@ -219,6 +244,7 @@ impl Core {
 
     fn set_problem(&mut self, problem: Option<Problem>) {
         if problem != self.problem {
+            log::note(format_args!("problem: {}", problem.as_ref().map_or("none", |problem| problem.says.as_str())));
             self.problem.clone_from(&problem);
             self.report(Report::Problem(problem));
         }
@@ -273,12 +299,18 @@ impl Core {
             Act::Nothing => {}
             Act::Start => self.start(),
             Act::Lock => {
-                if let Some(session) = &self.live {
-                    self.report(Report::Listening { locked: true, since: millis(session.started) });
+                if let Some(session) = &mut self.live {
+                    session.as_you_talk = true;
+                    let since = millis(session.started);
+                    self.report(Report::Listening { locked: true, since });
                 }
             }
             Act::Finish => self.finish(),
             Act::Cancel => self.cancel(),
+            Act::Restart => {
+                self.stop_listening();
+                self.start();
+            }
         }
     }
 
@@ -287,11 +319,13 @@ impl Core {
             return;
         }
         if !self.groq.has_key() {
+            log::note("no Groq key");
             self.trigger.reset();
             self.report(Report::Failed { says: Failure::NoKey.says(), retry: false, setup: true });
             return;
         }
         if let Some(problem) = self.platform.problem(self.prefs.hotkey).filter(|problem| problem.blocks) {
+            log::note(format_args!("blocked: {}", problem.says));
             self.trigger.reset();
             self.set_problem(Some(problem.clone()));
             self.report(Report::Failed { says: problem.says, retry: false, setup: false });
@@ -301,6 +335,7 @@ impl Core {
         let recording = match self.platform.listen(tape.clone()) {
             Ok(recording) => recording,
             Err(says) => {
+                log::note(format_args!("microphone: {says}"));
                 self.trigger.reset();
                 self.report(Report::Failed { says, retry: false, setup: false });
                 return;
@@ -315,6 +350,12 @@ impl Core {
         self.report(Report::Listening { locked: self.trigger.locked(), since: millis(started) });
         let around = self.platform.surroundings(self.prefs.screen);
         let screen = if self.prefs.screen { screen_terms(&around) } else { Vec::new() };
+        log::note(format_args!(
+            "listening in {:?}, {} text around the cursor, {} terms on screen",
+            around.app,
+            if around.before.is_some() { "read the" } else { "no" },
+            screen.len()
+        ));
         let id = self.next;
         self.next += 1;
         self.live = Some(Session {
@@ -328,6 +369,9 @@ impl Core {
             screen,
             heard_speech: false,
             checked: started,
+            as_you_talk: self.trigger.locked(),
+            typed: 0,
+            words: Vec::new(),
         });
     }
 
@@ -350,6 +394,12 @@ impl Core {
             self.platform.cue(Cue::Stop);
         }
         let rest = session.tape.copy(session.cut, usize::MAX);
+        log::note(format_args!(
+            "finished after {} ms with {:.1} s of sound, level {:.0} dB",
+            session.started.elapsed().as_millis(),
+            session.tape.count() as f32 / RATE as f32,
+            sound::decibels(&session.tape.all())
+        ));
         self.write_part(&mut session, rest);
         self.queue.push_back(session);
         self.report(Report::Writing);
@@ -379,13 +429,28 @@ impl Core {
         if let Some(part) = session.and_then(|session| session.parts.get_mut(index)) {
             *part = Some(result);
         }
+        if let Some(mut session) = self.live.take_if(|session| session.id == id && session.as_you_talk) {
+            self.type_ready(&mut session);
+            self.live = Some(session);
+        }
         self.deliver();
     }
 
     fn deliver(&mut self) {
-        while self.queue.front().is_some_and(|session| session.parts.iter().all(Option::is_some)) {
-            let Some(session) = self.queue.pop_front() else { break };
-            self.deliver_one(session);
+        loop {
+            let Some(mut session) = self.queue.pop_front() else { break };
+            if session.as_you_talk {
+                self.type_ready(&mut session);
+            }
+            if !session.parts.iter().all(Option::is_some) {
+                self.queue.push_front(session);
+                break;
+            }
+            if session.as_you_talk {
+                self.done_talking(&session);
+            } else {
+                self.deliver_one(session);
+            }
         }
         if self.queue.is_empty() && self.live.is_none() {
             self.report(Report::Idle);
@@ -398,6 +463,7 @@ impl Core {
             match part {
                 Some(Ok(text)) => texts.push(text.clone()),
                 Some(Err(failure)) => {
+                    log::note(format_args!("failed: {failure:?}"));
                     let setup = matches!(failure, Failure::NoKey | Failure::BadKey);
                     self.report(Report::Failed { says: failure.says(), retry: failure.passes(), setup });
                     if failure.passes() {
@@ -411,6 +477,7 @@ impl Core {
         }
         let text = clean::joined(&texts);
         if text.is_empty() {
+            log::note("nothing to type");
             self.report(Report::Nothing);
             return;
         }
@@ -426,17 +493,74 @@ impl Core {
         }
     }
 
+    /// Types each part that's written, in order, while the rest is still being said.
+    fn type_ready(&mut self, session: &mut Session) {
+        while let Some(Some(part)) = session.parts.get(session.typed) {
+            session.typed += 1;
+            let text = match part {
+                Ok(text) if text.is_empty() => continue,
+                Ok(text) => text.clone(),
+                Err(failure) => {
+                    log::note(format_args!("failed: {failure:?}"));
+                    let setup = matches!(failure, Failure::NoKey | Failure::BadKey);
+                    self.report(Report::Failed { says: failure.says(), retry: false, setup });
+                    continue;
+                }
+            };
+            // The field is read again each time, since the words typed before are now part of it.
+            let fresh = self.platform.surroundings(true);
+            let first = session.words.is_empty();
+            let typed_before = (!first)
+                .then(|| format!("{}{}", session.around.before.as_deref().unwrap_or(""), session.words.concat()));
+            let before = fresh.before.or(typed_before).or_else(|| session.around.before.clone());
+            let after = fresh.after.or_else(|| session.around.after.clone().filter(|_| first));
+            let fitted = clean::fitted(&text, before.as_deref(), after.as_deref());
+            self.wait_for_keys_up();
+            match self.platform.type_text(&fitted, false) {
+                Ok(_) => log::note(format_args!("typed {} characters as you talk", fitted.chars().count())),
+                Err(why) => {
+                    log::note(format_args!("not typed: {why}"));
+                    self.report(Report::Typed { text: text.clone(), typed: false });
+                }
+            }
+            session.words.push(fitted);
+            if self.prefs.learn {
+                let learned = self.glossary.heard(&text, &session.screen, now());
+                self.glossary.save();
+                if !learned.is_empty() {
+                    self.report(Report::Learned(learned));
+                    self.report_glossary();
+                }
+            }
+        }
+    }
+
+    /// A hands-free recording is over and every part of it is typed.
+    fn done_talking(&self, session: &Session) {
+        if session.words.is_empty() {
+            log::note("nothing to type");
+            self.report(Report::Nothing);
+        } else {
+            let text = session.words.concat().trim().to_owned();
+            self.report(Report::Typed { text, typed: true });
+        }
+    }
+
     fn type_out(&mut self, text: &str, around: &Surroundings) {
         let fitted = clean::fitted(text, around.before.as_deref(), around.after.as_deref());
         self.wait_for_keys_up();
         match self.platform.type_text(&fitted, self.prefs.learn && around.before.is_some()) {
             Ok(typed) => {
+                log::note(format_args!("typed {} characters", fitted.chars().count()));
                 self.report(Report::Typed { text: text.to_owned(), typed: true });
                 if self.prefs.learn {
                     self.watch_for_edits(typed, &fitted, around);
                 }
             }
-            Err(_) => self.report(Report::Typed { text: text.to_owned(), typed: false }),
+            Err(why) => {
+                log::note(format_args!("not typed: {why}"));
+                self.report(Report::Typed { text: text.to_owned(), typed: false });
+            }
         }
     }
 
@@ -493,6 +617,9 @@ impl Core {
             screen: retry.screen,
             heard_speech: true,
             checked: Instant::now(),
+            as_you_talk: false,
+            typed: 0,
+            words: Vec::new(),
         };
         session.tape.push(&retry.samples);
         self.write_part(&mut session, retry.samples);
@@ -505,11 +632,18 @@ impl Core {
         if self.watching != Some(self.prefs.hotkey) && self.watched_at.is_none_or(|at| at.elapsed() >= WATCH_AGAIN) {
             self.watch();
         }
+        let expired = self.trigger.expire(now);
+        if expired != Act::Nothing {
+            log::note("a single tap: dropped");
+            self.act(expired);
+            return;
+        }
         let Some(session) = &self.live else { return };
         let elapsed = session.started.elapsed();
         self.report(Report::Level(sound::level(&session.tape.tail(METER))));
         if self.trigger.held() && elapsed >= STUCK_AFTER && self.platform.hotkey_down(self.prefs.hotkey) == Some(false)
         {
+            log::note("the key is up without a key-up");
             let act = self.trigger.released(now);
             self.act(act);
             return;
@@ -519,7 +653,8 @@ impl Core {
             self.finish();
             return;
         }
-        if session.checked.elapsed() >= CUT_EVERY {
+        let every = if session.as_you_talk { CHECK_LIVE_EVERY } else { CUT_EVERY };
+        if session.checked.elapsed() >= every {
             self.check_live();
         }
     }
@@ -539,7 +674,19 @@ impl Core {
                 return;
             }
         }
-        if length - session.cut >= PART {
+        if session.as_you_talk {
+            let pending = session.tape.copy(session.cut, length);
+            let pause = sound::frames_in(LIVE_PAUSE);
+            let at = if pending.len() >= LIVE_PHRASE { sound::ended_pause(&pending, pause) } else { None };
+            let at = at.or_else(|| {
+                (pending.len() >= LIVE_PART).then(|| sound::pause_after(&pending, LIVE_PART / 2)).flatten()
+            });
+            if let Some(at) = at {
+                let part = pending[..at].to_vec();
+                session.cut += at;
+                self.write_part(&mut session, part);
+            }
+        } else if length - session.cut >= PART {
             let pending = session.tape.copy(session.cut, length);
             if let Some(at) = sound::pause_after(&pending, PART - RATE * 4) {
                 let part = pending[..at].to_vec();
@@ -564,7 +711,10 @@ struct Job {
 
 impl Job {
     fn write(&self, samples: &[i16]) -> Result<String, Failure> {
-        let Some(speech) = sound::speech(samples) else { return Ok(String::new()) };
+        let Some(speech) = sound::speech(samples) else {
+            log::note("no speech heard");
+            return Ok(String::new());
+        };
         let prepared = sound::prepared(samples, speech);
         let audio = flac::encode(&prepared).map_err(Failure::Server)?;
         let ask = Ask {
@@ -573,8 +723,15 @@ impl Job {
             prompt: self.glossary.prompt(&self.screen),
             seconds: prepared.len() as f32 / RATE as f32,
         };
+        let started = Instant::now();
         let heard = self.groq.transcribe(&audio, &ask)?;
         let text = clean::heard(&heard.text, &heard.segments, speech.voiced);
+        log::note(format_args!(
+            "Whisper wrote {} characters in {} ms, {} kept",
+            heard.text.chars().count(),
+            started.elapsed().as_millis(),
+            text.chars().count()
+        ));
         let text = self.glossary.fix(&text, &self.screen);
         if !self.polish || text.is_empty() {
             return Ok(text);
