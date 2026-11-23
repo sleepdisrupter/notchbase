@@ -1,5 +1,6 @@
-//! The app switcher: Cmd+Tab shows the apps with a window open on screen right now (never hidden apps, minimized
-//! windows or other Spaces), most recently used first, each as a live
+//! The app switcher: Cmd+Tab shows, on the screen the pointer is on, the apps with a window open on that screen
+//! right now (never hidden apps, minimized windows, other Spaces or other screens), most recently used first, each
+//! as a live
 //! picture of its front window with its icon, on a floating panel of the dock's smoked black glass. Tab and
 //! Shift+Tab (or ` and the arrow keys, or the pointer) move along; letting go of Cmd switches; Esc cancels; Q quits
 //! and H hides the app picked. A quick Cmd+Tab switches straight back to the last app without showing the panel.
@@ -204,14 +205,49 @@ impl Entry {
     }
 }
 
-/// Which apps the switcher shows, and the window each one's picture shows: only apps with a real window on screen
-/// right now. `apps` are the Dock's kind of apps, (pid, hidden); `windows` are (pid, window, on screen), front to
-/// back, already only real windows of a real size. Hidden apps, minimized windows (never on screen) and windows on
-/// other Spaces (not on screen either) don't count.
-pub fn shown_apps(apps: &[(i32, bool)], windows: &[(i32, u32, bool)]) -> Vec<(i32, u32)> {
+/// A real window, as the switcher sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Listed {
+    pub pid: i32,
+    pub id: u32,
+    /// Minimized windows and windows on other Spaces aren't.
+    pub on_screen: bool,
+    /// Where it is, in global top-left points.
+    pub frame: Rect,
+}
+
+/// Which of `screens` (global top-left points) a window is on: the one holding most of it, as macOS decides. None
+/// when it's on none of them.
+pub fn screen_of(frame: Rect, screens: &[Rect]) -> Option<usize> {
+    let shared = |s: &Rect| {
+        let both = s.intersect(frame);
+        if both.is_positive() { both.area() } else { 0.0 }
+    };
+    let (i, most) = screens.iter().map(shared).enumerate().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    (most > 0.0).then_some(i)
+}
+
+/// The screen the pointer is on, or the nearest one when it's between them.
+pub fn screen_at(p: Pos2, screens: &[Rect]) -> Option<usize> {
+    screens.iter().position(|s| s.contains(p)).or_else(|| {
+        let away = |s: &Rect| s.distance_sq_to_pos(p);
+        (0..screens.len()).min_by(|&a, &b| away(&screens[a]).total_cmp(&away(&screens[b])))
+    })
+}
+
+/// Which apps the switcher shows on screen `on` of `screens`, and the window each one's picture shows: only apps
+/// with a real window open on that screen right now. `apps` are the Dock's kind of apps, (pid, hidden); `windows`
+/// are front to back, already only real windows of a real size. Hidden apps, minimized windows (never on screen),
+/// windows on other Spaces (not on screen either) and windows mostly on another screen don't count.
+pub fn shown_apps(apps: &[(i32, bool)], windows: &[Listed], screens: &[Rect], on: usize) -> Vec<(i32, u32)> {
     apps.iter()
         .filter(|(_, hidden)| !hidden)
-        .filter_map(|&(pid, _)| windows.iter().find(|w| w.0 == pid && w.2).map(|w| (pid, w.1)))
+        .filter_map(|&(pid, _)| {
+            windows
+                .iter()
+                .find(|w| w.pid == pid && w.on_screen && screen_of(w.frame, screens) == Some(on))
+                .map(|w| (pid, w.id))
+        })
         .collect()
 }
 
@@ -519,24 +555,78 @@ mod tests {
 
     const SCREEN: Vec2 = vec2(1470.0, 956.0);
 
+    /// A laptop's screen, with a bigger monitor above it and a bit to the left.
+    fn two_screens() -> [Rect; 2] {
+        [Rect::from_min_size(pos2(0.0, 0.0), SCREEN), Rect::from_min_size(pos2(-60.0, -1080.0), vec2(1920.0, 1080.0))]
+    }
+
+    fn listed(pid: i32, id: u32, on_screen: bool, at: Pos2) -> Listed {
+        Listed { pid, id, on_screen, frame: Rect::from_min_size(at, vec2(800.0, 600.0)) }
+    }
+
     #[test]
     fn only_apps_with_a_window_on_screen_show() {
+        let screens = two_screens();
+        let here = pos2(100.0, 100.0);
         let apps = [(1, false), (2, false), (3, true), (4, false), (5, false)];
         let windows = [
-            (1, 11, true),
-            (1, 12, true),
+            listed(1, 11, true, here),
+            listed(1, 12, true, here),
             // 2: only minimized (off screen).
-            (2, 21, false),
+            listed(2, 21, false, here),
             // 3: hidden, though its window says on screen.
-            (3, 31, true),
+            listed(3, 31, true, here),
             // 4: off screen first (another Space), then on screen.
-            (4, 41, false),
-            (4, 42, true),
+            listed(4, 41, false, here),
+            listed(4, 42, true, here),
             // 6: not one of the Dock's apps (a menu bar app, or this dock).
-            (6, 61, true),
+            listed(6, 61, true, here),
         ];
-        assert_eq!(shown_apps(&apps, &windows), vec![(1, 11), (4, 42)], "the front window on screen of each");
-        assert!(shown_apps(&apps, &[]).is_empty(), "no windows, nothing to show");
+        assert_eq!(
+            shown_apps(&apps, &windows, &screens, 0),
+            vec![(1, 11), (4, 42)],
+            "the front window on screen of each"
+        );
+        assert!(shown_apps(&apps, &[], &screens, 0).is_empty(), "no windows, nothing to show");
+    }
+
+    #[test]
+    fn each_screen_shows_only_its_own_windows() {
+        let screens = two_screens();
+        let (below, above) = (pos2(100.0, 100.0), pos2(200.0, -900.0));
+        let apps = [(1, false), (2, false), (3, false)];
+        let windows = [
+            // 1: its front window is above, another one below.
+            listed(1, 11, true, above),
+            listed(1, 12, true, below),
+            // 2: only below.
+            listed(2, 21, true, below),
+            // 3: only above.
+            listed(3, 31, true, above),
+        ];
+        assert_eq!(shown_apps(&apps, &windows, &screens, 0), vec![(1, 12), (2, 21)], "its window on this screen");
+        assert_eq!(shown_apps(&apps, &windows, &screens, 1), vec![(1, 11), (3, 31)]);
+    }
+
+    #[test]
+    fn a_window_across_two_screens_is_on_the_one_holding_most_of_it() {
+        let screens = two_screens();
+        // 600 high: 400 of it above the built-in screen's top, 200 below.
+        let mostly_above = Rect::from_min_size(pos2(100.0, -400.0), vec2(800.0, 600.0));
+        assert_eq!(screen_of(mostly_above, &screens), Some(1));
+        let mostly_below = Rect::from_min_size(pos2(100.0, -200.0), vec2(800.0, 600.0));
+        assert_eq!(screen_of(mostly_below, &screens), Some(0));
+        let nowhere = Rect::from_min_size(pos2(5000.0, 5000.0), vec2(800.0, 600.0));
+        assert_eq!(screen_of(nowhere, &screens), None, "parked off every screen");
+    }
+
+    #[test]
+    fn the_pointer_picks_its_screen_or_the_nearest() {
+        let screens = two_screens();
+        assert_eq!(screen_at(pos2(700.0, 500.0), &screens), Some(0));
+        assert_eq!(screen_at(pos2(700.0, -500.0), &screens), Some(1));
+        assert_eq!(screen_at(pos2(1600.0, 300.0), &screens), Some(0), "beside the built-in screen, off the bigger one");
+        assert_eq!(screen_at(pos2(0.0, 0.0), &[]), None);
     }
 
     #[test]

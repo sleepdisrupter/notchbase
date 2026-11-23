@@ -138,6 +138,8 @@ struct Overlay {
     gl: GlWindow,
     liquid: Liquid,
     shown: bool,
+    /// The screen it covers: the live dock's, or the switcher's while that's up on another one.
+    screen: CGRect,
 }
 
 struct Run {
@@ -191,6 +193,8 @@ pub struct App {
     busy: Busy,
     /// Cmd+Tab's panel, while it's up.
     switcher: Option<crate::switcher::Switcher>,
+    /// The screen it's on: the one the pointer was on when it opened.
+    switcher_screen: CGRect,
     /// Apps by when they were last in front, newest first.
     recent: Vec<i32>,
     /// Downloads coming in, for a bar on the browser fetching them.
@@ -291,6 +295,7 @@ pub fn run(dir: PathBuf) -> Result<(), String> {
         stress: None,
         busy: Busy::default(),
         switcher: None,
+        switcher_screen: CGRect::ZERO,
         recent: Vec::new(),
         downloads: crate::downloads::Watch::start(),
         pulse: crate::pulse::Pulse::start(),
@@ -369,6 +374,28 @@ impl App {
         global_rect(self.screen, self.primary_top)
     }
 
+    /// The overlay's screen in global top-left points.
+    fn overlay_rect(&self) -> Rect {
+        self.overlay.as_ref().map_or_else(|| self.screen_rect(), |o| global_rect(o.screen, self.primary_top))
+    }
+
+    /// Puts the overlay over `frame`'s screen, cleared first so nothing it showed flashes up in its new place.
+    fn move_overlay(&mut self, frame: CGRect) {
+        let Some(o) = &mut self.overlay else { return };
+        if o.screen == frame {
+            return;
+        }
+        if o.shown {
+            o.gl.frame(|_, _, _| {}, |_| {}, None, None);
+            o.gl.present();
+            o.shown = false;
+        }
+        mac::place_window(&o.gl.window, mac::EFFECT_LEVEL, frame);
+        o.gl.resized();
+        o.screen = frame;
+        self.needs_frame = true;
+    }
+
     /// The dock window's top left corner in global top-left points.
     fn dock_origin(&self) -> Pos2 {
         let r = self.screen_rect();
@@ -397,7 +424,7 @@ impl App {
         og.frame(|_, _, _| {}, |_| {}, None, None);
         og.present();
         mac::show_window(&og.window, true);
-        self.overlay = Some(Overlay { gl: og, liquid, shown: false });
+        self.overlay = Some(Overlay { gl: og, liquid, shown: false, screen: s });
         self.reposition(event_loop);
         let proxy = self.proxy.clone();
         crate::titlebar::on_minimize(move || {
@@ -582,10 +609,11 @@ impl App {
                 w.gl.resized();
                 self.dock.size = w.gl.size();
             }
-            if let Some(o) = &self.overlay {
-                mac::place_window(&o.gl.window, mac::EFFECT_LEVEL, frame);
-                o.gl.resized();
+            // The switcher is laid out for the screens as they were.
+            if let Some(s) = &mut self.switcher {
+                s.close();
             }
+            self.move_overlay(frame);
             self.needs_frame = true;
         }
         for seat in &mut self.seats {
@@ -666,10 +694,7 @@ impl App {
         self.hittest = false;
         self.resize_cursor = false;
         self.last_pointer = None;
-        if let Some(o) = &self.overlay {
-            mac::place_window(&o.gl.window, mac::EFFECT_LEVEL, self.screen);
-            o.gl.resized();
-        }
+        self.move_overlay(self.screen);
         self.wallpaper = None;
         self.needs_frame = true;
     }
@@ -999,12 +1024,19 @@ impl App {
             s.step(dt);
             if s.gone() {
                 self.switcher = None;
+                // Shown on another screen, the overlay goes back to the live dock's.
+                self.move_overlay(self.screen);
             }
         }
+        // The panel showing on another screen takes the overlay there. A quick Cmd+Tab never shows it, so it never
+        // moves the overlay either.
+        if self.switcher.as_ref().is_some_and(|s| s.visible() && !s.closing) {
+            self.move_overlay(self.switcher_screen);
+        }
 
-        // The overlay covers the live dock's screen: flights, launches and the cover are in global points, moved by
-        // its corner; the switcher is laid out in the overlay's own points.
-        let shift = -self.screen_rect().min.to_vec2();
+        // The overlay covers the live dock's screen (or the switcher's): flights, launches and the cover are in
+        // global points, moved by its corner; the switcher is laid out in the overlay's own points.
+        let shift = -self.overlay_rect().min.to_vec2();
         let flights = &mut self.flights;
         // Whether the overlay put a frame on screen this time (or there's no overlay to wait for).
         let mut presented = self.overlay.is_none();
@@ -1163,12 +1195,13 @@ impl App {
         }
     }
 
-    /// The apps the switcher shows: only ones with a window open on screen right now. Hidden apps, minimized
-    /// windows and windows on other Spaces are left out. Most recently used first.
-    fn switcher_entries(&mut self) -> Vec<crate::switcher::Entry> {
+    /// The apps the switcher shows on screen `on` of `screens`: only ones with a window open on that screen right
+    /// now. Hidden apps, minimized windows, windows on other Spaces and windows on other screens are left out. Most
+    /// recently used first.
+    fn switcher_entries(&mut self, screens: &[Rect], on: usize) -> Vec<crate::switcher::Entry> {
         let running = mac::running_apps();
         let apps: Vec<(i32, bool)> = running.iter().map(|a| (a.pid, a.hidden)).collect();
-        let shown = crate::switcher::shown_apps(&apps, &windows::switcher_windows());
+        let shown = crate::switcher::shown_apps(&apps, &windows::switcher_windows(), screens, on);
         let mut out = Vec::new();
         for (pid, window) in shown {
             let Some(app) = running.iter().find(|a| a.pid == pid) else { continue };
@@ -1198,13 +1231,24 @@ impl App {
                     match &mut self.switcher {
                         Some(s) if !s.closing => s.step_by(by),
                         _ => {
-                            let entries = self.switcher_entries();
+                            // It opens on the screen the pointer is on, with only that screen's windows.
+                            let screens = mac::screens();
+                            let rects: Vec<Rect> =
+                                screens.iter().map(|s| global_rect(s.frame, self.primary_top)).collect();
+                            let on = crate::switcher::screen_at(mac::pointer(), &rects);
+                            let Some((on, screen)) = on.map(|i| (i, screens[i].frame)) else {
+                                crate::switcher::finished();
+                                continue;
+                            };
+                            let entries = self.switcher_entries(&rects, on);
                             if entries.is_empty() {
                                 crate::switcher::finished();
                                 continue;
                             }
+                            self.switcher_screen = screen;
                             let front = mac::frontmost_pid();
-                            self.switcher = Some(Switcher::new(entries, key == Key::Next, front, self.screen_size()));
+                            let size = vec2(screen.size.width as f32, screen.size.height as f32);
+                            self.switcher = Some(Switcher::new(entries, key == Key::Next, front, size));
                         }
                     }
                 }
@@ -1231,8 +1275,9 @@ impl App {
                     }
                 }
                 Key::Click(at) => {
+                    let corner = global_rect(self.switcher_screen, self.primary_top).min.to_vec2();
                     if let Some(s) = self.switcher.as_mut().filter(|s| !s.closing) {
-                        match s.at(at) {
+                        match s.at(at - corner) {
                             Some(i) => {
                                 s.selected = i;
                                 self.switch_now();
@@ -1245,7 +1290,7 @@ impl App {
                 }
             }
         }
-        let corner = self.screen_rect().min.to_vec2();
+        let corner = global_rect(self.switcher_screen, self.primary_top).min.to_vec2();
         if let Some(s) = self.switcher.as_mut().filter(|s| s.visible() && !s.closing) {
             s.hover(mac::pointer() - corner);
         }
@@ -1267,10 +1312,20 @@ impl App {
             crate::switcher::finished();
             return;
         };
-        let pick = s.entries.get(s.selected).map(|e| e.pid);
+        let pick = s.entries.get(s.selected).map(|e| (e.pid, e.window));
         s.close();
-        if let Some(pid) = pick {
-            mac::activate(pid);
+        match pick {
+            // Its window on this screen comes to the front, not whichever one it last had in front elsewhere. Apps
+            // answer Accessibility slowly at times, so it's on a thread of its own.
+            Some((pid, Some(id))) => {
+                let raised =
+                    std::thread::Builder::new().name("switch".into()).spawn(move || windows::raise_id(pid, id));
+                if raised.is_err() {
+                    mac::activate(pid);
+                }
+            }
+            Some((pid, None)) => mac::activate(pid),
+            None => {}
         }
     }
 

@@ -171,7 +171,7 @@ pub(super) fn ui(ctx: &mut PageCtx<'_>, dock: &DockView, actions: &mut Vec<Actio
     #[cfg(not(windows))]
     {
         let rows = group(ctx, &mut top, "Cmd+Tab", GROUPS[4]);
-        let detail = "Only apps with a window on screen, with live pictures";
+        let detail = "Shows on the pointer's screen, only its windows";
         flag(ctx, (rows[0], "Dock's own switcher", detail), dock.replace_switcher, can)
             .then(|| change(DockChange::ReplaceSwitcher(!dock.replace_switcher)));
     }

@@ -451,6 +451,11 @@ pub fn raise(pid: i32, win: &Win) {
     crate::mac::activate(pid);
 }
 
+/// Brings window `id` of `pid` to the front, and its app with it.
+pub fn raise_id(pid: i32, id: u32) {
+    raise(pid, &win_with_id(id));
+}
+
 /// Presses one window's close button.
 pub fn close(pid: i32, win: &Win) {
     with_window(pid, win, |w| {
@@ -493,8 +498,6 @@ unsafe extern "C" {
     fn AXUIElementSetMessagingTimeout(element: AxElement, seconds: f32) -> i32;
 }
 
-/// Every app's real windows for the switcher, front to back: (pid, window id, on screen). Small helper windows and
-/// invisible ones are left out.
 /// A smaller copy of a picture, `height` pixels high at most, averaged so it stays smooth.
 pub fn smaller(image: &egui::ColorImage, height: usize) -> egui::ColorImage {
     let [w, h] = image.size;
@@ -637,7 +640,9 @@ fn covered(display: u32) -> bool {
     })
 }
 
-pub fn switcher_windows() -> Vec<(i32, u32, bool)> {
+/// Every app's real windows for the switcher, front to back, with where they are. Small helper windows and invisible
+/// ones are left out.
+pub fn switcher_windows() -> Vec<crate::switcher::Listed> {
     autoreleasepool(|_| {
         let raw = unsafe { CGWindowListCopyWindowInfo(ALL | EXCLUDE_DESKTOP, 0) };
         if raw.is_null() {
@@ -658,13 +663,16 @@ pub fn switcher_windows() -> Vec<(i32, u32, bool)> {
                 let bounds = entry.objectForKey(ns_string!("kCGWindowBounds"))?;
                 let bounds = dict(&bounds)?;
                 let f = |key: &NSString| bounds.objectForKey(key)?.downcast::<NSNumber>().ok().map(|n| n.doubleValue());
-                if f(ns_string!("Width"))? < 120.0 || f(ns_string!("Height"))? < 80.0 {
+                let (x, y, w, h) =
+                    (f(ns_string!("X"))?, f(ns_string!("Y"))?, f(ns_string!("Width"))?, f(ns_string!("Height"))?);
+                if w < 120.0 || h < 80.0 {
                     return None;
                 }
                 let pid = num(ns_string!("kCGWindowOwnerPID"))?.intValue();
                 let id = num(ns_string!("kCGWindowNumber"))?.intValue() as u32;
                 let on_screen = num(ns_string!("kCGWindowIsOnscreen")).is_some_and(|n| n.boolValue());
-                Some((pid, id, on_screen))
+                let frame = Rect::from_min_size(pos2(x as f32, y as f32), vec2(w as f32, h as f32));
+                Some(crate::switcher::Listed { pid, id, on_screen, frame })
             })
             .collect();
         unsafe { CFRelease(raw) };

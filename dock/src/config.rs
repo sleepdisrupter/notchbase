@@ -35,7 +35,8 @@ pub struct Config {
     pub minimize_effect: MinimizeEffect,
     /// Slide down out of sight over a full-screen app, as the Dock does; the bottom edge calls it back.
     pub hide_in_fullscreen: bool,
-    /// Cmd+Tab shows the dock's own switcher (only apps with a window on screen) instead of macOS's.
+    /// Cmd+Tab shows the dock's own switcher (on the pointer's screen, only apps with a window open there) instead
+    /// of macOS's.
     pub replace_switcher: bool,
     /// Resting on a running app's icon shows its open windows side by side (pictures need Screen Recording).
     pub window_previews: bool,
