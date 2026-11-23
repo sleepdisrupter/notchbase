@@ -401,7 +401,7 @@ mod displays {
         pub closed: Vec<usize>,
         /// Where each virtual display is, in the order they were made: a test moves one as the
         /// person would in the system's display settings.
-        pub hosted: Vec<Arc<Mutex<Rect>>>,
+        pub hosted: Vec<Arc<Mutex<HostedAt>>>,
         /// Each set of line-up guides put up, and of marks.
         pub guides: Vec<Vec<crate::align::Shown>>,
         pub marks: Vec<Vec<crate::align::Marked>>,
@@ -421,9 +421,17 @@ mod displays {
         }
     }
 
+    /// Where a pretend virtual display is, and where its host last said it was: a host notices
+    /// a move made in the system's display settings a while after the system lists it.
+    pub struct HostedAt {
+        pub rect: Rect,
+        said: Rect,
+        said_until: std::time::Instant,
+    }
+
     struct PretendHosted {
         fake: Fake,
-        rect: Arc<Mutex<Rect>>,
+        rect: Arc<Mutex<HostedAt>>,
         feed: Feed,
         /// How many times it was moved.
         placed: Arc<Mutex<usize>>,
@@ -431,16 +439,17 @@ mod displays {
 
     impl Hosted for PretendHosted {
         fn rect(&mut self) -> Option<Rect> {
-            Some(*self.rect.lock().unwrap())
+            let hosted = self.rect.lock().unwrap();
+            Some(if std::time::Instant::now() < hosted.said_until { hosted.said } else { hosted.rect })
         }
 
         fn place(&mut self, at: [i32; 2]) {
             *self.placed.lock().unwrap() += 1;
-            move_display(&self.fake, &self.rect, [f64::from(at[0]), f64::from(at[1])]);
+            move_to(&self.fake, &self.rect, [f64::from(at[0]), f64::from(at[1])], Duration::ZERO);
         }
 
         fn size(&self) -> [u32; 2] {
-            let rect = *self.rect.lock().unwrap();
+            let rect = self.rect.lock().unwrap().rect;
             [rect.w as u32, rect.h as u32]
         }
     }
@@ -448,19 +457,27 @@ mod displays {
     impl Drop for PretendHosted {
         fn drop(&mut self) {
             self.feed.stop();
-            let rect = *self.rect.lock().unwrap();
+            let rect = self.rect.lock().unwrap().rect;
             self.fake.state().screens.retain(|s| *s != rect);
         }
     }
 
-    /// Moves a virtual display's top left to `at`, among the computer's screens too.
-    pub fn move_display(fake: &Fake, rect: &Arc<Mutex<Rect>>, at: [f64; 2]) {
-        let mut rect = rect.lock().unwrap();
+    /// Moves a virtual display's top left to `at` as the person would in the system's display
+    /// settings: the system lists it there at once, its host notices a second and a half later.
+    pub fn move_display(fake: &Fake, rect: &Arc<Mutex<HostedAt>>, at: [f64; 2]) {
+        move_to(fake, rect, at, Duration::from_millis(1500));
+    }
+
+    fn move_to(fake: &Fake, hosted: &Arc<Mutex<HostedAt>>, at: [f64; 2], noticed_after: Duration) {
+        let mut hosted = hosted.lock().unwrap();
         let mut state = fake.state();
-        state.screens.retain(|s| *s != *rect);
-        rect.x = at[0];
-        rect.y = at[1];
-        state.screens.push(*rect);
+        let was = hosted.rect;
+        state.screens.retain(|s| *s != was);
+        hosted.rect.x = at[0];
+        hosted.rect.y = at[1];
+        hosted.said = if noticed_after.is_zero() { hosted.rect } else { was };
+        hosted.said_until = std::time::Instant::now() + noticed_after;
+        state.screens.push(hosted.rect);
     }
 
     struct PretendShowing(Arc<Mutex<Seen>>, usize);
@@ -551,7 +568,7 @@ mod displays {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             });
-            let shared = Arc::new(Mutex::new(rect));
+            let shared = Arc::new(Mutex::new(HostedAt { rect, said: rect, said_until: std::time::Instant::now() }));
             self.seen.lock().unwrap().hosted.push(shared.clone());
             Ok(Box::new(PretendHosted { fake: self.fake.clone(), rect: shared, feed, placed: Arc::default() }))
         }
@@ -977,16 +994,23 @@ fn an_extended_display_moved_in_display_settings_takes_its_screen_along_on_the_d
     // The person drags it 300 pixels right and 150 up in Display settings: 200 and 100 points
     // at 150%. The Mac was at (1220, -1080) on the desk.
     displays::move_display(&a.fake, &rect, [virtual_display.x + 300.0, virtual_display.y - 150.0]);
+    // Meanwhile the PC's own screens stay its own two: the moved display never counts among
+    // them, which would shift the PC on the desk and put the display back.
+    let own_only = std::cell::Cell::new(true);
     a.until("the Mac moved on the desk with its screen", |s| {
+        if s.me.as_ref().is_some_and(|m| m.displays != vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)]) {
+            own_only.set(false);
+        }
         s.moved.as_ref().is_some_and(|(_, placements)| {
             placements.iter().any(|p| p.id == b_id && (p.at[0] - 1420.0).abs() < 1.0 && (p.at[1] + 1180.0).abs() < 1.0)
         })
     });
     // And the display stays where the person put it.
     std::thread::sleep(Duration::from_millis(1500));
-    let now = *rect.lock().unwrap();
+    let now = rect.lock().unwrap().rect;
     assert_eq!([now.x, now.y], [virtual_display.x + 300.0, virtual_display.y - 150.0], "{}", log_of(&a));
     assert!(log_of(&a).contains("was moved in the display settings"), "{}", log_of(&a));
+    assert!(own_only.get(), "the moved display counted as one of the PC's own screens\n{}", log_of(&a));
 }
 
 /// Pushes from `at` by `push`, then keeps going: whether the cursor went over and stayed.

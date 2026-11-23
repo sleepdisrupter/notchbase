@@ -628,6 +628,9 @@ struct Core {
     /// When this computer's own screens last changed: the desk the editor sends may not show it
     /// yet, so where the virtual displays are isn't read as the person moving them till later.
     real_changed_at: u64,
+    /// This computer's own screens as last seen: a screen not among them may be a virtual
+    /// display its host hasn't placed yet.
+    known_real: Vec<Rect>,
     /// The desk as moved here, for the editor: see `Status::moved`.
     moved: Option<(u32, Vec<Placement>)>,
     /// The extended display this computer's cursor is over, whose lending computer is told
@@ -731,6 +734,7 @@ impl Core {
             extend_serial: 0,
             place_due: None,
             real_changed_at: 0,
+            known_real: Vec::new(),
             moved: None,
             pointer_over: None,
             leading: None,
@@ -981,9 +985,11 @@ impl Core {
             if screens != self.screens {
                 let before = self.real_screens();
                 self.screens = screens;
-                if self.real_screens() != before {
+                let after = self.real_screens();
+                if after != before {
                     self.real_changed_at = now;
                 }
+                self.known_real = after.0;
                 self.note(&format!("this computer's screens: {}", screens_words(&self.screens.0, self.screens.1)));
                 let (displays, ppu) = self.real_screens();
                 for session in self.sessions.values_mut() {

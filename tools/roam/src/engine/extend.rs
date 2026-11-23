@@ -104,6 +104,8 @@ pub(super) struct Extended {
     pub place: Option<Sender<[i32; 2]>>,
     /// Till when it may still be on its way to where it was last sent.
     pub placing_until: u64,
+    /// How big it was asked to be, in this computer's units, once its screen is lent.
+    pub size: Option<[u32; 2]>,
     /// The way to the other computer's stream, for the host's thread: a new one when the
     /// session forms again.
     pub route: Option<Sender<Route>>,
@@ -208,10 +210,27 @@ pub struct LendingView {
 
 impl Core {
     /// This computer's own displays, without the virtual ones it makes for other computers.
+    /// A virtual display just made, or just moved in the system's display settings, shows up
+    /// among the system's displays before its host says where it is: one that's new here and
+    /// as big as one of them is that one, so the computer's own screens never seem to change.
     pub(super) fn real_screens(&self) -> (Vec<Rect>, f64) {
         let (displays, ppu) = &self.screens;
         let virtuals: Vec<Rect> = self.extended.values().filter_map(|e| e.rect).collect();
-        let real: Vec<Rect> = displays.iter().copied().filter(|d| !virtuals.iter().any(|v| same(d, v))).collect();
+        let mut real: Vec<Rect> = displays.iter().copied().filter(|d| !virtuals.iter().any(|v| same(d, v))).collect();
+        for entry in self.extended.values() {
+            if entry.rect.is_some_and(|rect| displays.iter().any(|d| same(d, &rect))) {
+                continue;
+            }
+            let Some([w, h]) = entry.rect.map(|r| [r.w, r.h]).or(entry.size.map(|s| s.map(f64::from))) else {
+                continue;
+            };
+            let unknown = real.iter().position(|d| {
+                (d.w - w).abs() < 1.5 && (d.h - h).abs() < 1.5 && !self.known_real.iter().any(|k| same(k, d))
+            });
+            if let Some(index) = unknown {
+                real.remove(index);
+            }
+        }
         if real.is_empty() { (displays.clone(), *ppu) } else { (real, *ppu) }
     }
 
@@ -353,6 +372,7 @@ impl Core {
             feed: None,
             place: None,
             placing_until: 0,
+            size: None,
             route: None,
             asked_at: now,
             held_since: None,
@@ -498,6 +518,7 @@ impl Core {
         let words =
             if install { "Installing the display driver. Say Yes when Windows asks" } else { "Starting the display" };
         entry.state = State::Working(words.into());
+        entry.size = Some(units);
         entry.feed = Some(feed);
         entry.place = Some(place);
         entry.route = Some(reroute);
@@ -570,11 +591,12 @@ impl Core {
     /// An extended display asked for and never answered gives up; one waiting for its session to
     /// come back asks again once it has, and gives up when it doesn't.
     pub(super) fn check_extended(&mut self, now: u64) {
+        // A move the person made goes first: the desk follows it, and nothing then puts it back.
+        self.follow_moved(now);
         if self.place_due.is_some_and(|due| now >= due) {
             self.place_due = None;
             self.place_now();
         }
-        self.follow_moved(now);
         let (mut ask, mut gone) = (Vec::new(), Vec::new());
         for (&(id, display), entry) in &mut self.extended {
             if entry.state == State::Asking && now.saturating_sub(entry.asked_at) > ASK_FOR {
