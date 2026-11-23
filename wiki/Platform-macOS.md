@@ -28,6 +28,7 @@ Other system details:
 `winit` creates the window (undecorated, transparent, not resizable, no shadow, inactive, accepting the first mouse click), and `configure_notch_window` then adjusts the underlying `NSWindow`:
 
 - **Collection behaviour**: `CanJoinAllSpaces | Stationary | FullScreenAuxiliary | IgnoresCycle`, so the notch is on every Space, does not move with Mission Control, appears over full-screen apps, and is skipped by Cmd+` window cycling.
+- **Mission Control**: while Mission Control or App Exposé shows, the notch stays closed and lets the pointer and clicks through to it (`src/system/mission_control`). It's seen by WindowManager's full-screen shield window (layer 19) over each display, read about seven times a second with only new windows looked up; owner, layer and size need no Screen Recording.
 - **Level**: three levels above the main menu level, so it sits above the menu bar, where the physical notch is.
 - Clear background, not opaque, no shadow, never hidden on deactivate, cannot be hidden or moved, and no open/close animation.
 - **Color space**: sRGB, so colors (and picked colors) match other apps.

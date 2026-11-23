@@ -1,5 +1,5 @@
-//! The system watchers (battery, lock screen, sensors, downloads, Focus, menus) and keeping awake, each
-//! switched on only while something needs it.
+//! The system watchers (battery, lock screen, Mission Control, sensors, downloads, Focus, menus) and keeping awake,
+//! each switched on only while something needs it.
 
 mod bluetooth;
 mod calendar;
@@ -13,6 +13,7 @@ use crate::system::awake::Awake;
 use crate::system::downloads::Downloads;
 use crate::system::focus::{FocusWatch, Reading};
 use crate::system::menus::{MenuWatch, edge_in};
+use crate::system::mission_control::MissionControl;
 use crate::system::permissions::{self, Access};
 use crate::system::power::Battery;
 use crate::system::sensors::SensorWatch;
@@ -38,6 +39,8 @@ pub(super) struct System {
     battery: Option<Battery>,
     lock: Option<ScreenLock>,
     locked: bool,
+    mission_control: Option<MissionControl>,
+    in_mission_control: bool,
     sensors: Option<SensorWatch>,
     downloads: Option<Downloads>,
     focus: Option<FocusWatch>,
@@ -58,6 +61,7 @@ impl App {
         }
         self.sync_power();
         self.sync_screen_lock();
+        self.sync_mission_control();
         self.sync_sensors();
         self.sync_downloads();
         self.sync_focus();
@@ -206,6 +210,18 @@ impl App {
             }
             self.update_notch(|notch| notch.set_locked(locked));
         }
+    }
+
+    fn sync_mission_control(&mut self) {
+        follow(&mut self.system.mission_control, cfg!(target_os = "macos"), MissionControl::start);
+        if let Some(showing) = self.system.mission_control.as_ref().and_then(MissionControl::take) {
+            self.system.in_mission_control = showing;
+            self.update_notch(|notch| notch.set_mission_control(showing));
+        }
+    }
+
+    pub(super) fn in_mission_control(&self) -> bool {
+        self.system.in_mission_control
     }
 
     pub(super) fn screen_locked(&self) -> bool {

@@ -144,6 +144,8 @@ pub struct Notch {
     split_shown: bool,
     menu_edge: Option<f32>,
     locked: bool,
+    /// Mission Control or App Exposé is showing: the notch stays closed and lets the pointer through to it.
+    in_mission_control: bool,
     unlocked_at: Option<Instant>,
     lock_leaving: Option<live::lock::Leaving>,
     taking_over: bool,
@@ -250,6 +252,7 @@ impl Notch {
             split_shown: false,
             menu_edge: None,
             locked: false,
+            in_mission_control: false,
             unlocked_at: None,
             lock_leaving: None,
             taking_over: false,
@@ -275,7 +278,7 @@ impl Notch {
         if self.preview.is_some() {
             return false;
         }
-        let cursor = cursor.filter(|_| !self.locked);
+        let cursor = cursor.filter(|_| !self.locked && !self.in_mission_control);
         self.hold_hovered_notice(now, cursor);
         let expired = self.expire_activity(now) | self.expire_music(now) | self.expire_strip(now) | self.lock_tick(now);
         let calm = cursor.filter(|_| !self.shies());
@@ -289,7 +292,7 @@ impl Notch {
     }
 
     pub fn wants_input(&self, cursor: Pos2) -> bool {
-        if self.locked {
+        if self.locked || self.in_mission_control {
             return false;
         }
         (self.mode != Mode::Idle && self.input_zone().contains(cursor))
@@ -340,6 +343,20 @@ impl Notch {
                 .into_iter()
                 .chain([&self.panel_fade, &self.activity_fade, &self.attract])
                 .all(Spring::is_settled)
+    }
+
+    pub fn set_mission_control(&mut self, showing: bool) {
+        if self.preview.is_some() || self.in_mission_control == showing {
+            return;
+        }
+        self.in_mission_control = showing;
+        self.hover_armed = false;
+        if showing {
+            self.pinned = false;
+            if matches!(self.mode, Mode::Expanded | Mode::Peek) {
+                self.collapse();
+            }
+        }
     }
 
     pub fn collapse(&mut self) {
@@ -415,7 +432,7 @@ impl Notch {
     }
 
     pub fn set_pinned(&mut self, pinned: bool) {
-        self.pinned = pinned && !self.locked;
+        self.pinned = pinned && !self.locked && !self.in_mission_control;
         self.leave_until = None;
         if self.pinned && self.mode != Mode::Expanded && self.preview.is_none() {
             self.set_mode(Mode::Expanded, Motion::Open);

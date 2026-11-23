@@ -385,6 +385,7 @@ impl App {
     fn shown(&self) -> Shown {
         Shown {
             locked: self.screen_locked(),
+            in_mission_control: self.in_mission_control(),
             activities: self.activities(),
             now_playing: self.panel.now_playing.clone(),
         }
@@ -393,6 +394,7 @@ impl App {
 
 struct Shown {
     locked: bool,
+    in_mission_control: bool,
     activities: Vec<Activity>,
     now_playing: Option<NowPlaying>,
 }
@@ -400,6 +402,7 @@ struct Shown {
 impl Shown {
     fn apply(&self, notch: &mut Notch) {
         notch.set_locked(self.locked);
+        notch.set_mission_control(self.in_mission_control);
         notch.set_activities(self.activities.clone());
         notch.set_now_playing(self.now_playing.as_ref());
     }

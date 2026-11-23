@@ -10,6 +10,7 @@ pub(crate) mod dock;
 pub(crate) mod downloads;
 pub(crate) mod focus;
 pub(crate) mod menus;
+pub(crate) mod mission_control;
 pub(crate) mod permissions;
 pub(crate) mod power;
 pub(crate) mod sensors;

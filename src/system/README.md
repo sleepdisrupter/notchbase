@@ -11,6 +11,7 @@ Small watchers and switches for the operating system, one folder each:
 | `downloads` | Downloads in progress in the Downloads folder |
 | `focus` | Focus and Do Not Disturb |
 | `menus` | Where the front app's menus end, so the notch can step aside |
+| `mission_control` | Whether Mission Control or App Exposé is showing, on a Mac |
 | `permissions` | What each feature needs, whether it was granted, and asking for it |
 | `power` | The battery level and charger |
 | `sensors` | The camera and microphone in use, and muting the microphone |

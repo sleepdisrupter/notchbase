@@ -191,6 +191,38 @@ mod tests {
     }
 
     #[test]
+    fn mission_control_keeps_it_closed() {
+        let mut n = island();
+        n.set_mission_control(true);
+        let t0 = Instant::now();
+        for step in 0..20u64 {
+            n.tick(t0 + ms(step * 100), Some(OVER));
+        }
+        assert_eq!(n.mode, Mode::Idle, "resting on it over Mission Control never peeks or opens");
+        assert!(!n.wants_input(OVER), "and clicks go through to Mission Control");
+
+        n.set_mission_control(false);
+        let t1 = t0 + ms(2_000);
+        n.tick(t1, Some(OVER));
+        n.tick(t1 + REST, Some(OVER));
+        assert_eq!(n.mode, Mode::Idle, "back from it, the pointer still on the notch has to leave first");
+        n.tick(t1 + REST + ms(10), Some(AWAY));
+        settle(&mut n);
+        peek(&mut n, t1 + ms(1_000), OVER);
+        assert_eq!(n.mode, Mode::Peek);
+    }
+
+    #[test]
+    fn mission_control_closes_an_open_panel() {
+        let mut n = island();
+        let t0 = peek(&mut n, Instant::now(), OVER) + SURGE;
+        n.tick(t0 + ms(300), Some(OVER));
+        assert_eq!(n.mode, Mode::Expanded);
+        n.set_mission_control(true);
+        assert_eq!(n.mode, Mode::Idle);
+    }
+
+    #[test]
     fn restless_pointer_never_opens() {
         let mut n = island();
         let t0 = peek(&mut n, Instant::now(), OVER);
