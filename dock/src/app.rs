@@ -275,6 +275,8 @@ pub struct App {
     main_screen: CGRect,
     /// Every screen in global top-left points, the main one first.
     screens: Vec<Rect>,
+    /// Their display numbers, in the same order.
+    screen_ids: Vec<u32>,
     /// The docks on the other screens, with "All displays".
     seats: Vec<Seat>,
     /// What `dock-areas.json` last said: each screen with the dock up and how much of its bottom the dock keeps.
@@ -363,6 +365,7 @@ pub fn run(dir: PathBuf) -> Result<(), String> {
         primary_top: 900.0,
         main_screen: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1440.0, 900.0)),
         screens: Vec::new(),
+        screen_ids: Vec::new(),
         seats: Vec::new(),
         reposition_soon: false,
         areas_written: None,
@@ -635,6 +638,7 @@ impl App {
         self.primary_top = main.frame.origin.y + main.frame.size.height;
         self.main_screen = main.frame;
         self.screens = screens.iter().map(|s| global_rect(s.frame, self.primary_top)).collect();
+        self.screen_ids = screens.iter().map(|s| s.id).collect();
         let wanted: Vec<mac::Screen> = match self.dock.config.displays {
             Displays::All => screens.clone(),
             Displays::Primary => vec![*main],
@@ -690,7 +694,14 @@ impl App {
                 self.needs_frame = true;
             }
         }
-        let displays = std::iter::once(self.display).chain(self.seats.iter().map(|s| s.display)).collect();
+        // Every screen, docked or not: a window never parks or waits on one showing a full-screen app.
+        let mut displays: Vec<u32> =
+            std::iter::once(self.display).chain(self.seats.iter().map(|s| s.display)).collect();
+        for id in &self.screen_ids {
+            if !displays.contains(id) {
+                displays.push(*id);
+            }
+        }
         if let Ok(mut watched) = self.watched_displays.lock() {
             *watched = displays;
         }
@@ -1686,25 +1697,49 @@ impl App {
         vec2(self.screen.size.width as f32, self.screen.size.height as f32)
     }
 
-    /// Where a window of `size` waits while it's down, and the screen it waits under (see `park_spot_on`).
-    fn park(&self, size: egui::Vec2) -> (Pos2, Rect) {
-        let main = global_rect(self.main_screen, self.primary_top);
-        let screens = if self.screens.is_empty() { vec![main] } else { self.screens.clone() };
+    /// The screens, and which of them show a full-screen app right now. A window moved onto one of those (to wait
+    /// under it, or in its corner) takes that screen out of the full-screen app's Space to the window's desktop,
+    /// swiping the app out of view, so windows keep off them.
+    fn screens_now(&self) -> (Vec<Rect>, Vec<bool>) {
+        if self.screens.is_empty() {
+            return (vec![self.screen_rect()], vec![false]);
+        }
+        let full = self.fullscreen.lock().map(|f| f.clone()).unwrap_or_default();
+        let busy = self.screen_ids.iter().map(|id| full.contains(id)).collect();
+        (self.screens.clone(), busy)
+    }
+
+    /// Where a window of `size` (on the screen at `home`, global points) waits while it's down, and the screen it
+    /// waits under (see `park_spot_on`).
+    fn park(&self, size: egui::Vec2, home: Rect) -> (Pos2, Rect) {
+        let (screens, mut full) = self.screens_now();
+        let home = screens.iter().position(|s| overlap(*s, home) >= s.area() * 0.5);
+        // The window's own screen shows its desktop, whatever the watch last said.
+        if let Some(h) = home {
+            full[h] = false;
+        }
         let trash = pos2(
             f32::from_bits(SYSTEM_TRASH_X.load(Ordering::Relaxed)),
             f32::from_bits(SYSTEM_TRASH_Y.load(Ordering::Relaxed)),
         );
         let trash = (trash != Pos2::ZERO).then_some(trash);
-        match park_spot_on(&screens, trash, size) {
+        let fallback = screens[home.unwrap_or(0)];
+        match park_spot_on(&screens, trash, size, home, &full) {
             Some((spot, i)) => (spot, screens[i]),
-            None => (pos2((main.center().x - size.x * 0.5).round(), main.bottom() - 1.0), main),
+            None => (pos2((fallback.center().x - size.x * 0.5).round(), fallback.bottom() - 1.0), fallback),
         }
     }
 
     /// Where a window coming back up waits for its picture to land: a corner with only a point of it on screen.
     fn waiting_corner(&self, size: egui::Vec2) -> Pos2 {
-        let screens = if self.screens.is_empty() { vec![self.screen_rect()] } else { self.screens.clone() };
-        waiting_corner_on(&screens, self.screen_rect(), size)
+        let (screens, mut full) = self.screens_now();
+        let live = self.screen_rect();
+        for (i, s) in screens.iter().enumerate() {
+            if overlap(*s, live) >= s.area() * 0.5 {
+                full[i] = false;
+            }
+        }
+        waiting_corner_on(&screens, &full, live, size)
     }
 
     /// A window handed over to minimize: its picture covers it and flies down into its new tile; once the overlay
@@ -1760,7 +1795,7 @@ impl App {
         self.flights.push(flight);
         self.parked.insert(id, (pid, frame, Instant::now()));
         // The screen's bottom without the window, taken now so it's in the very first frame with the picture.
-        let (spot, park) = self.park(frame.size());
+        let (spot, park) = self.park(frame.size(), self.screen_rect());
         let until = self.cover_bottom(id, park);
         trace.step(|| format!("cover {} parked at {spot:?}", self.cover.is_some()));
         let refused = Arc::clone(&self.refused);
@@ -1965,7 +2000,7 @@ impl App {
         // app won't move a minimized window, bring it back plainly.
         if ours.is_none() {
             let size = windows::frame_of(pid, id).map_or(window.size(), |f| f.size());
-            let (spot, _) = self.park(size);
+            let (spot, _) = self.park(size, self.screen_rect());
             windows::move_to(pid, id, spot);
             // macOS keeps a sliver of a window on screen, so it may end up a little higher than asked.
             let moved =
@@ -1994,7 +2029,7 @@ impl App {
         flight.landed = Some(Arc::clone(&landed));
         flight.trace = Some(trace.clone());
         self.flights.push(flight);
-        let (spot, park) = self.park(window.size());
+        let (spot, park) = self.park(window.size(), self.screen_rect());
         // While it waits for the picture, it sits in a corner, where only a point of it shows.
         let corner = self.waiting_corner(window.size());
         let until = self.cover_bottom(id, park);
@@ -2290,12 +2325,24 @@ fn dock_screen(screens: &[Rect], trash: Pos2) -> Option<usize> {
 /// (the main one, while the Dock had moved to another) showed that animation flying across the screens.
 ///
 /// The window hangs down from there, so it never waits where it would hang over another screen below or beside:
-/// it slides along the bottom to a free stretch, or waits under the main screen (then any other) when there's
-/// none. None when no screen has room, which only an odd layout gives.
-fn park_spot_on(screens: &[Rect], trash: Option<Pos2>, size: egui::Vec2) -> Option<(Pos2, usize)> {
+/// it slides along the bottom to a free stretch, or waits under its own screen `home` (then the main one, then any
+/// other) when there's none. It never waits under a screen marked in `full` (one showing a full-screen app): moved
+/// there, the window would take that screen out of the app's Space. None when no screen has room, which only an odd
+/// layout gives.
+fn park_spot_on(
+    screens: &[Rect],
+    trash: Option<Pos2>,
+    size: egui::Vec2,
+    home: Option<usize>,
+    full: &[bool],
+) -> Option<(Pos2, usize)> {
     let dock = trash.and_then(|t| dock_screen(screens, t));
-    let mut order: Vec<usize> = dock.into_iter().collect();
-    order.extend((0..screens.len()).filter(|i| Some(*i) != dock));
+    let mut order: Vec<usize> = Vec::new();
+    for i in dock.into_iter().chain(home).chain(0..screens.len()) {
+        if !order.contains(&i) && !full.get(i).copied().unwrap_or(false) {
+            order.push(i);
+        }
+    }
     for i in order {
         let s = screens[i];
         let ours = s.center().x;
@@ -2325,14 +2372,21 @@ fn park_spot_on(screens: &[Rect], trash: Option<Pos2>, size: egui::Vec2) -> Opti
 
 /// Where a window of `size` coming back up waits: in the bottom-right corner of `prefer` (the live dock's screen),
 /// with only a point of it on screen. Never where the rest of it would hang over another screen (one beside or
-/// below, more than a hairline along an edge they share); another screen's corner then, if one is free.
-fn waiting_corner_on(screens: &[Rect], prefer: Rect, size: egui::Vec2) -> Pos2 {
+/// below, more than a hairline along an edge they share), and never on or over a screen marked in `full` (one
+/// showing a full-screen app); another screen's corner then, if one is free.
+fn waiting_corner_on(screens: &[Rect], full: &[bool], prefer: Rect, size: egui::Vec2) -> Pos2 {
     let corner = |s: Rect| s.max - vec2(1.0, 1.0);
     let hairline = size.x.max(size.y) + 1.0;
+    let busy = |i: usize| full.get(i).copied().unwrap_or(false);
+    let is_full = |o: Rect| screens.iter().enumerate().any(|(i, f)| busy(i) && overlap(*f, o) >= f.area() * 0.5);
     let free = |s: Rect| {
         let r = Rect::from_min_size(corner(s), size);
         let same = |o: Rect| overlap(o, s) >= s.area() * 0.5;
-        screens.iter().all(|o| same(*o) || overlap(*o, r) <= hairline)
+        !is_full(s)
+            && screens
+                .iter()
+                .enumerate()
+                .all(|(i, o)| same(*o) || overlap(*o, r) <= if busy(i) { 0.0 } else { hairline })
     };
     std::iter::once(prefer).chain(screens.iter().copied()).find(|s| free(*s)).map_or(corner(prefer), corner)
 }
@@ -2637,14 +2691,14 @@ mod tests {
     fn windows_park_under_the_main_screen_while_the_system_dock_is_there() {
         let screens = laptop_and_monitor_above();
         let size = vec2(600.0, 400.0);
-        let (spot, on) = park_spot_on(&screens, Some(pos2(1200.0, 940.0)), size).unwrap();
+        let (spot, on) = park_spot_on(&screens, Some(pos2(1200.0, 940.0)), size, None, &[]).unwrap();
         assert_eq!(on, 0);
         parked(&screens, spot, size, 0);
         assert!(spot.x + 300.0 > 735.0, "a little toward the Trash");
         // The Trash not known yet: the main screen's middle.
-        assert_eq!(park_spot_on(&screens, None, size), Some((pos2(435.0, 955.0), 0)));
+        assert_eq!(park_spot_on(&screens, None, size, None, &[]), Some((pos2(435.0, 955.0), 0)));
         // The Trash somewhere no screen's bottom is: the main screen too.
-        assert_eq!(park_spot_on(&screens, Some(pos2(-5000.0, 30.0)), size).map(|p| p.1), Some(0));
+        assert_eq!(park_spot_on(&screens, Some(pos2(-5000.0, 30.0)), size, None, &[]).map(|p| p.1), Some(0));
     }
 
     #[test]
@@ -2652,16 +2706,16 @@ mod tests {
         let screens = three_in_a_row();
         let size = vec2(800.0, 600.0);
         // macOS moved its Dock to the monitor on the left, so its animation plays there: so does the window wait.
-        let (spot, on) = park_spot_on(&screens, Some(pos2(-400.0, 975.0)), size).unwrap();
+        let (spot, on) = park_spot_on(&screens, Some(pos2(-400.0, 975.0)), size, None, &[]).unwrap();
         assert_eq!(on, 1);
         parked(&screens, spot, size, 1);
         // And on the right, taller one.
-        let (spot, on) = park_spot_on(&screens, Some(pos2(3500.0, 1230.0)), size).unwrap();
+        let (spot, on) = park_spot_on(&screens, Some(pos2(3500.0, 1230.0)), size, None, &[]).unwrap();
         assert_eq!(on, 2);
         parked(&screens, spot, size, 2);
         // Back on the main screen. The right-hand screen reaches lower than its bottom, so the window never slides
         // over toward there.
-        let (spot, on) = park_spot_on(&screens, Some(pos2(1400.0, 970.0)), vec2(1400.0, 900.0)).unwrap();
+        let (spot, on) = park_spot_on(&screens, Some(pos2(1400.0, 970.0)), vec2(1400.0, 900.0), None, &[]).unwrap();
         assert_eq!(on, 0);
         parked(&screens, spot, vec2(1400.0, 900.0), 0);
     }
@@ -2672,17 +2726,17 @@ mod tests {
         // waits under the stretch of it that has nothing below.
         let screens = laptop_and_monitor_above();
         let size = vec2(600.0, 400.0);
-        let (spot, on) = park_spot_on(&screens, Some(pos2(900.0, -12.0)), size).unwrap();
+        let (spot, on) = park_spot_on(&screens, Some(pos2(900.0, -12.0)), size, None, &[]).unwrap();
         assert_eq!(on, 1);
         parked(&screens, spot, size, 1);
         // A wide one too, reaching out past the monitor's edge where there's no screen at all.
         let wide = vec2(1600.0, 900.0);
-        let (spot, on) = park_spot_on(&screens, Some(pos2(900.0, -12.0)), wide).unwrap();
+        let (spot, on) = park_spot_on(&screens, Some(pos2(900.0, -12.0)), wide, None, &[]).unwrap();
         assert_eq!(on, 1);
         parked(&screens, spot, wide, 1);
         // A monitor squarely on top of the laptop has no free stretch at all: the window waits under the laptop.
         let stacked = [screens[0], Rect::from_min_size(pos2(0.0, -900.0), vec2(1470.0, 900.0))];
-        let (spot, on) = park_spot_on(&stacked, Some(pos2(900.0, -12.0)), size).unwrap();
+        let (spot, on) = park_spot_on(&stacked, Some(pos2(900.0, -12.0)), size, None, &[]).unwrap();
         assert_eq!(on, 0);
         parked(&stacked, spot, size, 0);
     }
@@ -2721,20 +2775,51 @@ mod tests {
             assert!(shown <= size.x + 2.0, "only a point shows at {corner:?}, not {shown}");
         };
         // The left screen's corner is free.
-        let corner = waiting_corner_on(&screens, screens[1], size);
+        let corner = waiting_corner_on(&screens, &[], screens[1], size);
         assert_eq!(corner, pos2(-1.0, 981.0));
         point_only(corner);
         // The main screen's would hang over the taller one on its right, so another free one is used.
-        let corner = waiting_corner_on(&screens, screens[0], size);
+        let corner = waiting_corner_on(&screens, &[], screens[0], size);
         assert_ne!(corner, pos2(1511.0, 981.0));
         point_only(corner);
         // John's: the monitor's corner has nothing past it.
         let two = laptop_and_monitor_above();
-        assert_eq!(waiting_corner_on(&two, two[1], size), pos2(1859.0, -1.0));
-        assert_eq!(waiting_corner_on(&two, two[0], size), pos2(1469.0, 955.0));
+        assert_eq!(waiting_corner_on(&two, &[], two[1], size), pos2(1859.0, -1.0));
+        assert_eq!(waiting_corner_on(&two, &[], two[0], size), pos2(1469.0, 955.0));
         // One screen alone: its own corner.
         let one = [screens[0]];
-        assert_eq!(waiting_corner_on(&one, one[0], size), pos2(1511.0, 981.0));
+        assert_eq!(waiting_corner_on(&one, &[], one[0], size), pos2(1511.0, 981.0));
+    }
+
+    #[test]
+    fn windows_never_park_under_a_screen_showing_a_full_screen_app() {
+        // A full-screen app on the laptop, where the system Dock is, and a window going down on the monitor: moved
+        // onto the laptop, it would swipe the app out of view. It waits under its own screen instead.
+        let screens = three_in_a_row();
+        let size = vec2(800.0, 600.0);
+        let full = [true, false, false];
+        let (spot, on) = park_spot_on(&screens, Some(pos2(1200.0, 970.0)), size, Some(1), &full).unwrap();
+        assert_eq!(on, 1, "under the window's own screen");
+        parked(&screens, spot, size, 1);
+        // Without the full-screen app it goes where the Dock is.
+        let (_, on) = park_spot_on(&screens, Some(pos2(1200.0, 970.0)), size, Some(1), &[false; 3]).unwrap();
+        assert_eq!(on, 0);
+        // The Trash not known: its own screen still comes before the main one.
+        let (_, on) = park_spot_on(&screens, None, size, Some(2), &[false; 3]).unwrap();
+        assert_eq!(on, 2);
+    }
+
+    #[test]
+    fn a_window_coming_up_never_waits_on_a_screen_showing_a_full_screen_app() {
+        let screens = three_in_a_row();
+        let size = vec2(800.0, 600.0);
+        // From the main screen its corner hangs over the right-hand one, and the left one shows a full-screen app,
+        // so it waits in the right-hand screen's corner.
+        let corner = waiting_corner_on(&screens, &[false, true, false], screens[0], size);
+        assert_eq!(corner, pos2(4071.0, 1239.0));
+        // Its own corner is fine as long as nothing full-screen is past it.
+        let two = laptop_and_monitor_above();
+        assert_eq!(waiting_corner_on(&two, &[true, false], two[1], size), pos2(1859.0, -1.0));
     }
 
     #[test]
