@@ -163,6 +163,7 @@ impl Notice {
                 shake: false,
                 size: NoticeSize::Medium,
                 controls: None,
+                alarm: false,
             },
         }
     }
@@ -197,6 +198,14 @@ impl Notice {
     pub fn sticky(mut self) -> Self {
         self.node.duration_ms = 0;
         self
+    }
+
+    /// An alarm: a sticky notice that keeps shaking the notch, with notchbase's alarm sound, until the user
+    /// clicks it or the tool sends `Command::dismiss_notice()` (give it a Stop button with
+    /// `Command::notice_with_controls`). The sound stops by itself after a few minutes; the shaking doesn't.
+    pub fn alarm(mut self) -> Self {
+        self.node.alarm = true;
+        self.shake().sticky()
     }
 
     pub fn size(mut self, size: NoticeSize) -> Self {

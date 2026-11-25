@@ -203,7 +203,7 @@ fn finished_focus_starts_break() {
         panic!("{requests:?}")
     };
     assert_eq!((key.as_str(), value), (SESSIONS, &Value::from(1u64)));
-    assert!(notice.pop);
+    assert!(notice.alarm && notice.sticky() && notice.controls.is_some(), "it rings until it's stopped");
     assert_eq!(notice.leading, Node::Badge { icon: Icon::Checkmark, size: 18.0, tone: Tone::Green });
     assert!(
         matches!(&notice.trailing, Node::Text(TextNode { text, style: TextStyle::Callout, .. }) if text == "Focus done")
@@ -221,7 +221,7 @@ fn finished_break_goes_idle() {
     tick(&mut runtime, START + 25 * MINUTE);
     let requests = tick(&mut runtime, START + 30 * MINUTE);
     let [Request::Notice { notice }] = &requests[..] else { panic!("{requests:?}") };
-    assert!(notice.pop);
+    assert!(notice.alarm);
     assert_eq!(notice.leading, Node::Badge { icon: Icon::Bell, size: 18.0, tone: Tone::Orange });
     assert_eq!(texts(&notice.trailing), ["Break over"]);
     assert_eq!(countdown(&runtime), Countdown::idle(25 * MINUTE));
@@ -237,8 +237,9 @@ fn no_auto_break_waits() {
     assert!(matches!(&requests[..], [Request::SaveSetting { .. }, Request::Notice { .. }]));
     assert_eq!(countdown(&runtime), Countdown::idle(25 * MINUTE));
     assert!(runtime.views().live.is_none());
-    runtime.send(Msg::Toggle);
+    assert_eq!(runtime.send(Msg::Toggle).requests, [Request::DismissNotice], "the next session stops the alarm");
     assert_eq!(countdown(&runtime).phase(), Phase::Focus);
+    assert!(runtime.send(Msg::Toggle).requests.is_empty());
 }
 
 #[test]
@@ -359,7 +360,7 @@ fn reset_goes_idle_from_break() {
     tick(&mut runtime, START + 25 * MINUTE);
     let Node::Button { on_press, .. } = button_labeled(&page_of(&mut runtime), "Reset") else { unreachable!() };
     let effects = press(&mut runtime, Surface::Page, on_press);
-    assert!(effects.requests.is_empty());
+    assert_eq!(effects.requests, [Request::DismissNotice], "and stops the alarm still ringing");
     assert!(effects.wants.every_ms.is_empty());
     assert_eq!(countdown(&runtime), Countdown::idle(25 * MINUTE));
     assert_eq!(sessions(&runtime), 1);

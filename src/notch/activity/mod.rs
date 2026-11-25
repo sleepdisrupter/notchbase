@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use egui::text::LayoutJob;
 use egui::{Align, Galley, Painter, Pos2, Rect, Shape, Vec2, pos2, vec2};
 
-use crate::bridge::Action;
+use crate::bridge::{Action, ToolSlot};
 use crate::config;
 use crate::platform::Style;
 use crate::ui::canvas::Canvas;
@@ -42,6 +42,8 @@ const SWAPPED_FROM: f32 = 0.2;
 const LEAVE: SpringConfig = SpringConfig::new(0.16, 1.0);
 const NOD: f32 = -4.0;
 const SHOWN: f32 = 0.001;
+/// How often a ringing alarm shakes the notch again.
+pub(super) const RING_EVERY: Duration = Duration::from_millis(1300);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum ActivityKind {
@@ -70,6 +72,10 @@ impl ActivityKind {
         }
     }
 
+    fn rings(&self) -> bool {
+        matches!(self, Self::Tool(notice) if notice.node.alarm)
+    }
+
     fn pops(&self) -> bool {
         match self {
             Self::Tool(notice) => notice.node.pop,
@@ -94,6 +100,10 @@ pub(super) struct Activity {
     pub(super) pointer: Option<Pos2>,
     message_size: Option<Vec2>,
     pop_pending: bool,
+    /// When a ringing alarm shakes the notch next.
+    next_ring: Option<Instant>,
+    /// An alarm the user clicked away on this notch, for the app to end on every other one too.
+    pub(super) hushed: Option<ToolSlot>,
 }
 
 impl Default for Activity {
@@ -107,6 +117,8 @@ impl Default for Activity {
             pointer: None,
             message_size: None,
             pop_pending: false,
+            next_ring: None,
+            hushed: None,
         }
     }
 }
@@ -162,7 +174,7 @@ impl Lane {
 
 impl Notch {
     pub(super) fn start_activity(&mut self, kind: ActivityKind, now: Instant) {
-        if self.preview.is_some() {
+        if self.preview.is_some() || self.alarm_holds_against(&kind) {
             return;
         }
         let shown = self.activity_shown();
@@ -188,9 +200,10 @@ impl Notch {
             self.activity.kind = Some(kind);
         }
         if shake && matches!(self.mode, Mode::Idle | Mode::Activity | Mode::Peek) {
-            self.jolt.velocity = if self.jolt.velocity > 0.0 { -JOLT_KICK } else { JOLT_KICK };
-            self.jolt.animate_to(0.0, JOLT);
+            self.kick();
         }
+        let rings = self.activity.kind.as_ref().is_some_and(ActivityKind::rings);
+        self.activity.next_ring = rings.then(|| now + RING_EVERY);
         if pressable {
             self.wait_for_the_pointer_to_come_back();
         }
@@ -201,6 +214,53 @@ impl Notch {
             Mode::Peek => self.retarget(Motion::Peek),
             Mode::Expanded | Mode::Drop | Mode::Ask => {}
         }
+    }
+
+    fn kick(&mut self) {
+        self.jolt.velocity = if self.jolt.velocity > 0.0 { -JOLT_KICK } else { JOLT_KICK };
+        self.jolt.animate_to(0.0, JOLT);
+    }
+
+    /// A ringing alarm isn't pushed aside by a lesser activity (a volume change, another tool's notice): only its own
+    /// tool or another alarm takes its place.
+    fn alarm_holds_against(&self, next: &ActivityKind) -> bool {
+        let Some(ActivityKind::Tool(ringing)) = self.activity.kind.as_ref().filter(|_| self.rings()) else {
+            return false;
+        };
+        !next.rings() && !matches!(next, ActivityKind::Tool(notice) if notice.slot == ringing.slot)
+    }
+
+    /// Whether an alarm is up, seen or not: its sound plays even while the panel is open over it.
+    pub fn rings(&self) -> bool {
+        self.activity.is_live() && self.activity.kind.as_ref().is_some_and(ActivityKind::rings)
+    }
+
+    pub(super) fn ring_wakeup(&self) -> Option<Instant> {
+        self.activity.next_ring.filter(|_| self.rings())
+    }
+
+    /// The tool whose alarm the user clicked away here since the last call.
+    pub fn take_hushed_alarm(&mut self) -> Option<ToolSlot> {
+        self.activity.hushed.take()
+    }
+
+    /// Shakes the notch again while an alarm shows, every `RING_EVERY`, with a nod of its badge.
+    pub(super) fn ring_alarm(&mut self, now: Instant) -> bool {
+        if !self.rings() {
+            self.activity.next_ring = None;
+            return false;
+        }
+        let due = self.activity.next_ring.is_none_or(|at| now >= at);
+        if !due {
+            return false;
+        }
+        self.activity.next_ring = Some(now + RING_EVERY);
+        if !self.shows_activity() || self.preview.is_some() {
+            return false;
+        }
+        self.kick();
+        self.activity.nod();
+        true
     }
 
     fn let_activity_go(&mut self, shown: f32) {
@@ -596,6 +656,65 @@ mod tests {
         notice.node.shake = true;
         n.start_activity(ActivityKind::Tool(notice), Instant::now());
         assert_eq!(n.jolt.velocity, 0.0, "a shake nobody sees only knocks the panel's words out of place");
+    }
+
+    fn alarm(slot: u16) -> ActivityKind {
+        let mut notice = sample_notice(0);
+        notice.slot = ToolSlot(slot);
+        notice.node.alarm = true;
+        notice.node.shake = true;
+        notice.node.duration_ms = 0;
+        ActivityKind::Tool(notice)
+    }
+
+    #[test]
+    fn alarm_keeps_shaking_until_dismissed() {
+        let mut n = island();
+        let t0 = Instant::now();
+        n.start_activity(alarm(0), t0);
+        assert!(n.rings() && n.jolt.velocity != 0.0);
+        settle(&mut n);
+        n.jolt.snap_to(0.0);
+        assert_eq!(n.ring_wakeup(), Some(t0 + RING_EVERY));
+        n.tick(t0 + RING_EVERY - ms(10), Some(AWAY));
+        assert_eq!(n.jolt.velocity, 0.0, "not yet");
+        assert!(n.tick(t0 + RING_EVERY, Some(AWAY)));
+        assert_ne!(n.jolt.velocity, 0.0, "it shakes again");
+        n.tick(t0 + ms(600_000), Some(AWAY));
+        assert!(n.rings() && n.shows_sticky_notice(), "for as long as it takes");
+        n.dismiss_notice(ToolSlot(0));
+        assert!(!n.rings());
+        settle(&mut n);
+        n.jolt.snap_to(0.0);
+        n.tick(t0 + ms(700_000), Some(AWAY));
+        assert_eq!(n.jolt.velocity, 0.0, "and stops once it's gone");
+    }
+
+    #[test]
+    fn alarm_is_not_pushed_aside() {
+        let mut n = island();
+        let t0 = Instant::now();
+        n.start_activity(alarm(3), t0);
+        n.show_message("Copied");
+        n.show_volume(0.4, false);
+        n.start_activity(ActivityKind::Tool(sample_notice(2_000)), t0);
+        assert!(n.rings(), "{:?}", n.activity.kind);
+        n.start_activity(alarm(1), t0);
+        assert!(matches!(&n.activity.kind, Some(ActivityKind::Tool(notice)) if notice.slot == ToolSlot(1)));
+        let mut own = sample_notice(2_000);
+        own.slot = ToolSlot(1);
+        n.start_activity(ActivityKind::Tool(own), t0);
+        assert!(!n.rings(), "its own tool can replace it");
+    }
+
+    #[test]
+    fn alarm_rings_behind_the_panel() {
+        let mut n = island();
+        n.open_page(crate::bridge::Page::Tools);
+        settle(&mut n);
+        n.start_activity(alarm(0), Instant::now());
+        assert!(n.rings(), "its sound plays while the panel covers it");
+        assert_eq!(n.jolt.velocity, 0.0);
     }
 
     #[test]

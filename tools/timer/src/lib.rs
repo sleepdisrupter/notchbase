@@ -1,4 +1,5 @@
-//! Timer: a countdown set with wheels, shown as a draining ring, with an alarm at the end.
+//! Timer: a countdown set with wheels, shown as a draining ring, with an alarm at the end that rings until it's
+//! stopped.
 
 mod clock;
 mod countdown;
@@ -26,6 +27,8 @@ const BADGE: f32 = 18.0;
 pub struct Timer<C: Clock = SystemClock> {
     length: Length,
     countdown: Countdown,
+    /// The alarm went off and nobody here stopped it yet (a click on the notch ends it without telling us).
+    ringing: bool,
     clock: PhantomData<C>,
 }
 
@@ -36,6 +39,7 @@ pub enum Msg {
     Pause,
     Resume,
     Cancel,
+    Stop,
     Toggle,
     Tick,
     Open,
@@ -64,7 +68,7 @@ impl<C: Clock> Tool for Timer<C> {
         } else {
             Command::none()
         };
-        (Self { length: remembered(settings), countdown, clock: PhantomData }, forget)
+        (Self { length: remembered(settings), countdown, ringing: false, clock: PhantomData }, forget)
     }
 
     fn update(&mut self, msg: Msg) -> Command<Msg> {
@@ -94,8 +98,11 @@ impl<C: Clock> Tool for Timer<C> {
             },
             Msg::Tick if self.countdown.over(now) => {
                 self.countdown = Countdown::Idle;
-                Command::chime().and(Command::notice(done(self.length))).and(self.countdown.remember())
+                self.ringing = true;
+                let stop = button("Stop").filled().on_press(Msg::Stop);
+                Command::notice_with_controls(done(self.length), stop).and(self.countdown.remember())
             }
+            Msg::Stop => self.hush(),
             Msg::Tick => Command::none(),
             Msg::Open => Command::open_page(),
             Msg::Configured(settings) => {
@@ -162,7 +169,12 @@ impl<C: Clock> Timer<C> {
             return Command::none();
         }
         self.countdown = Countdown::start(length, now);
-        Command::save_setting(LAST, length).and(self.countdown.remember())
+        let started = Command::save_setting(LAST, length).and(self.countdown.remember());
+        self.hush().and(started)
+    }
+
+    fn hush(&mut self) -> Command<Msg> {
+        if std::mem::take(&mut self.ringing) { Command::dismiss_notice() } else { Command::none() }
     }
 }
 
@@ -177,8 +189,11 @@ fn footnote(words: String) -> Element<Msg> {
 
 fn done(length: Length) -> Notice {
     let words: Element<()> =
-        notchbase_sdk::column![text("Timer").callout(), text(length.words()).caption().secondary()].spacing(1.0).into();
-    Notice::new(badge(Icon::Timer, Tone::Orange, BADGE), words).shake().sticky() // stays until it is seen
+        notchbase_sdk::column![text("Time's up").callout(), text(length.words()).caption().secondary()]
+            .spacing(1.0)
+            .into();
+    // Shakes and sounds until Stop, a click on the notch, or a new timer.
+    Notice::new(badge(Icon::Timer, Tone::Orange, BADGE), words).alarm().size(NoticeSize::Large)
 }
 
 fn controls(toggle: Icon, msg: Msg) -> Element<Msg> {

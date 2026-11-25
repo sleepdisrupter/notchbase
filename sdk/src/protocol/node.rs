@@ -420,6 +420,9 @@ pub struct NoticeNode {
     pub size: NoticeSize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controls: Option<Node>,
+    /// Rings until it is dismissed: the notch keeps shaking and notchbase plays its alarm sound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alarm: bool,
 }
 
 impl NoticeNode {

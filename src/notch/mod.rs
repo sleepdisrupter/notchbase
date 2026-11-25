@@ -287,7 +287,7 @@ impl Notch {
         let moved = self.follow_pointer(now, calm) || sided || lifted;
         let attracted = self.attract_toward(calm) | self.flee_from(cursor);
         let summoned = self.summon_music(calm, now);
-        let ticked = self.live_tick() | self.music_tick(now);
+        let ticked = self.live_tick() | self.music_tick(now) | self.ring_alarm(now);
         attracted || summoned || expired || moved || ticked
     }
 
@@ -329,7 +329,7 @@ impl Notch {
         let live = self.live_wakeup(now);
         let music = self.music_wakeup(now);
         let hides = [self.music_until, self.strip_wakeup()];
-        let waits = [self.dwell_until, self.peek_until, self.leave_until, self.activity.until];
+        let waits = [self.dwell_until, self.peek_until, self.leave_until, self.activity.until, self.ring_wakeup()];
         let lock = self.lock_wakeup();
         waits.into_iter().chain([live, music, lock]).chain(hides).flatten().min()
     }

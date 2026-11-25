@@ -161,6 +161,8 @@ impl App {
         }
         step!("drive_notches");
         self.drive_notches(&frame, &mut schedule);
+        step!("ring_alarms");
+        self.ring_alarms(now);
         step!("replace_spent_notches");
         self.replace_spent_notches(event_loop);
         step!("advance_captures");
@@ -180,10 +182,21 @@ impl App {
         schedule.wake_by(self.snap_wakeup());
         schedule.wake_by(self.videos_wakeup());
         schedule.wake_by(self.annotating.wakeup());
+        schedule.wake_by(self.ringer.wakeup());
         step!("pace_frame (waiting for vblank)");
         pace_frame();
         event_loop.set_control_flow(ControlFlow::WaitUntil(schedule.wake_at));
         crate::stall::sleep_until(schedule.wake_at);
+    }
+
+    /// An alarm clicked away on one screen ends on all of them, and its sound plays while any screen still shows one.
+    fn ring_alarms(&mut self, now: Instant) {
+        let hushed: Vec<_> = self.notches.windows_mut().filter_map(|(_, nw)| nw.notch.take_hushed_alarm()).collect();
+        for slot in hushed {
+            self.update_notch(|notch| notch.dismiss_notice(slot));
+        }
+        let ringing = self.notches.iter().any(|nw| nw.notch.rings());
+        self.ringer.ring(ringing, now);
     }
 
     fn shows_tool_timers(&self) -> bool {

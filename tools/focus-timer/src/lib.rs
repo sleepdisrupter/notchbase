@@ -20,12 +20,13 @@ const PRESETS: [u64; 3] = [15, 25, 50];
 const TICK: Duration = Duration::from_secs(1);
 const RING: f32 = 13.0;
 const BADGE: f32 = 18.0;
-const SHOWN_FOR: Duration = Duration::from_millis(2600);
 
 pub struct FocusTimer<C: Clock = SystemClock> {
     prefs: Prefs,
     sessions: u64,
     countdown: Countdown,
+    /// A session or break ended and its alarm hasn't been stopped here yet.
+    ringing: bool,
     clock: PhantomData<C>,
 }
 
@@ -33,6 +34,7 @@ pub struct FocusTimer<C: Clock = SystemClock> {
 pub enum Msg {
     Toggle,
     Reset,
+    Stop,
     Tick,
     Preset(usize),
     AutoBreak(bool),
@@ -57,7 +59,7 @@ impl<C: Clock> Tool for FocusTimer<C> {
         let prefs = Prefs::from(context.settings());
         let countdown = Countdown::idle(prefs.focus_ms());
         let sessions = prefs::sessions(context.settings());
-        (Self { prefs, sessions, countdown, clock: PhantomData }, Command::none())
+        (Self { prefs, sessions, countdown, ringing: false, clock: PhantomData }, Command::none())
     }
 
     fn update(&mut self, msg: Msg) -> Command<Msg> {
@@ -65,12 +67,13 @@ impl<C: Clock> Tool for FocusTimer<C> {
         match msg {
             Msg::Toggle => {
                 self.countdown.toggle(now);
-                Command::none()
+                self.hush()
             }
             Msg::Reset => {
                 self.countdown = self.ready();
-                Command::none()
+                self.hush()
             }
+            Msg::Stop => self.hush(),
             Msg::Tick if self.countdown.over(now) => self.finish(now),
             Msg::Tick => Command::none(),
             Msg::Preset(index) => self.preset(index),
@@ -145,14 +148,23 @@ impl<C: Clock> FocusTimer<C> {
                 } else {
                     self.ready()
                 };
-                Command::save_setting(prefs::SESSIONS, self.sessions).and(Command::notice(focus_done()))
+                Command::save_setting(prefs::SESSIONS, self.sessions).and(self.ring(focus_done()))
             }
             Phase::Break => {
                 self.countdown = self.ready();
-                Command::notice(break_over())
+                self.ring(break_over())
             }
             Phase::Idle => Command::none(),
         }
+    }
+
+    fn ring(&mut self, notice: Notice) -> Command<Msg> {
+        self.ringing = true;
+        Command::notice_with_controls(notice, button("Stop").filled().on_press(Msg::Stop))
+    }
+
+    fn hush(&mut self) -> Command<Msg> {
+        if std::mem::take(&mut self.ringing) { Command::dismiss_notice() } else { Command::none() }
     }
 
     fn preset(&mut self, index: usize) -> Command<Msg> {
@@ -168,11 +180,11 @@ fn footnote(words: String) -> Element<Msg> {
 }
 
 fn focus_done() -> Notice {
-    Notice::new(badge(Icon::Checkmark, Tone::Green, BADGE), text("Focus done").callout()).pop().duration(SHOWN_FOR)
+    Notice::new(badge(Icon::Checkmark, Tone::Green, BADGE), text("Focus done").callout()).alarm()
 }
 
 fn break_over() -> Notice {
-    Notice::new(badge(Icon::Bell, Tone::Orange, BADGE), text("Break over").callout()).pop().duration(SHOWN_FOR)
+    Notice::new(badge(Icon::Bell, Tone::Orange, BADGE), text("Break over").callout()).alarm()
 }
 
 notchbase_sdk::export!(FocusTimer);

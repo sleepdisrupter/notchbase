@@ -186,12 +186,27 @@ Command::notice(copied)
 | `.sticky()` | Stay until the user clicks the notch or you send `Command::dismiss_notice()` |
 | `.pop()` | The leading element springs in |
 | `.shake()` | The notch jolts sideways with a springy shake to get attention; also pops |
+| `.alarm()` | Shake, pop and stay, and keep ringing until dismissed: see [Alarms](#alarms) |
 | `.size(NoticeSize)` | `Small`, `Medium` (default) or `Large`: the minimum room the notice takes. The notch still grows if the content needs more |
 | `.into_node()` | The wire form, `protocol::NoticeNode` |
 
 The elements of a `Notice` (leading, trailing and below) are `Element<()>`: they can't carry handlers. Element builders are generic, so this happens without any extra code. For something to press, send the notice with [controls](#controls).
 
 A new notice replaces the one showing. `Command::dismiss_notice()` removes your tool's notice at once, which is how a tool ends a sticky one; the user can also dismiss a sticky notice by clicking the notch.
+
+### Alarms
+
+`.alarm()` is for something that must not be missed, like a timer running out. It is a sticky, shaking notice that keeps going: the notch shakes again every 1.3 seconds and notchbase plays its alarm sound (Glass every 2 seconds on a Mac, the Windows alarm looped) until the notice ends. The sound stops by itself after 5 minutes; the shaking and the notice stay until the user clicks the notch, presses one of its controls that dismisses it, or you send `Command::dismiss_notice()`. Clicking it away on one screen ends it on every screen. While an alarm shows, other notices, messages and the volume indicator don't replace it; only your own tool's next notice or another alarm does. It still rings while the panel is open over it, and shows once the panel closes.
+
+Give an alarm a Stop button, and dismiss it when your tool's own controls make it moot:
+
+```rust
+let stop = button("Stop").filled().on_press(Msg::Stop);
+Command::notice_with_controls(Notice::new(badge, words).alarm(), stop)
+// Msg::Stop => Command::dismiss_notice()
+```
+
+The `alarm` flag is new in notchbase 0.32: an older notchbase shows the notice as a plain sticky, shaking one.
 
 ### Controls
 

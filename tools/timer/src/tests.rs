@@ -141,18 +141,37 @@ fn pause_freezes_resume_continues() {
     assert_eq!(countdown(&runtime), Countdown::Running { start: START + 9 * MINUTE, end: START + 14 * MINUTE });
 }
 
+fn ring(runtime: &mut Runtime<Tested>) -> HandlerId {
+    press(runtime, "Start");
+    assert!(tick(runtime, START + MINUTE).is_empty());
+    let requests = tick(runtime, START + 5 * MINUTE);
+    let [Request::Notice { notice }, Request::SaveSetting { .. }] = &requests[..] else { panic!("{requests:?}") };
+    assert!(notice.alarm && notice.sticky() && notice.shake, "it rings until it's stopped");
+    let Some(Node::Button { label, on_press: Some(stop), .. }) = notice.controls.as_ref() else { panic!("{notice:?}") };
+    assert_eq!(label, "Stop");
+    *stop
+}
+
 #[test]
-fn alarm_chimes_and_waits() {
+fn alarm_rings_until_stopped() {
     let mut runtime = started();
-    press(&mut runtime, "Start");
-    assert!(tick(&mut runtime, START + MINUTE).is_empty());
-    let requests = tick(&mut runtime, START + 5 * MINUTE);
-    let [Request::Chime, Request::Notice { notice }, Request::SaveSetting { .. }] = &requests[..] else {
-        panic!("{requests:?}")
-    };
-    assert!(notice.sticky() && notice.shake);
+    let stop = ring(&mut runtime);
     assert_eq!(countdown(&runtime), Countdown::Idle);
     wheels(&page_of(&mut runtime));
+    assert!(tick(&mut runtime, START + 6 * MINUTE).is_empty(), "the notch rings it, not the tool");
+    let pressed = runtime.handle(vec![Event::Ui { surface: Surface::Notice, handler: stop, value: UiValue::Press }]);
+    assert_eq!(pressed.requests, [Request::DismissNotice]);
+}
+
+#[test]
+fn a_new_timer_stops_the_alarm() {
+    let mut runtime = started();
+    ring(&mut runtime);
+    let requests = press(&mut runtime, "Start").requests;
+    assert_eq!(requests.first(), Some(&Request::DismissNotice), "{requests:?}");
+    assert!(countdown(&runtime).running());
+    let again = press(&mut runtime, "Pause").requests;
+    assert!(!again.contains(&Request::DismissNotice), "only once");
 }
 
 #[test]

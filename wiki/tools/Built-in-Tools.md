@@ -8,7 +8,7 @@ notchbase's own tools are written with the same SDK as any plugin. They live in 
 | Screenshot | [`tools/screenshot`](../../tools/screenshot) | `screenshot` | Captures, clipboard and files; a `Prefs` struct; settings shown only while a toggle is on; a notice with a thumbnail and a button that opens the annotator |
 | Record Screen | [`tools/screen-recorder`](../../tools/screen-recorder) | `screen-recorder` | A tile that changes with state; a compact dropdown and an icon chip on a tile; a live activity; recording and microphone subscriptions |
 | Dictation | [`tools/dictation`](../../tools/dictation) | `dictation` | A tool with its own platform code and engine thread; a live activity with a meter drawn on a canvas; a secret setting; notices with Set up and Retry. See [Dictation](../Dictation.md) |
-| Timer | [`tools/timer`](../../tools/timer) | `timer` | A page that swaps views with state; a picker, round buttons and a draining ring; a chime and a sticky alarm; an injectable clock for tests |
+| Timer | [`tools/timer`](../../tools/timer) | `timer` | A page that swaps views with state; a picker, round buttons and a draining ring; an alarm notice with a Stop button; an injectable clock for tests |
 | Alerts | [`tools/alerts`](../../tools/alerts) | `alerts` | A long-running background server; settings that restart it; sticky, shaking banner notices; a tool with no tile or page |
 | Keep Awake | [`tools/keep-awake`](../../tools/keep-awake) | `keep-awake` | A tile that is a switch; a host request held for as long as the tool asks; a timer only while a timed session runs; a setting that hides the live activity |
 | Battery, Focus | [`tools/battery`](../../tools/battery), [`tools/focus-status`](../../tools/focus-status) | `battery`, `focus-status` | Tools with no tile or page that turn a system feed into notices; treating the first reading as the starting point; adaptive notices |
@@ -401,7 +401,7 @@ The page is one row: a round Cancel button, the middle, and a round button on th
 - **Running**: the middle is a 128 point orange ring that `counting_down(start, end)`, with the time left in the `Hero` style and a bell beside `timer(end).clock()`, the time it will go off. The right button is an orange Pause. A one-second tick checks for the end.
 - **Paused**: the ring stops and turns gray at the share left, with "Paused" under the time, and the right button is a green Resume. Resuming moves `start` and `end` together so the ring carries on from where it stopped.
 
-When the time is up the timer goes back to set, sends `Command::chime()`, and shows a sticky, shaking notice with the length that finished. The tile always opens the page, so a started timer can be paused, resumed or cancelled there; while running it shows the time left in an orange tile, and while paused "Paused · 8:55". The live activity is a 13 point ring that drains with the countdown beside the time left. The shortcut starts, pauses and resumes. `Timer<C: Clock>` takes its clock as a type, like Focus, so the tests in `tools/timer/src/tests.rs` drive it with a fake one.
+When the time is up the timer goes back to set and shows an alarm (`Notice::alarm()`, size `Large`): "Time's up" with the length that finished and a Stop button. notchbase keeps shaking the notch and playing its alarm sound until Stop, a click on the notch, or a new timer ends it (see [Alarms](Surfaces.md#alarms)). The tile always opens the page, so a started timer can be paused, resumed or cancelled there; while running it shows the time left in an orange tile, and while paused "Paused · 8:55". The live activity is a 13 point ring that drains with the countdown beside the time left. The shortcut starts, pauses and resumes. `Timer<C: Clock>` takes its clock as a type, like Focus, so the tests in `tools/timer/src/tests.rs` drive it with a fake one.
 
 ## Alerts
 
@@ -414,6 +414,6 @@ Alerts turns a small webhook on your own computer into notch notifications: anyt
 
 ## The Focus plugin
 
-`tools/focus-timer` is the reference **plugin**: a Pomodoro-style timer with a page of presets, a live countdown ring in the closed notch, notices when a session or break ends, and a session count kept in a `data` setting. It isn't bundled; build it and install it like any plugin (see [Plugins and Distribution](Plugins-and-Distribution.md#the-reference-plugin)). Its tests use an injectable clock (see [Testing](Testing.md#controlling-time)).
+`tools/focus-timer` is the reference **plugin**: a Pomodoro-style timer with a page of presets, a live countdown ring in the closed notch, an alarm with a Stop button when a session or break ends (Start, Pause or Reset stop it too), and a session count kept in a `data` setting. It isn't bundled; build it and install it like any plugin (see [Plugins and Distribution](Plugins-and-Distribution.md#the-reference-plugin)). Its tests use an injectable clock (see [Testing](Testing.md#controlling-time)).
 
 For a complete tool written for this wiki, see [Example: Snippets](Example-Snippets.md).

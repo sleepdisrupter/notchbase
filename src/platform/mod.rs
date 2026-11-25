@@ -29,7 +29,7 @@ use self::other as imp;
 
 #[cfg(not(target_os = "macos"))]
 pub use self::capture::{Capture, to_srgb_image};
-pub use self::chime::chime;
+pub use self::chime::{Ringer, chime};
 pub use self::haptics::{Feel, haptic};
 pub use self::hotkeys::{hotkey_caption, hotkey_labels};
 #[cfg(not(target_os = "macos"))]

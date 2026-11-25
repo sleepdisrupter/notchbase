@@ -153,6 +153,7 @@ struct App {
     snap: snap::SnapState,
     videos: videos::Grabbing,
     annotating: annotate::Annotating,
+    ringer: platform::Ringer,
     _instance: InstanceLock,
 }
 
@@ -233,6 +234,7 @@ impl App {
             snap: snap::SnapState::default(),
             videos: videos::Grabbing::new(wake.clone()),
             annotating: annotate::Annotating::new(wake),
+            ringer: platform::Ringer::default(),
             _instance: instance,
             proxy,
         };

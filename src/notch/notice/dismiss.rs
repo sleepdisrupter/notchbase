@@ -34,6 +34,12 @@ impl Notch {
     }
 
     pub(in crate::notch) fn dismiss_clicked_notice(&mut self, at: Option<Pos2>) {
+        if self.rings() {
+            self.activity.hushed = self.activity.kind.as_ref().and_then(|kind| match kind {
+                ActivityKind::Tool(notice) => Some(notice.slot),
+                _ => None,
+            });
+        }
         self.end_notice(self.hovers_controls(at));
     }
 
