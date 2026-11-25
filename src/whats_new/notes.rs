@@ -73,7 +73,15 @@ const UNREAD: &str = "Unread counts show on each icon";
 const LEADS: &str = "Dictation comes first while it listens";
 const MIDDLE: &str = "It takes the middle of the notch";
 
+const MINIMIZE: &str = "Minimizing stays on the screen you're on";
+const STILL: &str = "Your other displays stay still meanwhile";
+
 pub(super) static NOTES: &[Release] = &[
+    Release {
+        version: "0.31.1",
+        picture: None,
+        changes: &[Change { glyph: Glyph::Display, title: MINIMIZE, caption: STILL }],
+    },
     Release {
         version: "0.31.0",
         picture: None,
