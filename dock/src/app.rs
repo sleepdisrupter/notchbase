@@ -54,8 +54,14 @@ const CONFIG_POLL: Duration = Duration::from_millis(500);
 const FULLSCREEN_POLL: Duration = Duration::from_millis(250);
 /// Over a full-screen app: how long the pointer rests on the bottom edge before the dock comes up, and how long it's
 /// away from the dock before it goes back down.
-const EDGE_DWELL: Duration = Duration::from_millis(200);
+const EDGE_DWELL: Duration = Duration::from_millis(110);
 const TUCK_AFTER: Duration = Duration::from_millis(500);
+/// How near the bottom edge counts as on it. The pointer stops at an edge with nothing past it, so a few points do;
+/// where another screen sits right below (a laptop under a monitor) it never stops there and passes on down,
+/// so the band is taller and the pointer has to linger in it a moment longer, so passing through calls nothing up.
+const EDGE_BAND: f32 = 3.0;
+const SHARED_EDGE_BAND: f32 = 12.0;
+const SHARED_EDGE_DWELL: Duration = Duration::from_millis(170);
 /// How often the pointer is looked at while the dock is tucked away, waiting for the edge.
 const EDGE_POLL: Duration = Duration::from_millis(30);
 const AVOID_POLL: Duration = Duration::from_millis(300);
@@ -1050,7 +1056,8 @@ impl App {
             slow.mark("render");
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + AMBIENT_FRAME));
         } else {
-            let near = pointer.is_some_and(|p| p.y > self.dock.size.y - 220.0);
+            // Waiting on the edge over a full-screen app counts too, so the dock comes up the moment the wait is over.
+            let near = pointer.is_some_and(|p| p.y > self.dock.size.y - 220.0) || self.edge_since.is_some();
             self.idle = true;
             let wait = if near {
                 NEAR_POLL
@@ -1645,17 +1652,16 @@ impl App {
         }
         let screen = self.screen_rect();
         if !self.revealed {
-            let on_edge = (screen.left()..screen.right()).contains(&global.x)
-                && global.y >= screen.bottom() - 2.0
-                && global.y <= screen.bottom()
-                && !mac::mouse_buttons_held();
-            if !on_edge {
+            let dwell = reveal_dwell(screen, &self.screens, global).filter(|_| !mac::mouse_buttons_held());
+            if let Some(dwell) = dwell {
+                if now - *self.edge_since.get_or_insert(now) >= dwell {
+                    self.revealed = true;
+                    self.left_since = None;
+                    self.dock.set_tucked(false);
+                    self.needs_frame = true;
+                }
+            } else {
                 self.edge_since = None;
-            } else if now - *self.edge_since.get_or_insert(now) >= EDGE_DWELL {
-                self.revealed = true;
-                self.left_since = None;
-                self.dock.set_tucked(false);
-                self.needs_frame = true;
             }
             return;
         }
@@ -2290,6 +2296,21 @@ fn open_dock_window(event_loop: &ActiveEventLoop, frame: CGRect) -> Result<DockW
     Ok(DockWindow { gl, liquid, backdrop, fake: None })
 }
 
+/// Over a full-screen app on `screen` (global top-left points, as `screens` are): how long the pointer at `at` has to
+/// stay where it is to call the dock up, or `None` when it isn't on the screen's bottom edge. Where another screen
+/// sits right below, the pointer can't rest on the edge, so a taller band near it counts, with a longer wait.
+fn reveal_dwell(screen: Rect, screens: &[Rect], at: Pos2) -> Option<Duration> {
+    if !(screen.left()..screen.right()).contains(&at.x) {
+        return None;
+    }
+    let shared = screens
+        .iter()
+        .any(|s| *s != screen && (s.top() - screen.bottom()).abs() < 1.0 && (s.left()..s.right()).contains(&at.x));
+    let (band, dwell, past) =
+        if shared { (SHARED_EDGE_BAND, SHARED_EDGE_DWELL, 0.0) } else { (EDGE_BAND, EDGE_DWELL, 1.0) };
+    (at.y > screen.bottom() - band && at.y <= screen.bottom() + past).then_some(dwell)
+}
+
 /// The dock window's frame on a screen: along its bottom.
 fn dock_frame_on(screen: CGRect) -> CGRect {
     CGRect::new(screen.origin, CGSize::new(screen.size.width, f64::from(WINDOW_HEIGHT)))
@@ -2820,6 +2841,26 @@ mod tests {
         // Its own corner is fine as long as nothing full-screen is past it.
         let two = laptop_and_monitor_above();
         assert_eq!(waiting_corner_on(&two, &[true, false], two[1], size), pos2(1859.0, -1.0));
+    }
+
+    #[test]
+    fn the_dock_comes_up_from_the_bottom_edge_over_a_full_screen_app() {
+        let two = laptop_and_monitor_above();
+        let (laptop, monitor) = (two[0], two[1]);
+        // The laptop's bottom has nothing past it: the pointer stops right on it.
+        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 956.0)), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 954.5)), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 950.0)), None, "not near enough");
+        assert_eq!(reveal_dwell(laptop, &two, pos2(1500.0, 956.0)), None, "off the screen");
+        // The monitor's bottom runs into the laptop for most of its width: a taller band and a longer wait there.
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -0.5)), Some(SHARED_EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -10.0)), Some(SHARED_EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, 0.5)), None, "already on the laptop");
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -20.0)), None);
+        // Past the laptop's sides the monitor's edge is a real one again.
+        assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, 0.0)), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(-30.0, -2.0)), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, -10.0)), None);
     }
 
     #[test]

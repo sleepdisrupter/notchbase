@@ -62,8 +62,10 @@ const LONGEST_POPUP_STEP: f32 = 0.025;
 /// Fading out for Mission Control and back: about 200ms, critically damped, so it eases like Mission Control's own
 /// animation and never overshoots into a half-faded state.
 const AWAY: SpringConfig = SpringConfig::new(0.2, 1.0);
-/// Sliding down out of sight over a full-screen app, and back up when the pointer pushes on the screen's edge.
+/// Sliding down out of sight over a full-screen app, and back up when the pointer pushes on the screen's edge: up a
+/// touch quicker than down, both critically damped so it lands without a bounce.
 const TUCK: SpringConfig = SpringConfig::new(0.34, 1.0);
+const UNTUCK: SpringConfig = SpringConfig::new(0.28, 1.0);
 /// How far the dock settles down as it fades, in points: a hint of motion, not a slide.
 const AWAY_SETTLE: f32 = 3.0;
 /// Covering in Mission Control: the dock stays, settles this far and its glass darkens this much with the desktop.
@@ -520,7 +522,11 @@ impl Dock {
             self.press = None;
             self.drag = None;
         }
-        self.tucked.animate_to(if tucked { 1.0 } else { 0.0 }, TUCK);
+        if tucked {
+            self.tucked.animate_to(1.0, TUCK);
+        } else {
+            self.tucked.animate_to(0.0, UNTUCK);
+        }
     }
 
     /// Mission Control (or the system Dock shown): fading out in place and back, or, covering, staying put and only
@@ -572,9 +578,16 @@ impl Dock {
     /// the blur fades out with the move and the tint alone makes the glass.
     pub fn blur_opacity(&self) -> f32 {
         if self.fake_ready {
-            return self.opacity();
+            return self.opacity() * self.untucked();
         }
-        self.opacity() * (1.0 - self.cover_ease())
+        self.opacity() * (1.0 - self.cover_ease()) * self.untucked()
+    }
+
+    /// How much of the blur rides along as the dock slides in and out over a full-screen app. The blur's mask goes to
+    /// the window server apart from the glass drawn here, so at speed it can land a frame off the glass and show as a
+    /// band above or below it; it comes in as the dock slows to a stop and goes as it starts to move off.
+    fn untucked(&self) -> f32 {
+        1.0 - smoothstep(0.08, 0.6, self.tucked.value)
     }
 
     /// How much the blurred desktop picture stands in for the live blur: it rides the cover move in and out, so the
