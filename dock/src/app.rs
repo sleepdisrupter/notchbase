@@ -43,8 +43,11 @@ const MINIMIZED_POLL: Duration = Duration::from_millis(400);
 /// How often the apps' badges are read off the system Dock.
 const BADGES_POLL: Duration = Duration::from_secs(1);
 /// How often to look for a zoomed window under the dock.
-/// Where the hidden system Dock's Trash is, x in points (f32 bits; 0 until known).
+/// Where the hidden system Dock's Trash is, the middle of it in global top-left points (f32 bits; both 0 until
+/// known). macOS keeps the Dock on whichever screen the pointer last pushed against the bottom of, not always the
+/// main one, and plays its own minimize animation between a window and there.
 static SYSTEM_TRASH_X: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SYSTEM_TRASH_Y: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Where the dock tells notchbase which screens it's on and how tall it stands there.
 const AREAS_FILE: &str = "dock-areas.json";
 const CONFIG_POLL: Duration = Duration::from_millis(500);
@@ -135,6 +138,21 @@ const JOB_WAIT: Duration = Duration::from_millis(250);
 const REVEAL_WAIT: f32 = 2.0;
 /// How long an ask that came while its window was busy is kept.
 const WANTED_FOR: Duration = Duration::from_secs(4);
+/// How long a window going down on another screen's dock waits for the live dock to be free to move there, before
+/// it's minimized plainly.
+const SEAT_WAIT: Duration = Duration::from_millis(1500);
+/// How much of a screen's bottom the cover hides while macOS animates a window under it.
+const COVER_HEIGHT: f32 = 56.0;
+
+/// Covers the bottom of the screen windows park under, when that isn't the overlay's screen: a window going down
+/// on one screen waits at the bottom of the one the hidden system Dock is on, and without this its sliver and
+/// macOS's own animation showed there.
+struct Shade {
+    gl: GlWindow,
+    shown: bool,
+    /// Where it is, in AppKit's bottom-left points.
+    frame: CGRect,
+}
 
 struct Overlay {
     gl: GlWindow,
@@ -192,6 +210,11 @@ pub struct App {
     /// Asks that came while their window was still at work (a click mid-flight, a quick Cmd+M after a restore):
     /// the latest for each window is carried out once it's free, never dropped and never played over the first.
     wanted: Vec<(u32, i32, Way, Instant)>,
+    /// Windows going down on another screen's dock while the live one was still busy: each waits until the live dock
+    /// can move there, so it flies into its own screen's dock rather than going down plainly across the screens.
+    seat_waits: Vec<(u32, i32, Instant)>,
+    /// The cover for the screen windows park under, when that's another screen.
+    shade: Option<Shade>,
     /// A stress run of minimizing and restoring a TextEdit window, while one goes.
     stress: Option<crate::stress::Run>,
     busy: Busy,
@@ -248,8 +271,10 @@ pub struct App {
     screen: CGRect,
     display: u32,
     primary_top: f64,
-    /// The main screen (AppKit's points), where the hidden system Dock is.
+    /// The main screen (AppKit's points).
     main_screen: CGRect,
+    /// Every screen in global top-left points, the main one first.
+    screens: Vec<Rect>,
     /// The docks on the other screens, with "All displays".
     seats: Vec<Seat>,
     /// What `dock-areas.json` last said: each screen with the dock up and how much of its bottom the dock keeps.
@@ -297,6 +322,8 @@ pub fn run(dir: PathBuf) -> Result<(), String> {
         jobs: Vec::new(),
         refused: Arc::default(),
         wanted: Vec::new(),
+        seat_waits: Vec::new(),
+        shade: None,
         stress: None,
         busy: Busy::default(),
         switcher: None,
@@ -335,6 +362,7 @@ pub fn run(dir: PathBuf) -> Result<(), String> {
         display: 0,
         primary_top: 900.0,
         main_screen: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1440.0, 900.0)),
+        screens: Vec::new(),
         seats: Vec::new(),
         reposition_soon: false,
         areas_written: None,
@@ -430,6 +458,8 @@ impl App {
         og.present();
         mac::show_window(&og.window, true);
         self.overlay = Some(Overlay { gl: og, liquid, shown: false, screen: s });
+        self.shade =
+            open_shade(event_loop, self.main_screen).map_err(|e| eprintln!("notchbase-dock: no cover: {e}")).ok();
         self.reposition(event_loop);
         let proxy = self.proxy.clone();
         crate::titlebar::on_minimize(move || {
@@ -604,6 +634,7 @@ impl App {
         let Some(main) = screens.first() else { return };
         self.primary_top = main.frame.origin.y + main.frame.size.height;
         self.main_screen = main.frame;
+        self.screens = screens.iter().map(|s| global_rect(s.frame, self.primary_top)).collect();
         let wanted: Vec<mac::Screen> = match self.dock.config.displays {
             Displays::All => screens.clone(),
             Displays::Primary => vec![*main],
@@ -875,6 +906,7 @@ impl App {
         }
         self.step_ambient();
         self.step_wanted();
+        self.step_seat_waits();
         self.step_stress();
         if now - self.last_trash > Duration::from_secs(3) {
             self.last_trash = now;
@@ -883,7 +915,8 @@ impl App {
                     crate::titlebar::dock_items(dock).into_iter().find(|i| i.0 == "AXTrashDockItem").map(|i| i.2)
                 });
                 if let Some(f) = x {
-                    SYSTEM_TRASH_X.store((f[0] as f32).to_bits(), Ordering::Relaxed);
+                    SYSTEM_TRASH_X.store(((f[0] + f[2] * 0.5) as f32).to_bits(), Ordering::Relaxed);
+                    SYSTEM_TRASH_Y.store(((f[1] + f[3] * 0.5) as f32).to_bits(), Ordering::Relaxed);
                 }
             });
             let full = mac::trash_is_full();
@@ -1154,6 +1187,50 @@ impl App {
                 o.gl.present();
                 o.shown = showing;
                 presented = true;
+            }
+        }
+        // The bottom of the screen the window waits under, when that's another screen.
+        if let Some(shade) = &mut self.shade {
+            let patch = self.cover.as_mut().and_then(|c| c.park.as_mut());
+            match patch {
+                Some(p) => {
+                    let frame = appkit_rect(p.rect, self.primary_top);
+                    if shade.frame != frame {
+                        if shade.shown {
+                            shade.gl.frame(|_, _, _| {}, |_| {}, None, None);
+                            shade.gl.present();
+                        }
+                        mac::place_window(&shade.gl.window, mac::EFFECT_LEVEL, frame);
+                        shade.gl.resized();
+                        shade.frame = frame;
+                    }
+                    let local = Rect::from_min_size(Pos2::ZERO, p.rect.size());
+                    shade.gl.frame(
+                        |_, _, _| {},
+                        |ui| {
+                            let texture = p.texture.get_or_insert_with(|| {
+                                ui.ctx().load_texture("shade", p.image.clone(), egui::TextureOptions::LINEAR)
+                            });
+                            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                            ui.painter().clone().with_clip_rect(Rect::EVERYTHING).image(
+                                texture.id(),
+                                local,
+                                uv,
+                                egui::Color32::WHITE,
+                            );
+                        },
+                        None,
+                        None,
+                    );
+                    shade.gl.present();
+                    shade.shown = true;
+                }
+                None if shade.shown => {
+                    shade.gl.frame(|_, _, _| {}, |_| {}, None, None);
+                    shade.gl.present();
+                    shade.shown = false;
+                }
+                None => {}
             }
         }
         // Once the overlay has shown what covers a window, the window itself can move under it. Apps answer slowly
@@ -1587,13 +1664,19 @@ impl App {
 
     /// Covers the bottom of the screen, where a parked window's sliver shows, with what's behind window `id`, until
     /// the returned time (to be moved up once macOS is done there).
-    fn cover_bottom(&mut self, id: u32) -> Arc<std::sync::Mutex<Instant>> {
+    /// Covers the bottom of the live dock's screen, and of `park` (the screen the window waits under) when that's
+    /// another one, with what's there without window `id`, until the returned time.
+    fn cover_bottom(&mut self, id: u32, park: Rect) -> Arc<std::sync::Mutex<Instant>> {
         let until = Arc::new(std::sync::Mutex::new(Instant::now() + Duration::from_secs(3)));
-        let screen = self.screen_rect();
-        let rect = Rect::from_min_max(pos2(screen.left(), screen.bottom() - 56.0), screen.max);
+        let bottom = |screen: Rect| Rect::from_min_max(pos2(screen.left(), screen.bottom() - COVER_HEIGHT), screen.max);
+        let rect = bottom(self.overlay_rect());
         if let Some(image) = windows::screen_without(rect, id) {
             crate::recorder::event(|| "cover on".into());
-            self.cover = Some(Cover { image, rect, texture: None, until: Arc::clone(&until) });
+            let elsewhere = self.shade.is_some() && overlap(self.overlay_rect(), park) < park.area() * 0.5;
+            let park = elsewhere
+                .then(|| bottom(park))
+                .and_then(|rect| windows::screen_without(rect, id).map(|image| Patch { image, rect, texture: None }));
+            self.cover = Some(Cover { image, rect, texture: None, park, until: Arc::clone(&until) });
             self.needs_frame = true;
         }
         until
@@ -1603,16 +1686,25 @@ impl App {
         vec2(self.screen.size.width as f32, self.screen.size.height as f32)
     }
 
-    /// Where a window waits while it's down: low on the main screen, as close as it can be to where the hidden
-    /// system Dock keeps minimized windows (just before its Trash), under the main screen's dock. macOS animates
-    /// minimizing and restoring to and from its own Dock, so a window parked anywhere else (the bottom of another
-    /// screen, with a dock on each) showed macOS's animation across the screens as well as the dock's own.
-    fn park_spot(&self, width: f32) -> Pos2 {
-        park_spot_on(
-            global_rect(self.main_screen, self.primary_top),
+    /// Where a window of `size` waits while it's down, and the screen it waits under (see `park_spot_on`).
+    fn park(&self, size: egui::Vec2) -> (Pos2, Rect) {
+        let main = global_rect(self.main_screen, self.primary_top);
+        let screens = if self.screens.is_empty() { vec![main] } else { self.screens.clone() };
+        let trash = pos2(
             f32::from_bits(SYSTEM_TRASH_X.load(Ordering::Relaxed)),
-            width,
-        )
+            f32::from_bits(SYSTEM_TRASH_Y.load(Ordering::Relaxed)),
+        );
+        let trash = (trash != Pos2::ZERO).then_some(trash);
+        match park_spot_on(&screens, trash, size) {
+            Some((spot, i)) => (spot, screens[i]),
+            None => (pos2((main.center().x - size.x * 0.5).round(), main.bottom() - 1.0), main),
+        }
+    }
+
+    /// Where a window coming back up waits for its picture to land: a corner with only a point of it on screen.
+    fn waiting_corner(&self, size: egui::Vec2) -> Pos2 {
+        let screens = if self.screens.is_empty() { vec![self.screen_rect()] } else { self.screens.clone() };
+        waiting_corner_on(&screens, self.screen_rect(), size)
     }
 
     /// A window handed over to minimize: its picture covers it and flies down into its new tile; once the overlay
@@ -1623,17 +1715,25 @@ impl App {
             self.want(id, pid, Way::Down);
             return;
         }
-        let Some(done) = self.busy.begin(id) else { return };
-        // A window on another screen with a dock of its own flies into that one, which becomes the live dock.
+        // A window on another screen with a dock of its own flies into that one, which becomes the live dock. While
+        // the live dock is still busy (another window flying, a menu open) it waits for it, rather than going down
+        // plainly and having macOS play its own animation across the screens.
         let found = windows::frame_of(pid, id);
         if let Some(f) = found
             && !self.on_screen(f)
-            && self.calm()
             && let Some(i) =
-                self.seats.iter().position(|s| global_rect(s.screen, self.primary_top).contains(f.center()))
+                self.seats.iter().position(|s| mostly_on(&self.screens, global_rect(s.screen, self.primary_top), f))
         {
+            if !self.calm() {
+                if !self.seat_waits.iter().any(|w| w.0 == id) {
+                    crate::recorder::event(|| format!("down {id}: another screen's dock, waits for this one"));
+                    self.seat_waits.push((id, pid, Instant::now()));
+                }
+                return;
+            }
             self.activate(i);
         }
+        let Some(done) = self.busy.begin(id) else { return };
         let trace = crate::flow::Trace::new(
             format!("down {id} {} on display {} from {found:?}", self.dock.app_name(pid), self.display),
             Some(crate::flow::log_file()),
@@ -1660,9 +1760,9 @@ impl App {
         self.flights.push(flight);
         self.parked.insert(id, (pid, frame, Instant::now()));
         // The screen's bottom without the window, taken now so it's in the very first frame with the picture.
-        let until = self.cover_bottom(id);
-        trace.step(|| format!("cover {}", self.cover.is_some()));
-        let spot = self.park_spot(frame.width());
+        let (spot, park) = self.park(frame.size());
+        let until = self.cover_bottom(id, park);
+        trace.step(|| format!("cover {} parked at {spot:?}", self.cover.is_some()));
         let refused = Arc::clone(&self.refused);
         let run = move || {
             let _done = done;
@@ -1777,6 +1877,25 @@ impl App {
         }
     }
 
+    /// Windows waiting to go down into another screen's dock: each goes once the live dock is free to move there,
+    /// or plainly if it never is in time.
+    fn step_seat_waits(&mut self) {
+        if self.seat_waits.is_empty() {
+            return;
+        }
+        for (id, pid, at) in std::mem::take(&mut self.seat_waits) {
+            if self.calm() {
+                self.start_minimize(pid, id);
+            } else if at.elapsed() > SEAT_WAIT {
+                crate::recorder::event(|| format!("down {id}: the live dock stayed busy, minimized plainly"));
+                windows::set_minimized(pid, id, true);
+            } else {
+                self.seat_waits.push((id, pid, at));
+            }
+        }
+        self.needs_frame = true;
+    }
+
     /// Keeps an ask for a window that's still at work, replacing any earlier one for it.
     fn want(&mut self, id: u32, pid: i32, way: Way) {
         crate::recorder::event(|| format!("{way:?} {id}: busy, waits its turn"));
@@ -1845,8 +1964,8 @@ impl App {
         // A window minimized some other way waits where it was, so it would show at once: park it first, and if the
         // app won't move a minimized window, bring it back plainly.
         if ours.is_none() {
-            let width = windows::frame_of(pid, id).map_or(0.0, |f| f.width());
-            let spot = self.park_spot(width);
+            let size = windows::frame_of(pid, id).map_or(window.size(), |f| f.size());
+            let (spot, _) = self.park(size);
             windows::move_to(pid, id, spot);
             // macOS keeps a sliver of a window on screen, so it may end up a little higher than asked.
             let moved =
@@ -1875,11 +1994,11 @@ impl App {
         flight.landed = Some(Arc::clone(&landed));
         flight.trace = Some(trace.clone());
         self.flights.push(flight);
-        let spot = self.park_spot(window.width());
-        // While it waits for the picture, it sits in the corner, where only a point of it shows.
-        let corner = self.screen_rect().max - vec2(1.0, 1.0);
-        let until = self.cover_bottom(id);
-        trace.step(|| format!("cover {}", self.cover.is_some()));
+        let (spot, park) = self.park(window.size());
+        // While it waits for the picture, it sits in a corner, where only a point of it shows.
+        let corner = self.waiting_corner(window.size());
+        let until = self.cover_bottom(id, park);
+        trace.step(|| format!("cover {} parked at {spot:?}, waits at {corner:?}", self.cover.is_some()));
         let run = move || {
             let _done = done;
             trace.step(|| "covered".into());
@@ -2002,8 +2121,13 @@ impl App {
     }
 
     /// The overlay covers the live dock's screen, so only a window there can be flown into.
+    /// Whether `frame` is on the live dock's screen: more of it there than on any other. A window only touching it
+    /// (hanging over from the screen above) belongs to the screen it's mostly on, which is where macOS shows it.
     fn on_screen(&self, frame: Rect) -> bool {
-        self.screen_rect().intersects(frame)
+        if self.screens.is_empty() {
+            return self.screen_rect().intersects(frame);
+        }
+        mostly_on(&self.screens, self.screen_rect(), frame)
     }
 
     fn step_runs(&mut self, dt: f32) {
@@ -2136,13 +2260,81 @@ fn dock_frame_on(screen: CGRect) -> CGRect {
     CGRect::new(screen.origin, CGSize::new(screen.size.width, f64::from(WINDOW_HEIGHT)))
 }
 
-/// The parking spot on the main screen `main` (global points) for a window `width` wide, given where the hidden
-/// system Dock's Trash is (0 when not known yet): behind the middle of the dock there, a little toward the Trash.
-fn park_spot_on(main: Rect, trash_x: f32, width: f32) -> Pos2 {
-    let ours = main.center().x;
-    let system = if trash_x > 0.0 && (main.left()..main.right()).contains(&trash_x) { trash_x } else { ours };
-    let middle = ours + (system - ours) * 0.35;
-    pos2((middle - width * 0.5).round(), main.bottom() - 1.0)
+/// How much of `frame` lies on `screen`, in square points.
+fn overlap(screen: Rect, frame: Rect) -> f32 {
+    let both = screen.intersect(frame);
+    if both.is_positive() { both.area() } else { 0.0 }
+}
+
+/// Whether `frame` is mostly on `screen`: at least as much of it there as on any other of `screens`.
+fn mostly_on(screens: &[Rect], screen: Rect, frame: Rect) -> bool {
+    let here = overlap(screen, frame);
+    here > 0.0 && screens.iter().all(|s| overlap(*s, frame) <= here)
+}
+
+/// The screen the hidden system Dock is on: the one whose bottom edge its Trash (`trash`, its middle) is by.
+fn dock_screen(screens: &[Rect], trash: Pos2) -> Option<usize> {
+    screens
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| (s.left()..=s.right()).contains(&trash.x))
+        .map(|(i, s)| (i, (s.bottom() - trash.y).abs()))
+        .filter(|(_, off)| *off < 150.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// Where a window of `size` waits while it's down, and which of `screens` it waits under: just below the bottom of
+/// the screen the hidden system Dock is on (found by its Trash), a little toward the Trash, under the cover. macOS
+/// plays its own minimize and restore between a window and its Dock, so a window waiting under any other screen
+/// (the main one, while the Dock had moved to another) showed that animation flying across the screens.
+///
+/// The window hangs down from there, so it never waits where it would hang over another screen below or beside:
+/// it slides along the bottom to a free stretch, or waits under the main screen (then any other) when there's
+/// none. None when no screen has room, which only an odd layout gives.
+fn park_spot_on(screens: &[Rect], trash: Option<Pos2>, size: egui::Vec2) -> Option<(Pos2, usize)> {
+    let dock = trash.and_then(|t| dock_screen(screens, t));
+    let mut order: Vec<usize> = dock.into_iter().collect();
+    order.extend((0..screens.len()).filter(|i| Some(*i) != dock));
+    for i in order {
+        let s = screens[i];
+        let ours = s.center().x;
+        let system = trash.map(|t| t.x).filter(|x| (s.left()..s.right()).contains(x)).unwrap_or(ours);
+        let middle = ours + (system - ours) * 0.35;
+        let wanted = (middle - size.x * 0.5).round();
+        let y = s.bottom() - 1.0;
+        // Enough of it under this screen that it's this screen's window, even if it reaches past the edge.
+        let enough = size.x.clamp(1.0, 40.0);
+        let free = |x: f32| {
+            let r = Rect::from_min_size(pos2(x, y), size);
+            let under = r.right().min(s.right()) - r.left().max(s.left());
+            under >= enough && screens.iter().enumerate().all(|(j, o)| j == i || overlap(*o, r) <= 0.0)
+        };
+        let mut tries = vec![wanted, s.left(), s.right() - size.x];
+        for o in screens {
+            tries.extend([o.right(), o.left() - size.x]);
+        }
+        if let Some(x) =
+            tries.into_iter().filter(|x| free(*x)).min_by(|a, b| (a - wanted).abs().total_cmp(&(b - wanted).abs()))
+        {
+            return Some((pos2(x, y), i));
+        }
+    }
+    None
+}
+
+/// Where a window of `size` coming back up waits: in the bottom-right corner of `prefer` (the live dock's screen),
+/// with only a point of it on screen. Never where the rest of it would hang over another screen (one beside or
+/// below, more than a hairline along an edge they share); another screen's corner then, if one is free.
+fn waiting_corner_on(screens: &[Rect], prefer: Rect, size: egui::Vec2) -> Pos2 {
+    let corner = |s: Rect| s.max - vec2(1.0, 1.0);
+    let hairline = size.x.max(size.y) + 1.0;
+    let free = |s: Rect| {
+        let r = Rect::from_min_size(corner(s), size);
+        let same = |o: Rect| overlap(o, s) >= s.area() * 0.5;
+        screens.iter().all(|o| same(*o) || overlap(*o, r) <= hairline)
+    };
+    std::iter::once(prefer).chain(screens.iter().copied()).find(|s| free(*s)).map_or(corner(prefer), corner)
 }
 
 /// A screen's AppKit frame (bottom-left points) in global top-left points, given the main screen's top.
@@ -2315,7 +2507,42 @@ struct Cover {
     image: egui::ColorImage,
     rect: Rect,
     texture: Option<egui::TextureHandle>,
+    /// The bottom of the screen the window waits under, when that's another screen, for the shade.
+    park: Option<Patch>,
     until: Arc<std::sync::Mutex<Instant>>,
+}
+
+/// A piece of a screen as it is without a window, in global top-left points.
+struct Patch {
+    image: egui::ColorImage,
+    rect: Rect,
+    texture: Option<egui::TextureHandle>,
+}
+
+/// The shade's window, cleared and ordered in under the main screen's bottom, out of the way until it's needed.
+fn open_shade(event_loop: &ActiveEventLoop, main: CGRect) -> Result<Shade, String> {
+    let frame = CGRect::new(main.origin, CGSize::new(main.size.width, f64::from(COVER_HEIGHT)));
+    let mut gl = GlWindow::new(
+        event_loop,
+        window_attributes("notchbase dock cover", frame.size.width, frame.size.height),
+        false,
+    )?;
+    mac::place_window(&gl.window, mac::EFFECT_LEVEL, frame);
+    prevent_activation(&gl.window);
+    let _ = gl.window.set_cursor_hittest(false);
+    gl.resized();
+    gl.frame(|_, _, _| {}, |_| {}, None, None);
+    gl.present();
+    mac::show_window(&gl.window, true);
+    Ok(Shade { gl, shown: false, frame })
+}
+
+/// A rect in global top-left points as an AppKit frame (bottom-left points), given the main screen's top.
+fn appkit_rect(r: Rect, primary_top: f64) -> CGRect {
+    CGRect::new(
+        CGPoint::new(f64::from(r.left()), primary_top - f64::from(r.bottom())),
+        CGSize::new(f64::from(r.width()), f64::from(r.height())),
+    )
 }
 
 /// The Command and Shift keys held right now, read from the window server (the dock never has the keyboard).
@@ -2380,16 +2607,143 @@ fn areas_json(areas: &[(u32, f32)]) -> String {
 mod tests {
     use super::*;
 
+    /// John's screens: the laptop is main, a 1920 x 1080 monitor above it, a little to the left.
+    fn laptop_and_monitor_above() -> [Rect; 2] {
+        [
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(1470.0, 956.0)),
+            Rect::from_min_size(pos2(-60.0, -1080.0), vec2(1920.0, 1080.0)),
+        ]
+    }
+
+    /// Three screens side by side, the main one in the middle; the one on the right sits lower and is taller.
+    fn three_in_a_row() -> [Rect; 3] {
+        [
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(1512.0, 982.0)),
+            Rect::from_min_size(pos2(-1920.0, -98.0), vec2(1920.0, 1080.0)),
+            Rect::from_min_size(pos2(1512.0, -200.0), vec2(2560.0, 1440.0)),
+        ]
+    }
+
+    fn parked(screens: &[Rect], spot: Pos2, size: egui::Vec2, on: usize) {
+        let r = Rect::from_min_size(spot, size);
+        assert_eq!(spot.y, screens[on].bottom() - 1.0, "just under the bottom of screen {on}");
+        assert!(r.right() > screens[on].left() && r.left() < screens[on].right(), "under screen {on}");
+        for (i, s) in screens.iter().enumerate().filter(|(i, _)| *i != on) {
+            assert!(overlap(*s, r) <= 0.0, "never hanging over screen {i}: {r:?}");
+        }
+    }
+
     #[test]
-    fn windows_park_on_the_main_screen_whichever_screen_they_go_down_from() {
-        let main = Rect::from_min_size(pos2(0.0, 0.0), vec2(1470.0, 956.0));
-        let spot = park_spot_on(main, 1200.0, 600.0);
-        assert_eq!(spot.y, 955.0, "the main screen's bottom edge, where macOS's own animation is out of sight");
-        assert!((0.0..1470.0).contains(&(spot.x + 300.0)), "behind the dock there");
+    fn windows_park_under_the_main_screen_while_the_system_dock_is_there() {
+        let screens = laptop_and_monitor_above();
+        let size = vec2(600.0, 400.0);
+        let (spot, on) = park_spot_on(&screens, Some(pos2(1200.0, 940.0)), size).unwrap();
+        assert_eq!(on, 0);
+        parked(&screens, spot, size, 0);
         assert!(spot.x + 300.0 > 735.0, "a little toward the Trash");
-        // The Trash not known yet, or on no screen it makes sense for: the dock's middle.
-        assert_eq!(park_spot_on(main, 0.0, 600.0), pos2(435.0, 955.0));
-        assert_eq!(park_spot_on(main, -500.0, 600.0), pos2(435.0, 955.0));
+        // The Trash not known yet: the main screen's middle.
+        assert_eq!(park_spot_on(&screens, None, size), Some((pos2(435.0, 955.0), 0)));
+        // The Trash somewhere no screen's bottom is: the main screen too.
+        assert_eq!(park_spot_on(&screens, Some(pos2(-5000.0, 30.0)), size).map(|p| p.1), Some(0));
+    }
+
+    #[test]
+    fn windows_park_under_whichever_screen_the_system_dock_moved_to() {
+        let screens = three_in_a_row();
+        let size = vec2(800.0, 600.0);
+        // macOS moved its Dock to the monitor on the left, so its animation plays there: so does the window wait.
+        let (spot, on) = park_spot_on(&screens, Some(pos2(-400.0, 975.0)), size).unwrap();
+        assert_eq!(on, 1);
+        parked(&screens, spot, size, 1);
+        // And on the right, taller one.
+        let (spot, on) = park_spot_on(&screens, Some(pos2(3500.0, 1230.0)), size).unwrap();
+        assert_eq!(on, 2);
+        parked(&screens, spot, size, 2);
+        // Back on the main screen. The right-hand screen reaches lower than its bottom, so the window never slides
+        // over toward there.
+        let (spot, on) = park_spot_on(&screens, Some(pos2(1400.0, 970.0)), vec2(1400.0, 900.0)).unwrap();
+        assert_eq!(on, 0);
+        parked(&screens, spot, vec2(1400.0, 900.0), 0);
+    }
+
+    #[test]
+    fn a_window_never_parks_where_it_would_hang_over_the_screen_below() {
+        // The Dock on the monitor above the laptop: under most of the monitor's bottom is the laptop, so the window
+        // waits under the stretch of it that has nothing below.
+        let screens = laptop_and_monitor_above();
+        let size = vec2(600.0, 400.0);
+        let (spot, on) = park_spot_on(&screens, Some(pos2(900.0, -12.0)), size).unwrap();
+        assert_eq!(on, 1);
+        parked(&screens, spot, size, 1);
+        // A wide one too, reaching out past the monitor's edge where there's no screen at all.
+        let wide = vec2(1600.0, 900.0);
+        let (spot, on) = park_spot_on(&screens, Some(pos2(900.0, -12.0)), wide).unwrap();
+        assert_eq!(on, 1);
+        parked(&screens, spot, wide, 1);
+        // A monitor squarely on top of the laptop has no free stretch at all: the window waits under the laptop.
+        let stacked = [screens[0], Rect::from_min_size(pos2(0.0, -900.0), vec2(1470.0, 900.0))];
+        let (spot, on) = park_spot_on(&stacked, Some(pos2(900.0, -12.0)), size).unwrap();
+        assert_eq!(on, 0);
+        parked(&stacked, spot, size, 0);
+    }
+
+    #[test]
+    fn the_system_dock_is_on_the_screen_whose_bottom_its_trash_is_by() {
+        let screens = laptop_and_monitor_above();
+        // The monitor's bottom is the laptop's top: which one depends on which bottom it's by.
+        assert_eq!(dock_screen(&screens, pos2(1300.0, 940.0)), Some(0));
+        assert_eq!(dock_screen(&screens, pos2(1300.0, 970.0)), Some(0), "hidden just below the bottom");
+        assert_eq!(dock_screen(&screens, pos2(1300.0, -14.0)), Some(1));
+        assert_eq!(dock_screen(&screens, pos2(1300.0, 400.0)), None, "nowhere near a bottom");
+    }
+
+    #[test]
+    fn a_window_belongs_to_the_screen_most_of_it_is_on() {
+        let [laptop, monitor] = laptop_and_monitor_above();
+        let screens = [laptop, monitor];
+        // On the monitor, its bottom just over the laptop's top.
+        let window = Rect::from_min_size(pos2(200.0, -700.0), vec2(800.0, 720.0));
+        assert!(mostly_on(&screens, monitor, window));
+        assert!(!mostly_on(&screens, laptop, window), "touching the laptop doesn't make it the laptop's");
+        let window = Rect::from_min_size(pos2(200.0, -20.0), vec2(800.0, 600.0));
+        assert!(mostly_on(&screens, laptop, window));
+        assert!(!mostly_on(&screens, laptop, Rect::from_min_size(pos2(3000.0, 0.0), vec2(10.0, 10.0))));
+    }
+
+    #[test]
+    fn a_window_coming_up_waits_in_a_corner_that_shows_only_a_point_of_it() {
+        let screens = three_in_a_row();
+        let size = vec2(800.0, 600.0);
+        // A point of it, or at most a hairline along the bottom edge of a screen beside it.
+        let point_only = |corner: Pos2| {
+            let r = Rect::from_min_size(corner, size);
+            let shown: f32 = screens.iter().map(|s| overlap(*s, r)).sum();
+            assert!(shown <= size.x + 2.0, "only a point shows at {corner:?}, not {shown}");
+        };
+        // The left screen's corner is free.
+        let corner = waiting_corner_on(&screens, screens[1], size);
+        assert_eq!(corner, pos2(-1.0, 981.0));
+        point_only(corner);
+        // The main screen's would hang over the taller one on its right, so another free one is used.
+        let corner = waiting_corner_on(&screens, screens[0], size);
+        assert_ne!(corner, pos2(1511.0, 981.0));
+        point_only(corner);
+        // John's: the monitor's corner has nothing past it.
+        let two = laptop_and_monitor_above();
+        assert_eq!(waiting_corner_on(&two, two[1], size), pos2(1859.0, -1.0));
+        assert_eq!(waiting_corner_on(&two, two[0], size), pos2(1469.0, 955.0));
+        // One screen alone: its own corner.
+        let one = [screens[0]];
+        assert_eq!(waiting_corner_on(&one, one[0], size), pos2(1511.0, 981.0));
+    }
+
+    #[test]
+    fn appkit_frames_round_trip() {
+        let frame = CGRect::new(CGPoint::new(-60.0, 956.0), CGSize::new(1920.0, 1080.0));
+        let r = global_rect(frame, 956.0);
+        assert_eq!(r, Rect::from_min_size(pos2(-60.0, -1080.0), vec2(1920.0, 1080.0)));
+        let back = appkit_rect(r, 956.0);
+        assert_eq!((back.origin.x, back.origin.y, back.size.width, back.size.height), (-60.0, 956.0, 1920.0, 1080.0));
     }
 
     #[test]

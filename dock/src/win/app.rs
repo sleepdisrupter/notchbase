@@ -1042,6 +1042,12 @@ impl App {
             && o.screen.as_ref().is_none_or(|s| s.id != id)
             && let Some(seat) = self.seats.iter().find(|s| s.screen.id == id)
         {
+            // Out of sight while it moves and resizes: shown, it carried its last frame (the other screen's flight,
+            // stretched to the new size) onto this screen for a moment. It's shown again once it has drawn here.
+            if o.shown {
+                unsafe { ShowWindow(o.hwnd, SW_HIDE) };
+                o.shown = false;
+            }
             let s = &seat.screen;
             o.gl.window.set_outer_position(PhysicalPosition::new(s.frame.left, s.frame.top));
             let _ = o.gl.window.request_inner_size(PhysicalSize::new(s.frame.width() as u32, s.frame.height() as u32));
