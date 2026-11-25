@@ -30,7 +30,7 @@ windows-sys = "0.61"
 
 [package]
 name = "notchbase"
-version = "0.31.2"
+version = "0.31.3"
 edition.workspace = true
 description = "A fluid notch for macOS and Windows that actually does things"
 license.workspace = true
