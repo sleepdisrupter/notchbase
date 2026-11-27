@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "notchbase"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "alerts",
  "arboard",
