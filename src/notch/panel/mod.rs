@@ -471,9 +471,9 @@ mod tests {
         n.open_page(Page::Settings);
         frames(&rig, &mut n, 60);
         n.pages.scroll.insert(Page::Settings, 120.0);
-        n.pages.show_tool_list();
+        n.pages.show_assistant_settings();
         frames(&rig, &mut n, 1);
-        assert_eq!(n.pages.scroll.get(&Page::Settings).copied().unwrap_or(0.0), 0.0, "Tools opens at its top");
+        assert_eq!(n.pages.scroll.get(&Page::Settings).copied().unwrap_or(0.0), 0.0, "Assistant opens at its top");
         assert_eq!(
             n.morph.h.config,
             n.spring_configs(Motion::Resize).1,
@@ -481,7 +481,7 @@ mod tests {
         );
         n.pages.hide();
         frames(&rig, &mut n, 1);
-        assert_eq!(n.pages.scroll.get(&Page::Settings).copied(), Some(120.0), "General comes back where it was left");
+        assert_eq!(n.pages.scroll.get(&Page::Settings).copied(), Some(120.0), "home comes back where it was left");
     }
 
     fn wheel_over(window: Rect, notches: f32) -> Vec<egui::Event> {
@@ -511,8 +511,10 @@ mod tests {
         let mut n = island();
         n.open_page(Page::Settings);
         frames(&rig, &mut n, 60);
+        n.pages.search_settings("e");
+        frames(&rig, &mut n, 60);
         let window = n.content_rect(Page::Settings);
-        assert!(n.overflow(Page::Settings).is_some(), "Settings is taller than the panel");
+        assert!(n.overflow(Page::Settings).is_some(), "a search finding most settings is taller than the panel");
         rig.frame(&mut n, &[], wheel_over(window, 1.0));
         frames(&rig, &mut n, 1);
         let started = n.overflow(Page::Settings).expect("scrolls").offset;

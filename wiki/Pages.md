@@ -181,37 +181,49 @@ The `whats-new` preview shows it (see [Previews](Previews.md)). Tests in `pages/
 
 ## Settings (`pages/settings`)
 
-Settings has a general view and three views it opens, switched inside the page (`pages/settings/mod.rs`): **Assistant**, **Tools** and a tool's settings. It always reopens on the general view. A view that opens slides in 12 points from the right as it fades in, and going back slides in from the left (`Slide`, on a `SMOOTH` spring), the way pages switch; each view keeps its own scroll position (`Pages::keep_settings_scroll` swaps the page's offset as the view changes), so a sub-view opens at its top and the general view comes back where it was left. Rows are 50 points tall and painted on flat cards with hairline dividers (`pages/settings/rows.rs`).
+Settings opens on a **home** view: a search field, then one tile for each group of settings. A tile opens that group's own view, and a tool's cog in Tools or Indicators opens that tool's settings, so there are three depths, switched inside the page (`pages/settings/mod.rs`, `View::Home`, `View::Group`, `View::Tool`). It always reopens on home with the search emptied. A view that opens slides in 12 points from the right as it fades in, and going back slides in from the left (`Slide`, on a `SMOOTH` spring), the way pages switch; each view keeps its own scroll position (`Pages::keep_settings_scroll` swaps the page's offset as the view changes, and a search counts as a view of its own), so a group opens at its top and home comes back where it was left. Rows are 50 points tall and painted on flat cards with hairline dividers (`pages/settings/rows.rs`).
 
-### General (`pages/settings/general.rs`)
+### Home (`pages/settings/home.rs`)
 
-The notch card:
+A 40-point **Search settings** field, then the tiles two to a row, 62 points tall. Each tile has its group's glyph, its name and a line on how things stand in it now (`Group::summary`):
 
-| Row | Control | Effect |
+| Tile | Second line | Opens |
 | --- | --- | --- |
-| **Volume indicator** | switch | replaces the system volume and media popups (`volume.indicator`). See [Volume and Media Keys](Volume-and-Media-Keys.md) |
-| **Brightness indicator** | switch | macOS only: replaces the system brightness popup (`brightness.indicator`). See [Volume and Media Keys](Volume-and-Media-Keys.md#brightness-keys) |
-| **All displays** | switch | shows an island on every screen (`displays.all`) |
-| **Wake at the top edge** | switch | the island only wakes once the pointer hits the top of the screen, so browser tabs under it stay clickable; a Mac's real notch only opens with the pointer on the notch itself (`notch.wake_at_edge`). See [Notch](Notch.md) |
-| **Move away for keys and clicks** | switch | the notch slides out from under the pointer while any key is held or a mouse press starts beside it; off, it stays put for both (`notch.flee_from_keys`). See [Notch](Notch.md) |
+| **Popups** | which popups the notch replaces ("Volume and brightness", "Volume only", "Off") | Volume indicator, and on a Mac Brightness indicator |
+| **Notch** | "4 of 6 on" | All displays, Wake at the top edge, Move away for keys and clicks, and on a Mac Make room for menus, Show on the lock screen and Haptics |
+| **Windows** | "Layouts on" or "Off" | Window layouts |
+| **Find** | "On · 1,204,311 items" or "Off" | Find files, Replace Spotlight (Replace the Start menu on Windows), What Find learned · Clear. See [Find](Find.md) |
+| **Assistant** | "Claude", "Claude · questions only", "ChatGPT · usage only", "Off" | [the Assistant view](#assistant-pagessettingsassistantrs) |
+| **Dock** | "On · bottom · 48 pt" or "Off" (macOS only) | [the Dock view](#dock-pagessettingsdockrs) |
+| **Tools** | "7 installed" | [the Tools view](#tools-pagessettingscatalogrs) |
+| **Indicators** | "5 installed" | the background tools, listed like Tools |
+| **Notifications** | what's waiting (the one notification's title, "2 unread" or "Nothing new"), with a red badge while something is unread | the [Notifications](#notifications-pagesnotificationsrs) page, not a Settings view |
+| **Permissions** | "What the notch can use" (macOS only) | the permissions walkthrough (`Action::ShowPermissions`) |
+| **notchbase** | the version and the update state ("0.34.0 · Up to date") | Install notchbase (only while running from somewhere else), Open at login, Automatic updates and What's New. See [Installing](Installing.md) and [Updates](Updates.md) |
 
-Then the app card. See [Installing](Installing.md) and [Updates](Updates.md):
+The last cell is **Quit**, which closes notchbase until you open it again (`Action::Quit`); with an even number of tiles it takes the whole last row. Every group view (`pages/settings/group.rs`) starts with a **‹ Settings** back button and the group's name, then its cards (`Block::Section`, `Block::Card`, `Block::Hint`, `Block::Nothing`). **What's New** ("See what changed in 0.34.0") is there whenever the running version has notes (`pages/settings/news.rs`); it sends `Action::ViewChanges`, and the app opens the [What's New](#whats-new-pageswhats_new) page on this notch.
 
-| Row | Control | Effect |
-| --- | --- | --- |
-| **Install notchbase** | row (only while running from somewhere else) | installs this copy as an app and relaunches it from there |
-| **Open at login** | switch | starts notchbase when you sign in |
-| **Automatic updates** | switch | installs new releases from GitHub when the notch is idle; the subtitle shows the version, download progress or the last problem (`updates.automatic`) |
+The notch rows (`pages/settings/notch.rs`):
 
-Then a card of rows that lead elsewhere:
+| Row | Effect |
+| --- | --- |
+| **Volume indicator** | replaces the system volume and media popups (`volume.indicator`). See [Volume and Media Keys](Volume-and-Media-Keys.md) |
+| **Brightness indicator** | macOS only: replaces the system brightness popup (`brightness.indicator`). See [Volume and Media Keys](Volume-and-Media-Keys.md#brightness-keys) |
+| **All displays** | shows an island on every screen (`displays.all`) |
+| **Wake at the top edge** | the island only wakes once the pointer hits the top of the screen, so browser tabs under it stay clickable; a Mac's real notch only opens with the pointer on the notch itself (`notch.wake_at_edge`). See [Notch](Notch.md) |
+| **Move away for keys and clicks** | the notch slides out from under the pointer while any key is held or a mouse press starts beside it (`notch.flee_from_keys`) |
+| **Make room for menus**, **Show on the lock screen**, **Haptics** | macOS only (`notch.dodge_menus`, `notch.lock_screen`, `notch.haptics`). See [Notch](Notch.md) |
+| **Window layouts** | drag a window to the notch to lay it out (`snap.enabled`) |
 
-- **Notifications**, whose subtitle sums up what's waiting (the one notification's title, such as "notchbase 0.5.0 is available", or "2 unread", or "Nothing new"). It opens the [Notifications](#notifications-pagesnotificationsrs) page,
-- **Assistant**, whose subtitle says what it's set to ("Claude · questions and progress", "ChatGPT · questions", "Claude · usage only", "Off"),
-- **Tools** ("7 installed · their settings and folders"). Tool settings live there, one page per tool, so the main Settings page stays short,
-- **Indicators** ("Battery, camera, downloads and other notices"), the same list for the background tools,
-- **What's New** ("See what changed in 0.14.0"), there whenever the running version has notes (`pages/settings/general/news.rs`). It doesn't open a Settings view: it sends `Action::ViewChanges`, and the app opens the [What's New](#whats-new-pageswhats_new) page on this notch.
+### Search (`pages/settings/search.rs`)
 
-Last, **Quit notchbase**, a plain centered text button that closes notchbase until you open it again (`Action::Quit`).
+Clicking the field gives it the keyboard. Typing replaces the tiles with every setting that has each typed word somewhere in its title, its detail, its group's (or tool's) name, or the other words it is known by (each row's `words`, such as "monitors screens external" for All displays). Those whose title starts with the first word come first, then those with a word in the title that starts with it, then those whose title holds it, then the rest (`search::rank`). Each tool's own visible settings are searched too, under the tool's name, so "copy" finds the Screenshot tool's setting.
+
+Under the field, chips narrow the results to one group: **All N**, then one chip for each group that has a match, as many as fit on the line. A picked chip is white. Typing a different search drops it. The results are the real rows, painted the way their own view paints them (`Item::paint`), so a switch in the results flips the setting, a stepper steps and a cog opens the tool. While a row is painted as a result it is "spotted" (`search::set_spot`): its detail starts with where it lives ("Notch › Show an island on every screen") and the run that matched the first word is lit behind it (`list::Lit`). With nothing found, one row says "No settings match “zzzz”".
+
+The × in the field and the first Esc empty the search and bring the tiles back; the second Esc, or Enter, lets the keyboard go. Leaving the page forgets the search.
+
+The `settings-search` preview shows a search for "screen" (see [Previews](Previews.md)).
 
 ### Assistant (`pages/settings/assistant.rs`)
 
@@ -227,7 +239,7 @@ The `assistant-settings` preview opens this view directly (see [Previews](Previe
 
 ### Dock (`pages/settings/dock.rs`)
 
-macOS only, from the **Dock** row of General. It shows [notchbase dock](../dock/README.md)'s settings. A **‹ Settings** back button, then a card with the **notchbase dock** switch and a **Permissions** row. While the dock is off, the switch row sums it up ("Liquid animations, live previews and its own Cmd+Tab") and the Permissions row says macOS will ask for Accessibility and Screen Recording next, so the reason comes before the system dialogs. The switch starts or quits the dock and sets `dock.enabled` (see [Configuration](Configuration.md#dock)). Four groups follow, each written straight to the dock's `dock.json`, which the running dock takes within half a second:
+macOS only, from the **Dock** tile. It shows [notchbase dock](../dock/README.md)'s settings. A **‹ Settings** back button, then a card with the **notchbase dock** switch and a **Permissions** row. While the dock is off, the switch row sums it up ("Liquid animations, live previews and its own Cmd+Tab") and the Permissions row says macOS will ask for Accessibility and Screen Recording next, so the reason comes before the system dialogs. The switch starts or quits the dock and sets `dock.enabled` (see [Configuration](Configuration.md#dock)). Four groups follow, each written straight to the dock's `dock.json`, which the running dock takes within half a second:
 
 | Group | Rows |
 | --- | --- |
@@ -240,7 +252,7 @@ The rows stay greyed out until the dock has run once and written its file. The o
 
 ### A tool's settings (`pages/settings/tool.rs`)
 
-Opened from the cog beside a tool in the Tools view, or straight from a tool with `Command::open_settings` (the Calendar's **Open Settings** does this). It has a **‹ Tools** back button, the tool's name, and a row for each setting its manifest declares as visible. Like the rest of Settings, the notch stays open while it's showing, so a long address can be pasted from elsewhere:
+Opened from the cog beside a tool in the Tools or Indicators view, from a search result, or straight from a tool with `Command::open_settings` (the Calendar's **Open Settings** does this). It has a **‹ Tools** (or **‹ Indicators**) back button, the tool's name, and a row for each setting its manifest declares as visible. Like the rest of Settings, the notch stays open while it's showing, so a long address can be pasted from elsewhere:
 
 | Setting kind | Control |
 | --- | --- |

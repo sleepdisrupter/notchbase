@@ -173,6 +173,10 @@ impl Pages {
         self.settings.show_dock();
     }
 
+    pub(in crate::notch) fn search_settings(&mut self, query: &str) {
+        self.settings.search_for(query);
+    }
+
     pub(in crate::notch) fn unfold_mixer(&mut self) {
         self.media.unfold_mixer();
     }

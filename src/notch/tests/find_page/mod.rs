@@ -359,6 +359,9 @@ fn settings_card_offers_find_and_clear() {
     rig.find = FindView { state: FindState::Ready, entries: 1_452_310, ..FindView::default() };
     n.open_page(Page::Settings);
     frames(&rig, &mut n, SETTLING_FRAMES);
+    let tile = rig.ctx.read_response(egui::Id::new(("notchbase.settings.tile", "Find"))).expect("the Find tile");
+    click(&rig, &mut n, tile.rect.center());
+    frames(&rig, &mut n, SETTLING_FRAMES);
     let painted = words(&rig, &mut n);
     for row in ["Find files", "1,452,310 items", "What Find learned", "Clear"] {
         assert!(painted.iter().any(|word| word == row), "{row} in {painted:?}");

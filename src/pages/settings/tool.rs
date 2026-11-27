@@ -3,8 +3,8 @@
 use egui::{Rect, vec2};
 
 use super::editing::Editing;
-use super::general::{shown, tool_setting};
 use super::rows::{BACK_H, INSET, ROW_H, Row, SECTION_H, back, card, card_of, paint_lines, section};
+use super::setting::{shown, tool_setting};
 use crate::bridge::{Action, ToolView};
 use crate::pages::PageCtx;
 use crate::ui::color::secondary_label;

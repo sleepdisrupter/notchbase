@@ -14,7 +14,7 @@ Find is the file locator in the open panel: a magnifier button mirrored against 
 - **System Settings.** On macOS every pane of System Settings is listed like an app, under the name the system shows (`wifi` finds **Wi-Fi**, `blue` **Bluetooth**, `dock` **Desktop & Dock**), and Enter opens that pane.
 - **Where the pointer is.** With notchbase on every display, the system's search key opens Find on the display the pointer is on. One row stands out: the selected row is full size on a glass band with its folder, date and buttons, the others are smaller, dimmer and show only their names.
 - **Rows.** Click opens, drag drags the file out, and the two buttons on a hovered or selected row reveal it or add it to the Shelf. An app row shows the app's name without its ending, its own icon, "App" where a file shows its folder, and no date; Enter or a click launches it, and reveal, drag and the Shelf act on the shortcut or the bundle like on any file. On Windows an app row has a third button, a shield, that runs it as administrator, and its right-click menu has **Run as administrator** too. Declining the UAC prompt does nothing more.
-- **Settings.** Three rows in Settings › General: **Find files** (the on/off switch, with the item count), **Replace Spotlight** / **Replace the Start menu** (the system's search key, off by default) and **What Find learned · Clear**. Everything else is in [`config.json`](Configuration.md#find).
+- **Settings.** Three rows behind the **Find** tile in Settings: **Find files** (the on/off switch, with the item count), **Replace Spotlight** / **Replace the Start menu** (the system's search key, off by default) and **What Find learned · Clear**. Everything else is in [`config.json`](Configuration.md#find).
 
 ## How it works
 

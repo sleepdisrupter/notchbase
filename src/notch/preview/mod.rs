@@ -30,6 +30,7 @@ use super::{Mode, Notch};
 pub const SAMPLE_IMAGE: ImageId = ImageId(0);
 const SAMPLE_COLOR: Color = Color::rgb(0x3A, 0x7B, 0xFF);
 const SAMPLE_SLOT: ToolSlot = ToolSlot(0);
+const SAMPLE_SETTINGS_SEARCH: &str = "screen";
 const SAMPLE_MESSAGE: &str = "Allow Screen Recording for notchbase in System Settings";
 const SAMPLE_SHOT: [u32; 2] = [2560, 1600];
 const SAMPLE_SHOT_CONTROL: &str = "Annotate";
@@ -91,6 +92,7 @@ pub(super) enum Preview {
     Shelf,
     Drop,
     Settings,
+    SettingsSearch,
     Notifications,
     AssistantSettings,
     DockSettings,
@@ -196,6 +198,7 @@ impl Preview {
             "video-sides" => Self::VideoSides,
             "video-panel" => Self::VideoPanel,
             "settings" => Self::Settings,
+            "settings-search" | "search-settings" => Self::SettingsSearch,
             "notifications" | "update" => Self::Notifications,
             "assistant-settings" | "assistant" => Self::AssistantSettings,
             "dock-settings" | "dock" => Self::DockSettings,
@@ -346,6 +349,10 @@ impl Notch {
                 self.pin_page(Page::Tools);
             }
             Preview::Settings => self.pin_page(Page::Settings),
+            Preview::SettingsSearch => {
+                self.pin_page(Page::Settings);
+                self.pages.search_settings(SAMPLE_SETTINGS_SEARCH);
+            }
             Preview::Notifications => self.pin_page(Page::Notifications),
             Preview::AssistantSettings => {
                 self.pin_page(Page::Settings);

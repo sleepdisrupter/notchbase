@@ -2,6 +2,7 @@
 
 use egui::{Align2, Color32, Id, Rect, Sense, pos2, vec2};
 
+use super::search;
 use crate::pages::PageCtx;
 use crate::ui::canvas::{Canvas, fade};
 use crate::ui::color::{label, secondary_label};
@@ -24,7 +25,6 @@ const STEP_VALUE_W: f32 = 58.0;
 pub(super) const PILL_H: f32 = 24.0;
 const PILL_PAD: f32 = 12.0;
 const CHEVRON: f32 = 10.0;
-const TEXT_BUTTON_PAD: f32 = 12.0;
 const UNAVAILABLE: f32 = 0.45;
 pub(super) const CHOICE: egui::Vec2 = vec2(186.0, 24.0);
 
@@ -55,12 +55,23 @@ pub(in crate::pages) fn section(ctx: &mut PageCtx<'_>, top: f32, title: &str) ->
     header
 }
 
+/// A row's two lines. Painted as a search result, its detail starts with where it lives and the match is lit.
+fn spotted_lines<R>(ctx: &mut PageCtx<'_>, row: &Row, paint: impl FnOnce(&mut PageCtx<'_>, Lines<'_>) -> R) -> R {
+    let Some(spot) = search::spot(ctx.ui) else { return paint(ctx, Lines::new(row.title, row.detail)) };
+    let detail = search::crumbed(&spot.crumb, row.detail);
+    let lit = search::lit(&spot.query, row.title, &detail);
+    paint(ctx, Lines::new(row.title, &detail).lit(lit))
+}
+
 pub(super) fn toggled(ctx: &mut PageCtx<'_>, row: &Row, toggle: &Toggle) -> bool {
-    let lines = Lines::new(row.title, row.detail);
+    spotted_lines(ctx, row, |ctx, lines| toggled_with(ctx, row, toggle, &lines))
+}
+
+fn toggled_with(ctx: &mut PageCtx<'_>, row: &Row, toggle: &Toggle, lines: &Lines<'_>) -> bool {
     let unavailable = !toggle.enabled && ctx.alpha > INTERACTIVE_FROM;
     let dim = controls::animate(ctx.ui, toggle.id.with("unavailable"), unavailable);
     let mark = ctx.canvas.mark();
-    let flipped = list::switch_row(ctx.ui, ctx.canvas, row.rect, toggle.id, &lines, toggle.on, toggle.enabled);
+    let flipped = list::switch_row(ctx.ui, ctx.canvas, row.rect, toggle.id, lines, toggle.on, toggle.enabled);
     if dim > 0.0 {
         for shape in ctx.canvas.since(mark) {
             fade(shape, 1.0 - (1.0 - UNAVAILABLE) * dim);
@@ -78,8 +89,10 @@ pub(super) fn paint_text(ctx: &mut PageCtx<'_>, row: &Row, control_left: f32) {
 
 pub(super) fn paint_lines(ctx: &mut PageCtx<'_>, row: &Row, control_left: f32, detail_tone: Color32, path: bool) {
     let cut = if path { Cut::Start } else { Cut::End };
-    let lines = Lines::new(row.title, row.detail).tone(detail_tone).cut(cut);
-    list::two_lines(ctx.canvas, row.rect.left() + INSET, control_left - TEXT_GAP, row.rect.center().y, &lines);
+    spotted_lines(ctx, row, |ctx, lines| {
+        let lines = lines.tone(detail_tone).cut(cut);
+        list::two_lines(ctx.canvas, row.rect.left() + INSET, control_left - TEXT_GAP, row.rect.center().y, &lines);
+    });
 }
 
 pub(super) fn stepper(
@@ -163,18 +176,6 @@ pub(in crate::pages) fn back(ctx: &mut PageCtx<'_>, top: f32, to: &str, live: bo
     glyph::paint(ctx.canvas, Glyph::ChevronLeft, glyph_at, BACK_GLYPH, tint);
     let text_at = pos2(glyph_at.x + BACK_GLYPH * 0.5 + 4.0, rect.center().y);
     ctx.canvas.text(text_at, Align2::LEFT_CENTER, to, font, tint);
-    live && response.clicked()
-}
-
-pub(super) fn text_button(ctx: &mut PageCtx<'_>, top: f32, height: f32, id: Id, text: &str, live: bool) -> bool {
-    let font = font::callout();
-    let width = ctx.canvas.text_width(text, font.clone()) + 2.0 * TEXT_BUTTON_PAD;
-    let rect = Rect::from_center_size(pos2(ctx.rect.center().x, top + height * 0.5), vec2(width, height));
-    let response = ctx.ui.interact(rect, id, if live { Sense::click() } else { Sense::hover() });
-    let hover = controls::animate(ctx.ui, id.with("hover"), live && response.hovered());
-    controls::row_highlight(ctx.canvas, rect, hover);
-    let tint = crate::ui::color::mix(secondary_label(), label(), hover);
-    ctx.canvas.text(rect.center(), Align2::CENTER_CENTER, text, font, tint);
     live && response.clicked()
 }
 

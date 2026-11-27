@@ -215,16 +215,16 @@ All durations are in milliseconds.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `notch.open_on_hover` | `true` | Open the notch when the pointer rests on it. Off, it opens on a click instead: resting on the drawn-out island lets it take the click, and moving away without clicking hands clicks back to what's underneath |
-| `notch.wake_at_edge` | `true` | An island (and a docked song or activity) ignores the pointer until it reaches the thin strip above the browser tabs: the top 7 points of the screen within 16 points of it, or the top 4 points anywhere near it. Tab close and new-tab buttons under it never wake it. Once awake it follows the pointer until it moves away. On a Mac's real notch it instead means the notch only opens while the pointer is on the notch itself, not beside or just below it. **Settings › Wake at the top edge** |
-| `notch.haptics` | `true` | A light trackpad tap as the panel or an ear opens, as switches flip and as a picker wheel rolls (Mac). **Settings › Haptics** |
-| `notch.dodge_menus` | `true` | On a MacBook, slide the notch's left side away when the frontmost app's menus reach it, and back when they don't (needs Accessibility). **Settings › Make room for menus**. See [Notch](Notch.md#making-room-for-menus-notchmovesdodgers) |
-| `notch.lock_screen` | `true` | Keep the notch on the Mac's lock screen (with nothing in it clickable) and show a padlock that opens as you unlock. Off takes effect at the next start. **Settings › Show on the lock screen**. See [Notch](Notch.md#the-lock-screen) |
+| `notch.wake_at_edge` | `true` | An island (and a docked song or activity) ignores the pointer until it reaches the thin strip above the browser tabs: the top 7 points of the screen within 16 points of it, or the top 4 points anywhere near it. Tab close and new-tab buttons under it never wake it. Once awake it follows the pointer until it moves away. On a Mac's real notch it instead means the notch only opens while the pointer is on the notch itself, not beside or just below it. **Settings › Notch › Wake at the top edge** |
+| `notch.haptics` | `true` | A light trackpad tap as the panel or an ear opens, as switches flip and as a picker wheel rolls (Mac). **Settings › Notch › Haptics** |
+| `notch.dodge_menus` | `true` | On a MacBook, slide the notch's left side away when the frontmost app's menus reach it, and back when they don't (needs Accessibility). **Settings › Notch › Make room for menus**. See [Notch](Notch.md#making-room-for-menus-notchmovesdodgers) |
+| `notch.lock_screen` | `true` | Keep the notch on the Mac's lock screen (with nothing in it clickable) and show a padlock that opens as you unlock. Off takes effect at the next start. **Settings › Notch › Show on the lock screen**. See [Notch](Notch.md#the-lock-screen) |
 | `permissions.full_disk_asked` | `false` | Set once notchbase has asked for Full Disk Access to see your Focus, so it never asks again |
 | `permissions.find_disk_asked` | `false` | Set once Find has asked for Full Disk Access (one notch message and one Notifications entry), so it never asks again |
 | `permissions.find_access_hidden` | `false` | Set when the "See every file" row at the top of Find was dismissed |
 | `permissions.walkthrough` | `"pending"` | `"done"` once the first-launch walkthrough is finished. While `"pending"` the notch opens on it and nothing in the background asks for a permission. Configs older than version 6 are upgraded to `"done"` (see [Platform: macOS](Platform-macOS.md#the-first-launch-walkthrough)) |
 | `permissions.asked` | `[]` | The permissions the walkthrough has put to you (`accessibility`, `bluetooth`, `calendar`, `downloads`, `automation`, `system_audio`, `screen_recording`, `full_disk`). Background features never ask for these again; **Settings → Permissions** still can |
-| `notch.flee_from_keys` | `true` | Holding any key, or starting a mouse press, with the pointer near the notch makes it slide out from under the pointer. Off, it stays where it is for both. **Settings › Move away for keys and clicks** |
+| `notch.flee_from_keys` | `true` | Holding any key, or starting a mouse press, with the pointer near the notch makes it slide out from under the pointer. Off, it stays where it is for both. **Settings › Notch › Move away for keys and clicks** |
 | `notch.hover_delay_ms` | `120` | How long the pointer rests on a peek before the notch starts straining outward; the notch opens 380 ms after that. A config.json from before version 2 that still had the old default of 300 moves to 120 once; any other value is kept. The pointer has to stay within 12 points for the whole hold |
 | `notch.close_delay_ms` | `220` | How long after the pointer leaves before the notch closes |
 | `notch.start_page` | `"tools"` | The tab the notch opens on: a tab's key (`media`, `tools`, `shelf`, `sound`, `stats`, or a tool with a header tab such as `calendar`). If that tab isn't shown, it opens on Tools, or else the first tab; `sound` without a Sound tab opens Media, which holds the mixer |
@@ -266,7 +266,7 @@ Tool notices set their own duration in code (see [Surfaces](tools/Surfaces.md#no
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `brightness.indicator` | `true` | macOS only. Show brightness key presses in the notch, in place of the system's brightness pop-up. **Settings › Brightness indicator**. Elsewhere it does nothing |
+| `brightness.indicator` | `true` | macOS only. Show brightness key presses in the notch, in place of the system's brightness pop-up. **Settings › Popups › Brightness indicator**. Elsewhere it does nothing |
 
 ### bluetooth
 
@@ -348,15 +348,15 @@ An edit here is used by the next annotator window that opens; one that is alread
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `find.enabled` | `true` | Index every file and folder on local volumes and search them from the Find button. Off stops the scan, the watcher and every write; the page shows "Find is off". The same switch as **Settings › Find files** |
+| `find.enabled` | `true` | Index every file and folder on local volumes and search them from the Find button. Off stops the scan, the watcher and every write; the page shows "Find is off". The same switch as **Settings › Find › Find files** |
 | `find.excluded` | `[]` | Left out of the index. An entry with a separator or starting with `~` is a path (`"~/Movies/Raw"`, `"D:\\Backups"`); a bare word is a folder name left out wherever it appears (`"node_modules"`). Adding one removes what was indexed and learned below it at once |
 | `find.volumes` | `true` | Also index other local mounted volumes (never network shares). Fixed drives on Windows |
 | `find.max_entries` | `0` | `0` sizes the index from memory (about 6.7 million entries on 16 GB). A number overrides it, up to 50 million. Past the limit Find drops caches first, then build folders, then other volumes, then system folders, never your own files |
-| `find.learn` | `true` | Learn what you open for what you type, to rank and suggest. Off deletes `usage.bin` and stops learning. **Settings › What Find learned › Clear** empties it without turning it off |
+| `find.learn` | `true` | Learn what you open for what you type, to rank and suggest. Off deletes `usage.bin` and stops learning. **Settings › Find › What Find learned › Clear** empties it without turning it off |
 | `find.recents` | `true` | macOS: read the files you opened recently from Spotlight to start learning before your first search |
 | `find.hidden` | `false` | List hidden files and everything that is not yours (system, build and cache files, the contents of hidden folders and packages) together with your own. Off, Find lists a hidden file only when nothing of yours matches, when its name is typed with its leading dot, or when you picked it before; what is not yours only for a path or once you picked it |
 | `find.pins` | `[]` | What is pinned under the resting bar of Find, at most four, in order. Each entry has `path`, `name` (the name it showed when it was pinned), `app` and `folder`. Changed from the right-click menu of a result and by dragging the pins |
-| `find.system_key` | `true` | Open Find with the key of the system's own search: ⌘Space on macOS (needs Accessibility access), a lone Windows key on Windows. Spotlight or the Start menu no longer opens on that key. The same switch as **Settings › Replace Spotlight** / **Replace the Start menu** |
+| `find.system_key` | `true` | Open Find with the key of the system's own search: ⌘Space on macOS (needs Accessibility access), a lone Windows key on Windows. Spotlight or the Start menu no longer opens on that key. The same switch as **Settings › Find › Replace Spotlight** / **Replace the Start menu** |
 
 Edits here apply while notchbase runs. See [Find](Find.md).
 

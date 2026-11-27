@@ -92,7 +92,7 @@ fn divider_is_inset_on_row_bottom() {
 #[test]
 fn lines_default_to_secondary_end_cut() {
     let lines = Lines::new("Title", "Detail");
-    assert_eq!(lines, Lines { title: "Title", detail: "Detail", tone: secondary_label(), cut: Cut::End });
+    assert_eq!(lines, Lines { title: "Title", detail: "Detail", tone: secondary_label(), cut: Cut::End, lit: None });
     let changed = lines.tone(Color32::RED).cut(Cut::Start);
     assert_eq!((changed.tone, changed.cut, changed.title), (Color32::RED, Cut::Start, "Title"));
     assert_eq!(Cut::default(), Cut::End);
@@ -159,4 +159,44 @@ fn switch_row_layout() {
         assert!(canvas.text_width(drawn[1].0.as_str(), font::caption()) <= room);
     });
     output.textures_delta.clear();
+}
+
+fn bands(canvas: &Canvas) -> Vec<Rect> {
+    canvas
+        .shapes
+        .iter()
+        .filter_map(|shape| match shape {
+            Shape::Rect(rect) if rect.fill == white(LIT_ALPHA) => Some(rect.rect),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn lit_run_gets_band_behind_it() {
+    with_text(|canvas| {
+        let lines = Lines::new("Show on the lock screen", "Stays visible").lit(Some(Lit::Title(17, 23)));
+        two_lines(canvas, 20.0, 300.0, 100.0, &lines);
+        let band = bands(canvas);
+        assert_eq!(band.len(), 1);
+        let before = canvas.text_width("Show on the lock x", font::body()) - canvas.text_width("x", font::body());
+        assert!((band[0].left() - (20.0 + before - LIT_PAD)).abs() < 0.01, "{band:?}");
+        assert!(band[0].center().y < 100.0, "on the title line");
+        let index = canvas.shapes.iter().position(|shape| matches!(shape, Shape::Text(_))).unwrap();
+        let band_at = canvas.shapes.iter().position(|shape| matches!(shape, Shape::Rect(_))).unwrap();
+        assert!(band_at < index, "the band sits behind the words");
+    });
+}
+
+#[test]
+fn cut_run_gets_no_band() {
+    with_text(|canvas| {
+        let detail = "The edge of the screen it stands on";
+        let lines = Lines::new("Position", detail).lit(Some(Lit::Detail(16, 22)));
+        two_lines(canvas, 0.0, 70.0, 50.0, &lines);
+        assert!(bands(canvas).is_empty(), "the run was cut away");
+        two_lines(canvas, 0.0, 400.0, 50.0, &lines);
+        assert_eq!(bands(canvas).len(), 1);
+        assert!(bands(canvas)[0].center().y > 50.0, "on the detail line");
+    });
 }

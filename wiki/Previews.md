@@ -56,7 +56,8 @@ This makes previews safe to run next to your real notchbase.
 | `stats-disk` (or `storage`) | the Stats page with the Disk gauge chosen and a sample storage view: seven parts with a few items each on a 494 GB disk |
 | `stats-history` (or `usage-history`) | the Stats page with a heavier sample week: two days at 100%, one day without samples, "Hit the limit 2 days" |
 | `shelf` | the open panel on the Shelf page |
-| `settings` | the open panel on the Settings page |
+| `settings` | the open panel on the Settings page: the search field and the tiles |
+| `settings-search` (or `search-settings`) | the open panel on the Settings page searching for "screen": the chips and the results, each with where it lives and the match lit |
 | `notifications` (or `update`) | the open panel on the Notifications page with one sample unread update, "notchbase 0.5.0 is available" with **Update Now**, and the blue dot on the gear |
 | `assistant-settings` (or `assistant`) | the open panel on the Settings page's Assistant view: the Claude / ChatGPT / Off choice and the two switches |
 | `catalog` (or `installed-tools`) | the open panel on the Settings page's Tools view: folders, the installed tools and their switches |

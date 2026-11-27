@@ -230,6 +230,7 @@ mod tests {
                 Preview::Device,
                 Preview::DeviceGone,
                 Preview::Settings,
+                Preview::SettingsSearch,
                 Preview::Notifications,
                 Preview::AssistantSettings,
                 Preview::DockSettings,

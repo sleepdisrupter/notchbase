@@ -1,10 +1,11 @@
-//! The Find rows: the switch, what the index holds, the system key and clearing what Find has learned.
+//! The Find view's rows: the switch, what the index holds, the system key and clearing what Find has learned.
 
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Id, Rect, Sense, pos2, vec2};
 
-use super::super::rows::{INSET, PILL_H, Row, Toggle, paint_text, pill_width, toggled};
+use super::rows::{INSET, PILL_H, Row, Toggle, paint_text, pill_width, toggled};
+use super::search::Said;
 use crate::bridge::{Action, FindState, FindView, SystemKey};
 use crate::pages::PageCtx;
 use crate::ui::color::{GREEN, label};
@@ -12,7 +13,6 @@ use crate::ui::glass::{self, Glass};
 use crate::ui::glyph::{self, Glyph};
 use crate::ui::{controls, font};
 
-pub(super) const ROWS: usize = 3;
 const CONFIRMED_FOR: Duration = Duration::from_millis(1200);
 const CHECK: f32 = 11.0;
 const GROUP: usize = 3;
@@ -39,28 +39,54 @@ const KEY_DETAIL: &str = "The Windows key opens Find instead";
 #[cfg(not(target_os = "macos"))]
 const KEY_BLOCKED: &str = "Couldn't watch the Windows key";
 
-pub(super) fn rows(
-    ctx: &mut PageCtx<'_>,
-    [find, key, learned]: [Rect; ROWS],
-    view: &FindView,
-    live: bool,
-    actions: &mut Vec<Action>,
-) {
-    let on = view.state != FindState::Off;
-    let row = Row { rect: find, title: FIND_TITLE, detail: &detail(view) };
-    if toggled(ctx, &row, &Toggle { id: Id::new("notchbase.settings.find"), on, enabled: live }) {
-        actions.push(Action::SetFindEnabled(!on));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FindRow {
+    Files,
+    Key,
+    Learned,
+}
+
+pub(super) const ROWS: &[FindRow] = &[FindRow::Files, FindRow::Key, FindRow::Learned];
+
+impl FindRow {
+    pub(super) fn said(self, view: &FindView) -> Said {
+        let (title, detail, words) = match self {
+            FindRow::Files => (FIND_TITLE, detail(view), "search index spotlight files folders"),
+            FindRow::Key => (KEY_TITLE, key_detail(view.system_key).to_owned(), "shortcut keyboard spotlight start"),
+            FindRow::Learned => (LEARNED_TITLE, LEARNED_DETAIL.to_owned(), "history forget clear reset privacy"),
+        };
+        Said { title: title.to_owned(), detail, words }
     }
-    let taken = view.system_key != SystemKey::Off;
-    let row = Row { rect: key, title: KEY_TITLE, detail: key_detail(view.system_key) };
-    if toggled(ctx, &row, &Toggle { id: Id::new("notchbase.settings.find.key"), on: taken, enabled: live }) {
-        actions.push(Action::SetFindSystemKey(!taken));
+
+    pub(super) fn paint(self, ctx: &mut PageCtx<'_>, rect: Rect, view: &FindView, live: bool) -> Option<Action> {
+        match self {
+            FindRow::Files => {
+                let on = view.state != FindState::Off;
+                let row = Row { rect, title: FIND_TITLE, detail: &detail(view) };
+                let toggle = Toggle { id: Id::new("notchbase.settings.find"), on, enabled: live };
+                toggled(ctx, &row, &toggle).then_some(Action::SetFindEnabled(!on))
+            }
+            FindRow::Key => {
+                let taken = view.system_key != SystemKey::Off;
+                let row = Row { rect, title: KEY_TITLE, detail: key_detail(view.system_key) };
+                let toggle = Toggle { id: Id::new("notchbase.settings.find.key"), on: taken, enabled: live };
+                toggled(ctx, &row, &toggle).then_some(Action::SetFindSystemKey(!taken))
+            }
+            FindRow::Learned => {
+                let id = Id::new("notchbase.settings.find.learned");
+                let (clear, cleared) = clear_pill(ctx, rect.right() - INSET, rect.center().y, id, live);
+                paint_text(ctx, &Row { rect, title: LEARNED_TITLE, detail: LEARNED_DETAIL }, clear.left());
+                cleared.then_some(Action::FindForget)
+            }
+        }
     }
-    let id = Id::new("notchbase.settings.find.learned");
-    let (clear, cleared) = clear_pill(ctx, learned.right() - INSET, learned.center().y, id, live);
-    paint_text(ctx, &Row { rect: learned, title: LEARNED_TITLE, detail: LEARNED_DETAIL }, clear.left());
-    if cleared {
-        actions.push(Action::FindForget);
+}
+
+/// The tile's line: off, or how many items the index holds.
+pub(super) fn summary(view: &FindView) -> String {
+    match view.state {
+        FindState::Off => "Off".to_owned(),
+        _ => format!("On \u{b7} {}", detail(view).to_lowercase()),
     }
 }
 
@@ -134,9 +160,7 @@ mod tests {
         let rects = [row(0.0), row(1.0), row(2.0)];
         let frame = |harness: &mut Harness, events| {
             harness.frame(events, |ctx| {
-                let mut actions = Vec::new();
-                rows(ctx, rects, &view, true, &mut actions);
-                actions
+                ROWS.iter().zip(rects).filter_map(|(each, rect)| each.paint(ctx, rect, &view, true)).collect::<Vec<_>>()
             })
         };
         frame(&mut harness, Vec::new());
@@ -171,6 +195,13 @@ mod tests {
         assert_eq!(detail(&empty), STARTING_DETAIL);
         let ready = FindView { state: FindState::Ready, entries: 1_452_310, ..FindView::default() };
         assert_eq!(detail(&ready), "1,452,310 items");
+    }
+
+    #[test]
+    fn tile_says_on_or_off() {
+        assert_eq!(summary(&FindView::default()), "Off");
+        let ready = FindView { state: FindState::Ready, entries: 1_452_310, ..FindView::default() };
+        assert_eq!(summary(&ready), "On \u{b7} 1,452,310 items");
     }
 
     #[test]

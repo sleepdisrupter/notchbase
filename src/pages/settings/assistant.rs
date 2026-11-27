@@ -2,66 +2,72 @@
 
 use egui::{Id, Rect, pos2};
 
-use super::rows::{BACK_H, CHOICE, INSET, ROW_H, Row, Toggle, back, card, paint_text, toggled};
+use super::rows::{CHOICE, INSET, Row, Toggle, paint_text, toggled};
+use super::search::Said;
 use crate::assistant::Provider;
 use crate::bridge::{Action, PanelData};
 use crate::pages::PageCtx;
-use crate::ui::metrics::GAP;
 use crate::ui::segmented::segmented;
 
-const ROWS: usize = 3;
 const OFF: &str = "Off";
+const CHOICE_TITLE: &str = "Assistant";
+const CHOICE_DETAIL: &str = "Usage and questions";
 const QUESTIONS: &str = "Questions in the notch";
 const PROGRESS: &str = "Progress in the notch";
 
-pub(super) enum Outcome {
-    Stay,
-    Back,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AssistantRow {
+    Choice,
+    Questions,
+    Progress,
 }
 
-pub(super) fn height() -> f32 {
-    BACK_H + GAP + ROWS as f32 * ROW_H
-}
+pub(super) const ROWS: &[AssistantRow] = &[AssistantRow::Choice, AssistantRow::Questions, AssistantRow::Progress];
 
-pub(super) fn ui(ctx: &mut PageCtx<'_>, data: &PanelData, actions: &mut Vec<Action>) -> Outcome {
-    let live = ctx.alpha > super::rows::INTERACTIVE_FROM;
-    let mut top = ctx.rect.top();
-    let back = back(ctx, top, "Settings", live);
-    top += BACK_H + GAP;
-    let rows = card(ctx, top, ROWS);
-    let [choice, questions, progress] = rows[..] else { return Outcome::Stay };
-    actions.extend(assistant_choice(ctx, choice, data.assistant, live));
-
-    let has_assistant = data.assistant.is_some();
-    let row = Row { rect: questions, title: QUESTIONS, detail: questions_detail(data.assistant) };
-    let on = data.questions_in_notch && has_assistant;
-    let toggle = Toggle { id: Id::new("notchbase.settings.questions"), on, enabled: live && has_assistant };
-    if toggled(ctx, &row, &toggle) {
-        actions.push(Action::SetQuestionsInNotch(!data.questions_in_notch));
+impl AssistantRow {
+    pub(super) fn said(self, data: &PanelData) -> Said {
+        let (title, detail, words) = match self {
+            AssistantRow::Choice => (CHOICE_TITLE, CHOICE_DETAIL, "claude codex chatgpt ai agent usage"),
+            AssistantRow::Questions => (QUESTIONS, questions_detail(data.assistant), "claude codex prompts permission"),
+            AssistantRow::Progress => (PROGRESS, progress_detail(data.assistant), "claude codex working done"),
+        };
+        Said { title: title.to_owned(), detail: detail.to_owned(), words }
     }
 
-    let row = Row { rect: progress, title: PROGRESS, detail: progress_detail(data.assistant) };
-    let on = data.progress_in_notch && has_assistant;
-    let toggle = Toggle { id: Id::new("notchbase.settings.progress"), on, enabled: live && has_assistant };
-    if toggled(ctx, &row, &toggle) {
-        actions.push(Action::SetProgressInNotch(!data.progress_in_notch));
+    pub(super) fn paint(self, ctx: &mut PageCtx<'_>, rect: Rect, data: &PanelData, live: bool) -> Option<Action> {
+        let has_assistant = data.assistant.is_some();
+        match self {
+            AssistantRow::Choice => assistant_choice(ctx, rect, data.assistant, live),
+            AssistantRow::Questions => {
+                let row = Row { rect, title: QUESTIONS, detail: questions_detail(data.assistant) };
+                let on = data.questions_in_notch && has_assistant;
+                let toggle = Toggle { id: Id::new("notchbase.settings.questions"), on, enabled: live && has_assistant };
+                toggled(ctx, &row, &toggle).then_some(Action::SetQuestionsInNotch(!data.questions_in_notch))
+            }
+            AssistantRow::Progress => {
+                let row = Row { rect, title: PROGRESS, detail: progress_detail(data.assistant) };
+                let on = data.progress_in_notch && has_assistant;
+                let toggle = Toggle { id: Id::new("notchbase.settings.progress"), on, enabled: live && has_assistant };
+                toggled(ctx, &row, &toggle).then_some(Action::SetProgressInNotch(!data.progress_in_notch))
+            }
+        }
     }
-    if back { Outcome::Back } else { Outcome::Stay }
 }
 
+/// The tile's line: the assistant, and what of it shows when not everything does.
 pub(super) fn summary(assistant: Option<Provider>, questions: bool, progress: bool) -> String {
     let Some(provider) = assistant else { return OFF.to_owned() };
     let shows = match (questions, progress) {
-        (true, true) => "questions and progress",
-        (true, false) => "questions",
-        (false, true) => "progress",
+        (true, true) => return provider.title().to_owned(),
+        (true, false) => "questions only",
+        (false, true) => "progress only",
         (false, false) => "usage only",
     };
     format!("{} \u{b7} {shows}", provider.title())
 }
 
 fn assistant_choice(ctx: &mut PageCtx<'_>, rect: Rect, current: Option<Provider>, live: bool) -> Option<Action> {
-    let row = Row { rect, title: "Assistant", detail: "Usage and questions" };
+    let row = Row { rect, title: CHOICE_TITLE, detail: CHOICE_DETAIL };
     let choice = Rect::from_center_size(pos2(rect.right() - INSET - CHOICE.x * 0.5, rect.center().y), CHOICE);
     paint_text(ctx, &row, choice.left());
     let choices = assistant_choices();
@@ -96,16 +102,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nav_row_says_what_it_does() {
-        assert_eq!(summary(Some(Provider::Claude), true, true), "Claude \u{b7} questions and progress");
-        assert_eq!(summary(Some(Provider::Codex), true, false), "ChatGPT \u{b7} questions");
-        assert_eq!(summary(Some(Provider::Claude), false, true), "Claude \u{b7} progress");
+    fn tile_says_what_shows() {
+        assert_eq!(summary(Some(Provider::Claude), true, true), "Claude");
+        assert_eq!(summary(Some(Provider::Codex), true, false), "ChatGPT \u{b7} questions only");
+        assert_eq!(summary(Some(Provider::Claude), false, true), "Claude \u{b7} progress only");
         assert_eq!(summary(Some(Provider::Codex), false, false), "ChatGPT \u{b7} usage only");
         assert_eq!(summary(None, true, true), "Off");
-    }
-
-    #[test]
-    fn view_is_back_and_one_card() {
-        assert_eq!(height(), BACK_H + GAP + 3.0 * ROW_H);
     }
 }
