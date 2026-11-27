@@ -24,6 +24,8 @@ use other as backend;
 use egui::{Pos2, Rect};
 use winit::monitor::MonitorHandle;
 
+use crate::bridge::DockSide;
+
 pub use drag::{Drag, Probe, Watcher};
 pub use ghost::{Ghost, Scene};
 pub use habits::{Class, Habits};
@@ -121,18 +123,35 @@ pub fn cursor() -> Option<Pos2> {
 }
 
 pub fn screens() -> Vec<Screen> {
-    clear_of_dock(backend::screens(), &crate::system::dock::reserved_bottoms())
+    clear_of_dock(backend::screens(), &crate::system::dock::reserved_edges())
 }
 
-/// Takes notchbase dock's strip off the bottom of each screen it's up on (display number, height in points), so
-/// layouts end above it rather than under it. macOS leaves it in the visible frame: the system Dock it replaces is
-/// hidden.
-fn clear_of_dock(mut screens: Vec<Screen>, bottoms: &[(u64, f32)]) -> Vec<Screen> {
+/// Takes notchbase dock's strip off each screen it's up on (display number, how far in in points, and from which
+/// edge), so layouts end clear of it rather than under it. macOS leaves it in the visible frame: the system Dock it
+/// replaces is hidden.
+fn clear_of_dock(mut screens: Vec<Screen>, docks: &[(u64, f32, DockSide)]) -> Vec<Screen> {
     for screen in &mut screens {
-        if let Some((_, reserved)) = bottoms.iter().find(|(key, _)| *key == screen.key) {
-            let limit = screen.frame.max.y - reserved * screen.scale;
-            if limit > screen.work.min.y {
-                screen.work.max.y = screen.work.max.y.min(limit);
+        if let Some(&(_, reserved, side)) = docks.iter().find(|(key, _, _)| *key == screen.key) {
+            let reach = reserved * screen.scale;
+            match side {
+                DockSide::Bottom => {
+                    let limit = screen.frame.max.y - reach;
+                    if limit > screen.work.min.y {
+                        screen.work.max.y = screen.work.max.y.min(limit);
+                    }
+                }
+                DockSide::Left => {
+                    let limit = screen.frame.min.x + reach;
+                    if limit < screen.work.max.x {
+                        screen.work.min.x = screen.work.min.x.max(limit);
+                    }
+                }
+                DockSide::Right => {
+                    let limit = screen.frame.max.x - reach;
+                    if limit > screen.work.min.x {
+                        screen.work.max.x = screen.work.max.x.min(limit);
+                    }
+                }
             }
         }
     }
@@ -209,19 +228,31 @@ mod tests {
     #[test]
     fn layouts_end_above_the_dock_only_on_screens_it_is_up_on() {
         let screens = vec![screen(1, 0.0, 33.0), screen(2, 1470.0, 25.0)];
-        let clear = clear_of_dock(screens.clone(), &[(1, 70.0)]);
+        let clear = clear_of_dock(screens.clone(), &[(1, 70.0, DockSide::Bottom)]);
         assert_eq!(clear[0].work.max.y, 886.0, "above the dock on its screen");
         assert_eq!(clear[0].work.min.y, 33.0, "below the menu bar as before");
         assert_eq!(clear[1].work, screens[1].work, "the other screen keeps all of it");
-        let both = clear_of_dock(screens.clone(), &[(1, 70.0), (2, 70.0)]);
+        let both = clear_of_dock(screens.clone(), &[(1, 70.0, DockSide::Bottom), (2, 70.0, DockSide::Bottom)]);
         assert!(both.iter().all(|s| s.work.max.y == 886.0), "a dock on each: both keep clear");
         assert_eq!(clear_of_dock(screens.clone(), &[]), screens, "no dock running: macOS's own areas");
         // A macOS Dock still showing already took its room: never more than the larger of the two.
         let mut shown = screens.clone();
         shown[0].work.max.y = 870.0;
-        assert_eq!(clear_of_dock(shown, &[(1, 70.0)])[0].work.max.y, 870.0);
+        assert_eq!(clear_of_dock(shown, &[(1, 70.0, DockSide::Bottom)])[0].work.max.y, 870.0);
         // A filled window ends exactly at the dock's top: no gap, no overlap.
         let full = Zone::Full.rect(clear[0].work, 0.0);
         assert_eq!(full.max.y, 886.0);
+    }
+
+    #[test]
+    fn layouts_keep_clear_of_a_dock_down_either_side() {
+        let screens = vec![screen(1, 0.0, 33.0), screen(2, 1470.0, 25.0)];
+        let left = clear_of_dock(screens.clone(), &[(1, 70.0, DockSide::Left)]);
+        assert_eq!((left[0].work.min.x, left[0].work.max.x, left[0].work.max.y), (70.0, 1470.0, 956.0));
+        let halves = Zone::Left.rect(left[0].work, 0.0);
+        assert_eq!(halves.min.x, 70.0, "the left half starts beside the dock");
+        let right = clear_of_dock(screens.clone(), &[(2, 70.0, DockSide::Right)]);
+        assert_eq!((right[1].work.min.x, right[1].work.max.x), (1470.0, 2870.0));
+        assert_eq!(right[0].work, screens[0].work);
     }
 }

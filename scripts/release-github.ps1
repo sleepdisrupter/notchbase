@@ -55,14 +55,9 @@ if (-not $DryRun) {
 
 Write-Host "Building notchbase $version for $platform, updating from $repo..." -ForegroundColor Cyan
 rustup target add $Target | Out-Null
-# notchbase dock first: notchbase carries it inside its exe and writes it out when someone turns it on.
-cargo build --release --target $Target -p notchbase-dock
-if ($LASTEXITCODE -ne 0) { Fail "The dock's build failed." }
-$env:NOTCHBASE_BUNDLED_DOCK = Join-Path $root "target\$Target\release\notchbase-dock.exe"
+# notchbase dock is macOS only: the Windows build carries nothing of it.
 cargo build --release --target $Target -p notchbase
-$built = $LASTEXITCODE
-Remove-Item Env:NOTCHBASE_BUNDLED_DOCK
-if ($built -ne 0) { Fail "The build failed." }
+if ($LASTEXITCODE -ne 0) { Fail "The build failed." }
 cargo build --release --target $Target -p notchbase-setup
 if ($LASTEXITCODE -ne 0) { Fail "The installer's build failed." }
 

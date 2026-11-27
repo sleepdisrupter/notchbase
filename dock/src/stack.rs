@@ -115,14 +115,6 @@ fn flagged_hidden(meta: &std::fs::Metadata) -> bool {
     meta.st_flags() & UF_HIDDEN != 0
 }
 
-#[cfg(windows)]
-fn flagged_hidden(meta: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    const HIDDEN: u32 = 0x2;
-    const SYSTEM: u32 = 0x4;
-    meta.file_attributes() & (HIDDEN | SYSTEM) != 0
-}
-
 /// Puts a stack's items in the order it shows them, the top of the pile first.
 pub fn sort(items: &mut [Item], by: StackSort) {
     match by {
@@ -217,16 +209,6 @@ pub fn on_keys_wake(wake: impl Fn() + Send + Sync + 'static) {
 }
 
 /// A key already turned into what it means (Windows reads its own keyboard hook), for an open stack.
-#[cfg(windows)]
-pub fn push_key(key: Key) {
-    if let Ok(mut keys) = KEYS.lock() {
-        keys.push(key);
-    }
-    if let Some(wake) = KEYS_WAKE.get() {
-        wake();
-    }
-}
-
 pub fn take_keys() -> Vec<Key> {
     KEYS.lock().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default()
 }
@@ -414,60 +396,6 @@ impl Drop for Changes {
 }
 
 /// A change notification on one folder: a file added, removed or renamed inside it.
-#[cfg(windows)]
-struct Changes {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-    folder: PathBuf,
-}
-
-// The notification handle is only waited on from the watch's own thread.
-#[cfg(windows)]
-unsafe impl Send for Changes {}
-
-#[cfg(windows)]
-impl Changes {
-    fn open(folder: &Path) -> Option<Self> {
-        use std::os::windows::ffi::OsStrExt as _;
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-            FILE_NOTIFY_CHANGE_SIZE, FindFirstChangeNotificationW,
-        };
-        let wide: Vec<u16> = folder.as_os_str().encode_wide().chain([0]).collect();
-        let what = FILE_NOTIFY_CHANGE_FILE_NAME
-            | FILE_NOTIFY_CHANGE_DIR_NAME
-            | FILE_NOTIFY_CHANGE_ATTRIBUTES
-            | FILE_NOTIFY_CHANGE_SIZE;
-        let handle = unsafe { FindFirstChangeNotificationW(wide.as_ptr(), 0, what) };
-        (handle != INVALID_HANDLE_VALUE && !handle.is_null()).then(|| Self { handle, folder: folder.to_path_buf() })
-    }
-
-    fn wait(&mut self, at_most: Duration) -> Changed {
-        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-        use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        let ms = at_most.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-        match unsafe { WaitForSingleObject(self.handle, ms) } {
-            WAIT_OBJECT_0 => {
-                if unsafe { FindNextChangeNotification(self.handle) } == 0 || !self.folder.is_dir() {
-                    Changed::Replaced
-                } else {
-                    Changed::Yes
-                }
-            }
-            WAIT_TIMEOUT => Changed::No,
-            _ => Changed::Replaced,
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Changes {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification(self.handle) };
-    }
-}
-
 /// A picture of a file for a stack: a Quick Look thumbnail where there is one (photos, PDFs, videos), else its
 /// Finder icon.
 pub struct Picture {

@@ -1,50 +1,48 @@
-//! notchbase dock: a Dock for macOS and Windows in the notchbase style. See README.md.
-// Hides the console window on Windows: the dock is a background app with no window of its own to show one.
-#![cfg_attr(windows, windows_subsystem = "windows")]
-// The shared core carries the macOS side's probes and timing tools, which Windows does not use yet.
-#![cfg_attr(windows, allow(dead_code))]
+//! notchbase dock: a Dock for macOS in the notchbase style. See README.md.
 
-// The dock itself, the same on both systems: its drawing, tiles, menus, stacks, flights and settings.
-#[cfg(any(target_os = "macos", windows))]
+// The dock itself: its drawing, tiles, menus, stacks, flights and settings.
+#[cfg(target_os = "macos")]
 mod badges;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod clock;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod config;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod dock;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod downloads;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod flight;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod flow;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod gl;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod layout;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod liquid;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod minimized;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod pop;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod pulse;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod recorder;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
+mod side;
+#[cfg(target_os = "macos")]
 mod snapshot;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod stack;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod stress;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod tiles;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 mod usage;
 
-// macOS: AppKit, Accessibility, ScreenCaptureKit and the system Dock.
+// AppKit, Accessibility, ScreenCaptureKit and the system Dock.
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
@@ -69,16 +67,9 @@ mod titlebar;
 mod wallpaper;
 #[cfg(target_os = "macos")]
 mod windows;
-/// What the shared dock asks of the system, under one name on both.
+/// What the shared dock asks of the system.
 #[cfg(target_os = "macos")]
 use mac as os;
-
-// Windows: Win32, the shell, DWM and the taskbar. `win/` answers the same calls as the macOS modules above, under
-// the same names.
-#[cfg(windows)]
-mod win;
-#[cfg(windows)]
-use win::{app, app_menu, files, lifecycle, os, wallpaper, windows};
 
 #[cfg(target_os = "macos")]
 const HELP: &str = "notchbase dock: a Dock for macOS in the notchbase style
@@ -94,15 +85,10 @@ Usage:
                                  list the actions a running app adds to its menu (needs Accessibility)
 ";
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("notchbase dock runs on macOS and Windows.");
+    eprintln!("notchbase dock runs on macOS.");
     std::process::exit(1);
-}
-
-#[cfg(windows)]
-fn main() {
-    std::process::exit(win::main::run());
 }
 
 #[cfg(target_os = "macos")]

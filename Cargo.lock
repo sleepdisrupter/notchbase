@@ -2258,7 +2258,6 @@ dependencies = [
  "libc",
  "notchbase-paint",
  "notchbase-usage",
- "notchbase-wasapi",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -2272,9 +2271,6 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
- "windows",
- "windows-future",
- "windows-sys 0.61.2",
  "winit",
 ]
 

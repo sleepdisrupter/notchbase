@@ -18,6 +18,8 @@ pub struct Config {
     /// Downloads as a stack on the right, first of the folders, whatever `others` says. Removing its tile turns
     /// this off; Settings › Dock turns it back on.
     pub show_downloads: bool,
+    /// The screen edge the dock stands on: `"bottom"`, `"left"` or `"right"`.
+    pub side: crate::side::Side,
     /// Icon size at rest, in points.
     pub tile_size: f32,
     /// Icon size right under the pointer, in points.
@@ -164,6 +166,7 @@ impl Default for Config {
             pinned: Vec::new(),
             others: Vec::new(),
             show_downloads: true,
+            side: crate::side::Side::Bottom,
             tile_size: 48.0,
             large_size: 72.0,
             magnification: true,
@@ -300,6 +303,9 @@ mod tests {
         assert_eq!(older.minimize_effect, super::MinimizeEffect::Liquid);
         assert!(older.hide_in_fullscreen && older.replace_switcher);
         assert!((older.minimize_duration - 0.4).abs() < 1e-6);
+        assert_eq!(older.side, crate::side::Side::Bottom, "older files keep the dock along the bottom");
+        let left: super::Config = serde_json::from_str(r#"{"side": "left"}"#).unwrap();
+        assert_eq!(left.side, crate::side::Side::Left);
         let mut config = super::Config {
             minimize_effect: super::MinimizeEffect::System,
             hide_in_fullscreen: false,

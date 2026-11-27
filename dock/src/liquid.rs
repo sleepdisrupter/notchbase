@@ -21,6 +21,9 @@ pub struct Band {
     pub tint: [f32; 2],
     /// An open menu's or previews panel's top and bottom, in window points: it gets the same glass over its own height.
     pub panel: Option<(f32, f32)>,
+    /// The edge the dock stands on. `top` and `bottom` are the dock's own layout's (`side::Frame`), so on a side they
+    /// run across the window toward that edge.
+    pub side: crate::side::Side,
 }
 
 /// A rounded box, in window points with the origin at the top left.
@@ -35,15 +38,18 @@ pub struct Blob {
     /// bottom edge's half is (y), in points. Zero for a box. A slice's `half` and `lean` are of its shape shrunk by
     /// `radius` all round, which then grows back by `radius` with round corners.
     pub lean: egui::Vec2,
+    /// A slice turned on its side, for a dock on the left or right: its level edges run up and down. The slice is
+    /// the one `half` and `lean` describe, mirrored across the line from its top left to its bottom right.
+    pub turned: bool,
 }
 
 impl Blob {
     pub fn rect(rect: egui::Rect, radius: f32, melt: f32) -> Self {
-        Self { center: rect.center(), half: rect.size() * 0.5, radius, melt, lean: egui::Vec2::ZERO }
+        Self { center: rect.center(), half: rect.size() * 0.5, radius, melt, lean: egui::Vec2::ZERO, turned: false }
     }
 
     pub fn circle(center: egui::Pos2, radius: f32, melt: f32) -> Self {
-        Self { center, half: egui::vec2(radius, radius), radius, melt, lean: egui::Vec2::ZERO }
+        Self { center, half: egui::vec2(radius, radius), radius, melt, lean: egui::Vec2::ZERO, turned: false }
     }
 
     /// The four-sided piece between two level edges, `top` and `bottom` high with these left and right ends: its
@@ -79,7 +85,19 @@ impl Blob {
         let lean = egui::vec2(under.center() - over.center(), (under.span() - over.span()) * 0.5);
         // A lean of exactly zero would draw it as a box; a hair of one keeps it a slice.
         let lean = if lean == egui::Vec2::ZERO { egui::vec2(0.0, 1e-4) } else { lean };
-        Self { center, half, radius, melt: 0.0, lean }
+        Self { center, half, radius, melt: 0.0, lean, turned: false }
+    }
+
+    /// The same piece turned on its side about its middle and moved to `center`: what a dock along the bottom has,
+    /// for a dock on the right (`mirrored` false) or the left (`mirrored`, so what was nearest the bottom edge is
+    /// nearest the left one).
+    pub fn turned(self, center: egui::Pos2, mirrored: bool) -> Self {
+        if self.lean == egui::Vec2::ZERO {
+            return Self { center, half: egui::vec2(self.half.y, self.half.x), ..self };
+        }
+        // Mirrored left to right once turned is the slice flipped top to bottom before it: the lean goes the other way.
+        let lean = if mirrored { -self.lean } else { self.lean };
+        Self { center, lean, turned: !self.turned, ..self }
     }
 
     pub fn bounds(&self) -> egui::Rect {
@@ -88,6 +106,7 @@ impl Blob {
         } else {
             self.half + egui::vec2((self.lean.x.abs() + self.lean.y.abs()) * 0.5 + self.radius, self.radius)
         };
+        let half = if self.turned { egui::vec2(half.y, half.x) } else { half };
         egui::Rect::from_center_size(self.center, half * 2.0).expand(self.melt * 0.5)
     }
 }
@@ -104,7 +123,7 @@ void main() {
 
 const FRAGMENT: &str = r#"
 uniform vec4 u_box[96];   // center xy, half size xy, in pixels, origin bottom left
-uniform vec4 u_shape[96]; // corner extent, melt, in pixels; corner exponent
+uniform vec4 u_shape[96]; // corner extent, melt, in pixels; corner exponent; 1 for a slice turned on its side
 uniform vec2 u_lean[96];  // a slice's lean (Blob::lean), in pixels; zero for a box
 uniform int u_count;
 uniform float u_ppp;
@@ -118,8 +137,17 @@ float near(float dist, float reach) {
     return CLEAR * exp(-away * away);
 }
 uniform vec2 u_panel; // an open panel's top y and bottom y, in pixels, origin bottom left; equal when there is none
-uniform vec4 u_glass; // body top y, bottom y (pixels, origin bottom left), black at the top and at the bottom; z < 0 is solid
+uniform vec4 u_glass; // body top, bottom (pixels along `toward`, below), black at the top and at the bottom; z < 0 is solid
 uniform vec2 u_size;
+// The edge the dock stands on: 0 the bottom, 1 the left, 2 the right. The body's gradient runs toward it.
+uniform int u_side;
+// How far from the dock's edge a pixel is, growing away from it, in pixels: y up for a dock along the bottom, across
+// for one on a side.
+float toward(vec2 p) {
+    if (u_side == 1) return p.x;
+    if (u_side == 2) return u_size.x - p.x;
+    return p.y;
+}
 // The blurred desktop picture drawn in place of the live blur (wallpaper.rs), covering the window, its first row the
 // window's top; u_fake is how much of it shows, and at 1 the glass is opaque.
 uniform sampler2D u_backdrop;
@@ -179,10 +207,17 @@ void main() {
         vec4 s = u_shape[i];
         vec2 l = u_lean[i];
         bool sliced = l.x != 0.0 || l.y != 0.0;
-        float here = sliced ? slice(p - b.xy, b.zw, l) - s.x : box(p - b.xy, b.zw, s.x, s.z);
+        // A turned slice (Blob::turned): mirrored across its top-left to bottom-right line, which with y up is
+        // the line through its top right and bottom left the other way round.
+        bool turned = s.w > 0.5;
+        vec2 q = p - b.xy;
+        if (turned) q = vec2(-q.y, -q.x);
+        float here = sliced ? slice(q, b.zw, l) - s.x : box(p - b.xy, b.zw, s.x, s.z);
         d = melt(d, here, s.y);
         if (u_glass_shadow > 0.0) {
-            float under = sliced ? slice(p + drop - b.xy, b.zw, l) - s.x : box(p + drop - b.xy, b.zw, s.x, s.z);
+            vec2 qs = p + drop - b.xy;
+            if (turned) qs = vec2(-qs.y, -qs.x);
+            float under = sliced ? slice(qs, b.zw, l) - s.x : box(p + drop - b.xy, b.zw, s.x, s.z);
             shadow_d = melt(shadow_d, under, s.y);
         }
     }
@@ -201,14 +236,15 @@ void main() {
 
     // Glass, like the bottom of the open notch (src/notch/frame.rs): black down to FADE_FROM of the body's height,
     // then thinning out toward the bottom over the blurred desktop.
-    float y = gl_FragCoord.y;
+    float y = toward(gl_FragCoord.xy);
     float from = mix(u_glass.x, u_glass.y, 0.32);
     float black = mix(u_glass.z, u_glass.w, smoothstep(from, u_glass.y, y));
     // Menus and previews above the dock are the same glass, the same gradient run over their own height. It starts
     // above the hovered icon's rise, so the rise keeps the dock's own.
     if (u_panel.x > u_panel.y) {
         float panel_from = mix(u_panel.x, u_panel.y, 0.32);
-        float panel = mix(u_glass.z, u_glass.w, smoothstep(panel_from, u_panel.y, y));
+        // The panel is upright whatever edge the dock is on: its own gradient runs down it.
+        float panel = mix(u_glass.z, u_glass.w, smoothstep(panel_from, u_panel.y, gl_FragCoord.y));
         black = mix(black, panel, smoothstep(u_glass.x + 14.0 * u_ppp, u_glass.x + 22.0 * u_ppp, y));
     }
     float t = clamp((u_glass.x - y) / max(u_glass.x - u_glass.y, 1.0), 0.0, 1.0);
@@ -229,7 +265,9 @@ void main() {
     // Smoked glass: a faint 1pt highlight just inside the top edge, gone by the rounded ends, and a barely-there
     // lightening all round the inside of the edge, so it reads as a slab of glass rather than a flat tint.
     float inside = step(-0.5, depth);
-    float spec = 0.10 * pow(max(n.y, 0.0), 8.0) * clamp(1.0 - abs(depth - 0.9) / 0.6, 0.0, 1.0) * inside;
+    // The highlight is on the edges facing away from the dock's edge: up along the bottom, inward on a side.
+    float facing = u_side == 1 ? n.x : (u_side == 2 ? -n.x : n.y);
+    float spec = 0.10 * pow(max(facing, 0.0), 8.0) * clamp(1.0 - abs(depth - 0.9) / 0.6, 0.0, 1.0) * inside;
     float rim = 0.035 * clamp(1.0 - depth / 3.0, 0.0, 1.0) * inside;
     float light = clamp(spec + rim, 0.0, 1.0);
     rgb = vec3(light) + rgb * (1.0 - light);
@@ -304,7 +342,12 @@ impl Liquid {
             } else {
                 (blob.radius.max(0.0), 2.0)
             };
-            shapes.extend_from_slice(&[extent * ppp, blob.melt.max(0.0) * ppp, exponent, 0.0]);
+            shapes.extend_from_slice(&[
+                extent * ppp,
+                blob.melt.max(0.0) * ppp,
+                exponent,
+                if blob.turned && blob.lean != egui::Vec2::ZERO { 1.0 } else { 0.0 },
+            ]);
         }
         unsafe {
             gl.use_program(Some(self.program));
@@ -331,11 +374,22 @@ impl Liquid {
             gl.uniform_1_f32(at("u_thickness").as_ref(), (body_h * 0.19).clamp(3.0, 6.0));
             let (panel_top, panel_bottom) = glass.and_then(|b| b.panel).unwrap_or((0.0, 0.0));
             gl.uniform_2_f32(at("u_panel").as_ref(), height - panel_top * ppp, height - panel_bottom * ppp);
+            let side = glass.map_or(crate::side::Side::Bottom, |b| b.side);
+            gl.uniform_1_i32(
+                at("u_side").as_ref(),
+                match side {
+                    crate::side::Side::Bottom => 0,
+                    crate::side::Side::Left => 1,
+                    crate::side::Side::Right => 2,
+                },
+            );
+            // The body's band along `depth` in the shader: from the window's bottom up, or in from its side.
+            let reach = if side.vertical() { size[0] as f32 } else { height };
             match glass {
                 Some(band) => gl.uniform_4_f32(
                     at("u_glass").as_ref(),
-                    height - band.top * ppp,
-                    height - band.bottom * ppp,
+                    reach - band.top * ppp,
+                    reach - band.bottom * ppp,
                     band.tint[0].clamp(0.0, 1.0),
                     band.tint[1].clamp(0.0, 1.0),
                 ),
@@ -397,7 +451,14 @@ pub fn upload(
 pub fn distance(blobs: &[Blob], p: egui::Pos2) -> f32 {
     let mut d = 1e5_f32;
     for b in blobs {
-        let here = if b.lean == egui::Vec2::ZERO { box_distance(b, p) } else { slice_distance(b, p) };
+        let here = if b.lean == egui::Vec2::ZERO {
+            box_distance(b, p)
+        } else if b.turned {
+            let r = p - b.center;
+            slice_distance(b, b.center + egui::vec2(r.y, r.x))
+        } else {
+            slice_distance(b, p)
+        };
         d = melt(d, here, b.melt);
     }
     d

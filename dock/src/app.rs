@@ -25,6 +25,7 @@ use crate::gl::GlWindow;
 use crate::liquid::Liquid;
 use crate::minimized::Minimized;
 use crate::pop::{Pop, Reach};
+use crate::side::Side;
 use crate::windows::{self, Win};
 use crate::{lifecycle, mac, real_dock};
 
@@ -286,7 +287,7 @@ pub struct App {
     /// The docks on the other screens, with "All displays".
     seats: Vec<Seat>,
     /// What `dock-areas.json` last said: each screen with the dock up and how much of its bottom the dock keeps.
-    areas_written: Option<Vec<(u32, f32)>>,
+    areas_written: Option<Vec<(u32, f32, Side)>>,
     /// The Displays setting changed: the docks are laid out again on the next tick.
     reposition_soon: bool,
     /// Each folder's latest reading and the last minimized windows, for a dock that comes up on a new screen.
@@ -407,8 +408,9 @@ pub fn seed_from_system_dock() -> Option<Config> {
 }
 
 impl App {
+    /// Where the live dock's window goes: along the edge its settings ask for.
     fn dock_frame(&self) -> CGRect {
-        dock_frame_on(self.screen)
+        dock_frame_on(self.screen, self.dock.config.side)
     }
 
     /// The live dock's screen in global top-left points.
@@ -438,10 +440,9 @@ impl App {
         self.needs_frame = true;
     }
 
-    /// The dock window's top left corner in global top-left points.
+    /// The dock window's top left corner in global top-left points, along the edge it's laid out on now.
     fn dock_origin(&self) -> Pos2 {
-        let r = self.screen_rect();
-        pos2(r.left(), r.bottom() - WINDOW_HEIGHT)
+        self.dock.side().window_on(self.screen_rect(), WINDOW_HEIGHT).min
     }
 
     fn create(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -452,7 +453,7 @@ impl App {
             self.main_screen = main.frame;
         }
         let w = open_dock_window(event_loop, self.dock_frame())?;
-        self.dock.size = w.gl.size();
+        self.dock.set_window(self.dock.config.side, w.gl.size());
         self.win = Some(w);
 
         let s = self.screen;
@@ -598,11 +599,12 @@ impl App {
             return;
         }
         let reserved = self.dock.reserved_height();
+        let side = self.dock.side();
         let mut areas = Vec::new();
         if !self.in_fullscreen {
-            areas.push((self.display, reserved));
+            areas.push((self.display, reserved, side));
         }
-        areas.extend(self.seats.iter().filter(|s| !s.tucked).map(|s| (s.display, reserved)));
+        areas.extend(self.seats.iter().filter(|s| !s.tucked).map(|s| (s.display, reserved, s.dock.side())));
         areas.sort_by_key(|a| a.0);
         if self.areas_written.as_ref() == Some(&areas) {
             return;
@@ -670,16 +672,18 @@ impl App {
             }
         }
         let frame_of = |id: u32| wanted.iter().find(|w| w.id == id).map(|w| w.frame);
+        // A new place for the screen, or a new edge for the dock (its settings changed).
         if let Some(frame) = frame_of(self.display)
-            && frame != self.screen
+            && (frame != self.screen || self.dock.side() != self.dock.config.side)
         {
             self.screen = frame;
             let dock_frame = self.dock_frame();
             if let Some(w) = &self.win {
                 mac::place_window(&w.gl.window, mac::DOCK_LEVEL, dock_frame);
                 w.gl.resized();
-                self.dock.size = w.gl.size();
+                self.dock.set_window(self.dock.config.side, w.gl.size());
             }
+            self.last_pointer = None;
             // The switcher is laid out for the screens as they were.
             if let Some(s) = &mut self.switcher {
                 s.close();
@@ -689,13 +693,14 @@ impl App {
         }
         for seat in &mut self.seats {
             if let Some(frame) = frame_of(seat.display)
-                && frame != seat.screen
+                && (frame != seat.screen || seat.dock.side() != seat.dock.config.side)
             {
                 seat.screen = frame;
+                let side = seat.dock.config.side;
                 if let Some(w) = &seat.win {
-                    mac::place_window(&w.gl.window, mac::DOCK_LEVEL, dock_frame_on(frame));
+                    mac::place_window(&w.gl.window, mac::DOCK_LEVEL, dock_frame_on(frame, side));
                     w.gl.resized();
-                    seat.dock.size = w.gl.size();
+                    seat.dock.set_window(side, w.gl.size());
                 }
                 self.needs_frame = true;
             }
@@ -715,7 +720,7 @@ impl App {
 
     /// A dock for another screen, caught up with the live one.
     fn open_seat(&mut self, event_loop: &ActiveEventLoop, screen: &mac::Screen) -> Result<Seat, String> {
-        let win = open_dock_window(event_loop, dock_frame_on(screen.frame))?;
+        let win = open_dock_window(event_loop, dock_frame_on(screen.frame, self.dock.config.side))?;
         let _ = win.gl.window.set_cursor_hittest(false);
         let mut dock = Dock::new(self.dock.config.clone(), self.dir.clone(), win.gl.size()).live();
         dock.dark = self.dock.dark;
@@ -788,9 +793,12 @@ impl App {
         if self.calm()
             && !mac::mouse_buttons_held()
             && let Some(i) = self.seats.iter().position(|s| {
-                let r = global_rect(s.screen, self.primary_top);
+                // Turned so the dock's edge is the bottom, whichever edge it is.
+                let side = s.dock.side();
+                let r = side.rect_to_bottom(global_rect(s.screen, self.primary_top));
+                let at = side.to_bottom(global);
                 let reach = s.dock.reserved_height().max(4.0);
-                (r.left()..r.right()).contains(&global.x) && global.y >= r.bottom() - reach && global.y <= r.bottom()
+                (r.left()..r.right()).contains(&at.x) && at.y >= r.bottom() - reach && at.y <= r.bottom()
             })
         {
             self.activate(i);
@@ -982,14 +990,15 @@ impl App {
             // corrected as they happen; the check below is the fallback.
             let reserved = f64::from(self.dock.reserved_height());
             let docked: Vec<CGRect> = std::iter::once(self.screen).chain(self.seats.iter().map(|s| s.screen)).collect();
-            let areas = if self.away { Vec::new() } else { fill_areas(&mac::screens(), &docked, reserved) };
+            let side = self.dock.side();
+            let areas = if self.away { Vec::new() } else { fill_areas(&mac::screens(), &docked, reserved, side) };
             // Every screen with a dock up (not tucked under a full-screen app).
             let tucked: Vec<CGRect> = self.seats.iter().filter(|s| s.tucked).map(|s| s.screen).collect();
-            let docks: Vec<(f64, f64, f64, f64)> = areas
+            let docks: Vec<crate::titlebar::Area> = areas
                 .iter()
                 .filter(|a| a.reserved && !tucked.contains(&a.frame))
                 .filter(|a| a.frame != self.screen || !self.in_fullscreen)
-                .map(|a| (a.area.bottom, a.area.screen_bottom, a.area.left, a.area.right))
+                .map(|a| a.area)
                 .collect();
             crate::titlebar::set_areas(areas.iter().map(|a| a.area).collect());
             crate::titlebar::start();
@@ -1013,7 +1022,7 @@ impl App {
         self.step_seats();
         let global = mac::pointer();
         let local = global - self.dock_origin().to_vec2();
-        let inside = Rect::from_min_size(Pos2::ZERO, self.dock.size).contains(local);
+        let inside = Rect::from_min_size(Pos2::ZERO, self.dock.window_size()).contains(local);
         let pointer = inside.then_some(local);
         if pointer != self.last_pointer {
             self.last_pointer = pointer;
@@ -1057,7 +1066,7 @@ impl App {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + AMBIENT_FRAME));
         } else {
             // Waiting on the edge over a full-screen app counts too, so the dock comes up the moment the wait is over.
-            let near = pointer.is_some_and(|p| p.y > self.dock.size.y - 220.0) || self.edge_since.is_some();
+            let near = pointer.is_some_and(|p| self.dock.edge_distance(p) < 220.0) || self.edge_since.is_some();
             self.idle = true;
             let wait = if near {
                 NEAR_POLL
@@ -1270,7 +1279,7 @@ impl App {
             let wants = self.dock.over_separator;
             if wants != self.resize_cursor {
                 self.resize_cursor = wants;
-                let icon = if wants { winit::window::CursorIcon::NsResize } else { winit::window::CursorIcon::Default };
+                let icon = crate::side::resize_cursor(wants, self.dock.side());
                 w.gl.window.set_cursor(icon);
             }
         }
@@ -1470,7 +1479,7 @@ impl App {
             return;
         }
         let origin = self.dock_origin() - self.screen_rect().min.to_vec2();
-        let size = self.dock.size;
+        let size = self.dock.window_size();
         let window = [f64::from(origin.x), f64::from(origin.y), f64::from(size.x), f64::from(size.y)];
         let source = crate::wallpaper::source(self.display, window);
         if source == self.wallpaper {
@@ -1624,7 +1633,7 @@ impl App {
             }
         }
         if config != self.dock.config {
-            let displays = config.displays != self.dock.config.displays;
+            let displays = config.displays != self.dock.config.displays || config.side != self.dock.config.side;
             self.dock.take_config(config);
             self.dock.refresh(&running);
             self.needs_frame = true;
@@ -1652,7 +1661,8 @@ impl App {
         }
         let screen = self.screen_rect();
         if !self.revealed {
-            let dwell = reveal_dwell(screen, &self.screens, global).filter(|_| !mac::mouse_buttons_held());
+            let dwell =
+                reveal_dwell(screen, &self.screens, global, self.dock.side()).filter(|_| !mac::mouse_buttons_held());
             if let Some(dwell) = dwell {
                 if now - *self.edge_since.get_or_insert(now) >= dwell {
                     self.revealed = true;
@@ -1665,7 +1675,7 @@ impl App {
             }
             return;
         }
-        let near = pointer.is_some_and(|p| p.y > self.dock.size.y - self.dock.reserved_height() - 40.0);
+        let near = pointer.is_some_and(|p| self.dock.edge_distance(p) < self.dock.reserved_height() + 40.0);
         let busy = self.dock.popup_open() || self.dock.interactive() || !self.flights.is_empty();
         if near || busy {
             self.left_since = None;
@@ -1796,7 +1806,7 @@ impl App {
         self.dock.expect_minimized(Minimized { pid, win }, picture.as_ref().map(|p| windows::smaller(p, 256)));
         let tile = self.tile_rect(id);
         let fly = self.dock.config.minimize_duration;
-        let mut flight = Flight::new(Way::Down, id, frame, tile, picture).lasting(fly);
+        let mut flight = Flight::new(Way::Down, id, frame, tile, picture).toward(self.dock.side()).lasting(fly);
         flight.trace = Some(trace.clone());
         self.flights.push(flight);
         self.parked.insert(id, (pid, frame, Instant::now()));
@@ -2027,7 +2037,9 @@ impl App {
             .or_else(|| self.dock.window_picture(id));
         trace.step(|| format!("picture {:?}", picture.as_ref().map(|p| p.size)));
         self.parked.insert(id, (pid, window, Instant::now()));
-        let mut flight = Flight::new(Way::Up, id, window, tile, picture).lasting(self.dock.config.minimize_duration);
+        let mut flight = Flight::new(Way::Up, id, window, tile, picture)
+            .toward(self.dock.side())
+            .lasting(self.dock.config.minimize_duration);
         flight.texture = texture;
         let ready = Arc::new(AtomicBool::new(false));
         let landed = Arc::new(AtomicBool::new(false));
@@ -2075,18 +2087,14 @@ impl App {
     /// A window's tile's icon in global points, or where a new one would be.
     fn tile_rect(&self, id: u32) -> Rect {
         let origin = self.dock_origin().to_vec2();
-        self.dock.window_tile(id).map(|r| r.translate(origin)).unwrap_or_else(|| {
-            let size = self.dock.config.tile_size;
-            let screen = self.screen_rect();
-            Rect::from_center_size(pos2(screen.center().x, screen.bottom() - size), vec2(size, size))
-        })
+        self.dock.window_tile(id).unwrap_or_else(|| self.dock.spare_tile()).translate(origin)
     }
 
     fn step_flights(&mut self, dt: f32) {
         let mut flights = std::mem::take(&mut self.flights);
         for f in &mut flights {
             if f.way == Way::Down {
-                f.tile = self.tile_rect(f.id);
+                f.set_tile(self.tile_rect(f.id));
             }
             f.step(dt);
             crate::recorder::event(|| {
@@ -2299,21 +2307,34 @@ fn open_dock_window(event_loop: &ActiveEventLoop, frame: CGRect) -> Result<DockW
 /// Over a full-screen app on `screen` (global top-left points, as `screens` are): how long the pointer at `at` has to
 /// stay where it is to call the dock up, or `None` when it isn't on the screen's bottom edge. Where another screen
 /// sits right below, the pointer can't rest on the edge, so a taller band near it counts, with a longer wait.
-fn reveal_dwell(screen: Rect, screens: &[Rect], at: Pos2) -> Option<Duration> {
+///
+/// A dock on a side comes up from that side's edge the same way: everything is turned so that edge is the bottom.
+fn reveal_dwell(screen: Rect, screens: &[Rect], at: Pos2, side: Side) -> Option<Duration> {
+    let (screen, at) = (side.rect_to_bottom(screen), side.to_bottom(at));
     if !(screen.left()..screen.right()).contains(&at.x) {
         return None;
     }
     let shared = screens
         .iter()
-        .any(|s| *s != screen && (s.top() - screen.bottom()).abs() < 1.0 && (s.left()..s.right()).contains(&at.x));
+        .map(|s| side.rect_to_bottom(*s))
+        .any(|s| s != screen && (s.top() - screen.bottom()).abs() < 1.0 && (s.left()..s.right()).contains(&at.x));
     let (band, dwell, past) =
         if shared { (SHARED_EDGE_BAND, SHARED_EDGE_DWELL, 0.0) } else { (EDGE_BAND, EDGE_DWELL, 1.0) };
     (at.y > screen.bottom() - band && at.y <= screen.bottom() + past).then_some(dwell)
 }
 
-/// The dock window's frame on a screen: along its bottom.
-fn dock_frame_on(screen: CGRect) -> CGRect {
-    CGRect::new(screen.origin, CGSize::new(screen.size.width, f64::from(WINDOW_HEIGHT)))
+/// The dock window's frame on a screen (AppKit's, from the bottom left): along its bottom, or down one of its sides
+/// (see [`Side::window_on`]).
+fn dock_frame_on(screen: CGRect, side: Side) -> CGRect {
+    let reach = screen.size.width.min(f64::from(crate::side::SIDE_REACH));
+    match side {
+        Side::Bottom => CGRect::new(screen.origin, CGSize::new(screen.size.width, f64::from(WINDOW_HEIGHT))),
+        Side::Left => CGRect::new(screen.origin, CGSize::new(reach, screen.size.height)),
+        Side::Right => CGRect::new(
+            CGPoint::new(screen.origin.x + screen.size.width - reach, screen.origin.y),
+            CGSize::new(reach, screen.size.height),
+        ),
+    }
 }
 
 /// How much of `frame` lies on `screen`, in square points.
@@ -2463,7 +2484,7 @@ impl ApplicationHandler for App {
                 let seat = &mut self.seats[i];
                 if let Some(w) = &seat.win {
                     w.gl.resized();
-                    seat.dock.size = w.gl.size();
+                    seat.dock.set_window(seat.dock.side(), w.gl.size());
                 }
                 self.needs_frame = true;
                 return;
@@ -2479,7 +2500,7 @@ impl ApplicationHandler for App {
                     && is_dock
                 {
                     w.gl.resized();
-                    self.dock.size = w.gl.size();
+                    self.dock.set_window(self.dock.side(), w.gl.size());
                 }
                 if let Some(o) = &self.overlay
                     && o.gl.window.id() == id
@@ -2637,7 +2658,7 @@ fn mods_held() -> crate::dock::Mods {
     crate::dock::Mods::default()
 }
 
-/// A screen's area for filled windows, and whether the dock takes its bottom.
+/// A screen's area for filled windows, and whether the dock takes an edge of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FillArea {
     area: crate::titlebar::Area,
@@ -2646,20 +2667,23 @@ struct FillArea {
     frame: CGRect,
 }
 
-/// What a filled window covers on each screen: below its menu bar (and notch), and above the dock on screens with a
-/// dock only.
-fn fill_areas(screens: &[mac::Screen], docked: &[CGRect], reserved: f64) -> Vec<FillArea> {
+/// What a filled window covers on each screen: below its menu bar (and notch), and clear of the dock (above it, or
+/// beside it on `side`) on screens with a dock only.
+fn fill_areas(screens: &[mac::Screen], docked: &[CGRect], reserved: f64, side: Side) -> Vec<FillArea> {
     screens
         .iter()
         .map(|s| {
             let docked = docked.contains(&s.frame);
+            let keep = |on: Side| if docked && side == on { reserved } else { 0.0 };
             FillArea {
                 area: crate::titlebar::Area {
-                    left: s.left,
+                    left: s.left + keep(Side::Left),
                     top: s.top + s.menu,
-                    right: s.right,
-                    bottom: s.bottom - if docked { reserved } else { 0.0 },
+                    right: s.right - keep(Side::Right),
+                    bottom: s.bottom - keep(Side::Bottom),
+                    screen_left: s.left,
                     screen_top: s.top,
+                    screen_right: s.right,
                     screen_bottom: s.bottom,
                 },
                 reserved: docked,
@@ -2669,11 +2693,13 @@ fn fill_areas(screens: &[mac::Screen], docked: &[CGRect], reserved: f64) -> Vec<
         .collect()
 }
 
-/// `[{"display": 1, "reserved": 70}, …]`, as notchbase reads it.
-fn areas_json(areas: &[(u32, f32)]) -> String {
+/// `[{"display": 1, "reserved": 70, "side": "bottom"}, …]`, as notchbase reads it: how far in from which edge.
+fn areas_json(areas: &[(u32, f32, Side)]) -> String {
     let rows: Vec<String> = areas
         .iter()
-        .map(|(display, reserved)| format!("{{\"display\": {display}, \"reserved\": {reserved:.1}}}"))
+        .map(|(display, reserved, side)| {
+            format!("{{\"display\": {display}, \"reserved\": {reserved:.1}, \"side\": \"{}\"}}", side.key())
+        })
         .collect();
     format!("[{}]", rows.join(", "))
 }
@@ -2848,19 +2874,19 @@ mod tests {
         let two = laptop_and_monitor_above();
         let (laptop, monitor) = (two[0], two[1]);
         // The laptop's bottom has nothing past it: the pointer stops right on it.
-        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 956.0)), Some(EDGE_DWELL));
-        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 954.5)), Some(EDGE_DWELL));
-        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 950.0)), None, "not near enough");
-        assert_eq!(reveal_dwell(laptop, &two, pos2(1500.0, 956.0)), None, "off the screen");
+        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 956.0), Side::Bottom), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 954.5), Side::Bottom), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 950.0), Side::Bottom), None, "not near enough");
+        assert_eq!(reveal_dwell(laptop, &two, pos2(1500.0, 956.0), Side::Bottom), None, "off the screen");
         // The monitor's bottom runs into the laptop for most of its width: a taller band and a longer wait there.
-        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -0.5)), Some(SHARED_EDGE_DWELL));
-        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -10.0)), Some(SHARED_EDGE_DWELL));
-        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, 0.5)), None, "already on the laptop");
-        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -20.0)), None);
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -0.5), Side::Bottom), Some(SHARED_EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -10.0), Side::Bottom), Some(SHARED_EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, 0.5), Side::Bottom), None, "already on the laptop");
+        assert_eq!(reveal_dwell(monitor, &two, pos2(700.0, -20.0), Side::Bottom), None);
         // Past the laptop's sides the monitor's edge is a real one again.
-        assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, 0.0)), Some(EDGE_DWELL));
-        assert_eq!(reveal_dwell(monitor, &two, pos2(-30.0, -2.0)), Some(EDGE_DWELL));
-        assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, -10.0)), None);
+        assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, 0.0), Side::Bottom), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(-30.0, -2.0), Side::Bottom), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, -10.0), Side::Bottom), None);
     }
 
     #[test]
@@ -2894,8 +2920,8 @@ mod tests {
     fn the_areas_file_lists_each_screen_and_how_tall_the_dock_stands_there() {
         assert_eq!(areas_json(&[]), "[]");
         assert_eq!(
-            areas_json(&[(1, 70.0), (4, 70.0)]),
-            r#"[{"display": 1, "reserved": 70.0}, {"display": 4, "reserved": 70.0}]"#
+            areas_json(&[(1, 70.0, Side::Bottom), (4, 70.0, Side::Left)]),
+            r#"[{"display": 1, "reserved": 70.0, "side": "bottom"}, {"display": 4, "reserved": 70.0, "side": "left"}]"#
         );
     }
 
@@ -2917,17 +2943,55 @@ mod tests {
         assert_eq!((screens[1].left, screens[1].top, screens[1].bottom), (-1920.0, -133.0, 1067.0));
         assert_eq!(screens[1].menu, 25.0);
 
-        let areas = fill_areas(&screens, &[laptop], 70.0);
+        let areas = fill_areas(&screens, &[laptop], 70.0, Side::Bottom);
         assert!(areas[0].reserved && !areas[1].reserved);
         assert_eq!((areas[0].area.top, areas[0].area.bottom), (33.0, 886.0));
         assert_eq!((areas[1].area.left, areas[1].area.top, areas[1].area.bottom), (-1920.0, -108.0, 1067.0));
         // With the dock on the monitor, the laptop fills to its bottom.
-        let areas = fill_areas(&screens, &[monitor], 70.0);
+        let areas = fill_areas(&screens, &[monitor], 70.0, Side::Bottom);
         assert_eq!(areas[0].area.bottom, 956.0);
         assert_eq!(areas[1].area.bottom, 997.0);
         // With a dock on each, both keep clear of theirs.
-        let areas = fill_areas(&screens, &[laptop, monitor], 70.0);
+        let areas = fill_areas(&screens, &[laptop, monitor], 70.0, Side::Bottom);
         assert_eq!((areas[0].area.bottom, areas[1].area.bottom), (886.0, 997.0));
         assert!(areas.iter().all(|a| a.reserved));
+        // A dock on the left keeps the laptop's left edge, and the bottom is the screen's again.
+        let areas = fill_areas(&screens, &[laptop], 70.0, Side::Left);
+        assert_eq!((areas[0].area.left, areas[0].area.right, areas[0].area.bottom), (70.0, 1470.0, 956.0));
+        let areas = fill_areas(&screens, &[laptop], 70.0, Side::Right);
+        assert_eq!((areas[0].area.left, areas[0].area.right), (0.0, 1400.0));
+        assert_eq!(areas[1].area.left, -1920.0, "a screen without the dock keeps all of itself");
+    }
+
+    #[test]
+    fn a_side_dock_comes_up_from_its_own_edge_over_a_full_screen_app() {
+        let two = laptop_and_monitor_above();
+        let laptop = two[0];
+        assert_eq!(reveal_dwell(laptop, &two, pos2(0.0, 500.0), Side::Left), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(1.0, 500.0), Side::Left), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(10.0, 500.0), Side::Left), None, "not near enough");
+        assert_eq!(reveal_dwell(laptop, &two, pos2(700.0, 956.0), Side::Left), None, "the bottom does nothing");
+        assert_eq!(reveal_dwell(laptop, &two, pos2(1470.0, 500.0), Side::Right), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(1469.0, 500.0), Side::Right), Some(EDGE_DWELL));
+        assert_eq!(reveal_dwell(laptop, &two, pos2(0.0, 500.0), Side::Right), None);
+        // Three in a row: the main screen's left edge runs into the one on its left, so it waits longer there.
+        let row = three_in_a_row();
+        assert_eq!(reveal_dwell(row[0], &row, pos2(0.5, 500.0), Side::Left), Some(SHARED_EDGE_DWELL));
+        assert_eq!(reveal_dwell(row[0], &row, pos2(10.0, 500.0), Side::Left), Some(SHARED_EDGE_DWELL));
+        assert_eq!(reveal_dwell(row[0], &row, pos2(-1.0, 500.0), Side::Left), None, "already on the other screen");
+    }
+
+    #[test]
+    fn a_side_docks_window_runs_down_that_side_of_the_screen() {
+        let laptop = rect(0.0, 0.0, 1470.0, 956.0);
+        let f = dock_frame_on(laptop, Side::Left);
+        assert_eq!((f.origin.x, f.origin.y, f.size.width, f.size.height), (0.0, 0.0, 960.0, 956.0));
+        let f = dock_frame_on(laptop, Side::Right);
+        assert_eq!((f.origin.x, f.origin.y, f.size.width, f.size.height), (510.0, 0.0, 960.0, 956.0));
+        let f = dock_frame_on(laptop, Side::Bottom);
+        assert_eq!((f.size.width, f.size.height), (1470.0, f64::from(WINDOW_HEIGHT)));
+        // AppKit's frame and the dock's own top-left one agree.
+        let top_left = Side::Right.window_on(global_rect(laptop, 956.0), WINDOW_HEIGHT);
+        assert_eq!(appkit_rect(top_left, 956.0), dock_frame_on(laptop, Side::Right));
     }
 }

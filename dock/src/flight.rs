@@ -4,9 +4,15 @@
 //! its own head start: the bottom leads and the top follows, so the sides bend into smooth curves, and every strip
 //! arrives at exactly the same moment. One timed move, full speed on the first frame and a soft landing; nothing
 //! ever turns back, overshoots or crawls.
+//!
+//! Into a dock on the left or right the same move runs sideways: it's worked out as if the tile were below, in a
+//! space turned so the dock's edge is at the bottom, and every edge, strip and piece of glass is turned back onto the
+//! screen as it's drawn. The picture itself stays upright.
 
-use egui::{Color32, Rect, pos2};
+use egui::{Color32, Pos2, Rect, pos2};
 use notchbase_paint::spring::{lerp, smoothstep};
+
+use crate::side::Side;
 
 /// How long the move takes unless told otherwise, in seconds.
 pub const FLY: f32 = 0.4;
@@ -30,10 +36,12 @@ pub enum Way {
 pub struct Flight {
     pub way: Way,
     pub id: u32,
-    /// The window's frame, global top-left points.
-    pub window: Rect,
-    /// The tile's icon, global top-left points; it moves while the tile slides into place.
-    pub tile: Rect,
+    /// The edge the dock it flies into stands on.
+    side: Side,
+    /// The window's frame and the tile's icon (which moves while the tile slides into place), both in the flight's
+    /// own space (see `into_space`): global top-left points along the bottom.
+    window: Rect,
+    tile: Rect,
     /// The tile's corner radius.
     pub tile_corner: f32,
     /// Seconds into the move.
@@ -76,6 +84,42 @@ pub struct Edge {
     pub right: f32,
 }
 
+/// A point on the screen in a flight's own space, where the dock's edge is below: turned on its side for a dock on
+/// the right (the right edge comes to the bottom) or the left (mirrored too, so the left edge does).
+fn into_space(side: Side, r: Rect) -> Rect {
+    match side {
+        Side::Bottom => r,
+        Side::Right => Rect::from_two_pos(pos2(r.min.y, r.min.x), pos2(r.max.y, r.max.x)),
+        Side::Left => Rect::from_two_pos(pos2(r.min.y, -r.min.x), pos2(r.max.y, -r.max.x)),
+    }
+}
+
+/// A point in a flight's own space, back on the screen.
+fn out_of_space(side: Side, p: Pos2) -> Pos2 {
+    match side {
+        Side::Bottom => p,
+        Side::Right => pos2(p.y, p.x),
+        Side::Left => pos2(-p.y, p.x),
+    }
+}
+
+fn out_of_space_rect(side: Side, r: Rect) -> Rect {
+    if side == Side::Bottom {
+        return r;
+    }
+    Rect::from_two_pos(out_of_space(side, r.min), out_of_space(side, r.max))
+}
+
+/// Where on the window's picture a point `u` across and `v` down the flight's own space is: the picture is upright on
+/// the screen whichever way the flight runs.
+fn picture_uv(side: Side, u: f32, v: f32) -> Pos2 {
+    match side {
+        Side::Bottom => pos2(u, v),
+        Side::Right => pos2(v, u),
+        Side::Left => pos2(1.0 - v, u),
+    }
+}
+
 /// The edge at height `y`, between the two edges either side of it.
 fn edge_at(edges: &[Edge], y: f32) -> Edge {
     let below = edges.iter().position(|e| e.y >= y).unwrap_or(edges.len() - 1);
@@ -89,6 +133,7 @@ impl Flight {
         Self {
             way,
             id,
+            side: Side::Bottom,
             window,
             tile,
             tile_corner: tile.width() * 0.225,
@@ -104,6 +149,30 @@ impl Flight {
             waited: 0.0,
             trace: None,
         }
+    }
+
+    /// Into (or out of) a dock on `side`: the same move, turned to run toward that edge.
+    pub fn toward(mut self, side: Side) -> Self {
+        let (window, tile) = (self.window_frame(), self.tile_frame());
+        self.side = side;
+        self.window = into_space(side, window);
+        self.tile = into_space(side, tile);
+        self
+    }
+
+    /// The window's frame, global top-left points.
+    pub fn window_frame(&self) -> Rect {
+        out_of_space_rect(self.side, self.window)
+    }
+
+    /// The tile's icon, global top-left points.
+    pub fn tile_frame(&self) -> Rect {
+        out_of_space_rect(self.side, self.tile)
+    }
+
+    /// The tile moved (it slides into place as its neighbours make room): global top-left points.
+    pub fn set_tile(&mut self, tile: Rect) {
+        self.tile = into_space(self.side, tile);
     }
 
     /// The same move over `seconds` instead (within reason).
@@ -180,8 +249,13 @@ impl Flight {
         (0..=STRIPS).map(|n| self.edge(n as f32 / STRIPS as f32)).collect()
     }
 
-    /// The box around it all now.
+    /// The box around it all now, global top-left points.
     pub fn shape(&self) -> Rect {
+        out_of_space_rect(self.side, self.shape_in_space())
+    }
+
+    /// The box around it all now, in the flight's own space.
+    fn shape_in_space(&self) -> Rect {
         let edges = self.edges();
         let left = edges.iter().map(|e| e.left).fold(f32::MAX, f32::min);
         let right = edges.iter().map(|e| e.right).fold(f32::MIN, f32::max);
@@ -197,7 +271,7 @@ impl Flight {
 
     pub fn corner(&self) -> f32 {
         let r = lerp(WINDOW_CORNER, self.tile_corner, smoothstep(0.3, 1.0, self.progress()));
-        let s = self.shape();
+        let s = self.shape_in_space();
         r.min(s.width().min(s.height()) * 0.5).max(0.0)
     }
 
@@ -209,9 +283,15 @@ impl Flight {
         // Half a pixel each side of the true edge.
         let feather = 0.5 / painter.ctx().pixels_per_point();
         let mut mesh = egui::Mesh::with_texture(texture);
+        let side = self.side;
         for (n, e) in self.edges().iter().enumerate() {
             let v = n as f32 / STRIPS as f32;
-            let vertex = |x: f32, u: f32, color| egui::epaint::Vertex { pos: pos2(x, e.y), uv: pos2(u, v), color };
+            // Worked out along the bottom, put back on the screen: the picture's own top stays its top.
+            let vertex = |x: f32, u: f32, color| egui::epaint::Vertex {
+                pos: out_of_space(side, pos2(x, e.y)),
+                uv: picture_uv(side, u, v),
+                color,
+            };
             mesh.vertices.push(vertex(e.left - feather, 0.0, clear));
             mesh.vertices.push(vertex(e.left + feather, 0.0, color));
             mesh.vertices.push(vertex(e.right - feather, 1.0, color));
@@ -260,7 +340,7 @@ impl Flight {
         cuts.extend(edges.iter().copied().filter(|e| e.y > from && e.y < to));
         cuts.push(edge_at(&edges, to));
         out.extend(cuts.windows(2).filter(|pair| pair[1].y > pair[0].y).map(|pair| slice(pair[0], pair[1], 0.0)));
-        let body = self.shape();
+        let body = self.shape_in_space();
         let reach = smoothstep(0.6, 0.88, k) * (1.0 - smoothstep(0.95, 1.0, k));
         let gap = self.tile.center().y - body.max.y;
         if reach > 0.02 && gap > 1.0 {
@@ -272,7 +352,13 @@ impl Flight {
             );
             out.push(Blob::rect(neck, width * 0.5, 10.0 * reach));
         }
-        out
+        match self.side {
+            Side::Bottom => out,
+            Side::Left | Side::Right => {
+                let mirrored = self.side == Side::Left;
+                out.into_iter().map(|b| b.turned(out_of_space(self.side, b.center), mirrored)).collect()
+            }
+        }
     }
 
     /// How much of the window's picture shows over the glass: all of it nearly all the way; it melts into the glass
@@ -462,6 +548,80 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn into_a_side_dock_it_runs_sideways_and_its_glass_still_hugs_the_picture() {
+        // A window in the middle of a 1470-point screen, a tile by the left or right edge.
+        let window = Rect::from_min_max(pos2(300.0, 120.0), pos2(1100.0, 700.0));
+        for (side, tile) in [
+            (Side::Left, Rect::from_min_max(pos2(12.0, 400.0), pos2(60.0, 448.0))),
+            (Side::Right, Rect::from_min_max(pos2(1410.0, 400.0), pos2(1458.0, 448.0))),
+        ] {
+            for way in [Way::Down, Way::Up] {
+                let mut f = Flight::new(way, 3, window, tile, None).toward(side);
+                let (from, to) = if way == Way::Down { (window, tile) } else { (tile, window) };
+                assert!((f.shape().center() - from.center()).length() < 0.5, "{side:?} {way:?} starts where it should");
+                assert!(
+                    (f.window_frame().min - window.min).length() < 1e-3
+                        && (f.tile_frame().max - tile.max).length() < 1e-3
+                );
+                for _ in 0..HELD_FRAMES {
+                    f.step(1.0 / 120.0);
+                }
+                let mut last = f.shape().center().x;
+                while !f.arrived() {
+                    f.step(1.0 / 120.0);
+                    let x = f.shape().center().x;
+                    assert!(
+                        (x - last) * (to.center().x - from.center().x) >= -0.01,
+                        "{side:?} {way:?} never turns back"
+                    );
+                    last = x;
+                    let blobs = f.blobs();
+                    let (top, bottom) = (f.edge(0.0).y, f.edge(1.0).y);
+                    let ends = f.corner() * 2.0 + 4.0;
+                    for n in 0..STRIPS * 2 {
+                        let e = f.edge((n as f32 + 0.5) / (STRIPS * 2) as f32);
+                        if e.y < top + ends || e.y > bottom - ends || e.right - e.left < 12.0 {
+                            continue;
+                        }
+                        for (inside, outside) in [(e.left + 5.0, e.left - 2.0), (e.right - 5.0, e.right + 2.0)] {
+                            let (i, o) =
+                                (out_of_space(side, pos2(inside, e.y)), out_of_space(side, pos2(outside, e.y)));
+                            assert!(crate::liquid::distance(&blobs, i) < 0.0, "{side:?} {way:?}: a gap at {i:?}");
+                            assert!(crate::liquid::distance(&blobs, o) > 0.0, "{side:?} {way:?}: a step out at {o:?}");
+                        }
+                    }
+                }
+                let end = f.shape();
+                assert!(
+                    (end.min - to.min).length() < 0.5 && (end.max - to.max).length() < 0.5,
+                    "{side:?} {way:?} lands"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_side_flights_picture_stays_upright() {
+        // The picture's top left corner stays at the window's top left, whichever way the flight runs.
+        for side in [Side::Bottom, Side::Left, Side::Right] {
+            let window = Rect::from_min_max(pos2(300.0, 120.0), pos2(1100.0, 700.0));
+            let f =
+                Flight::new(Way::Down, 1, window, Rect::from_min_size(pos2(10.0, 400.0), egui::vec2(48.0, 48.0)), None)
+                    .toward(side);
+            let mut corners = Vec::new();
+            for (n, e) in f.edges().iter().enumerate() {
+                let v = n as f32 / STRIPS as f32;
+                for (x, u) in [(e.left, 0.0), (e.right, 1.0)] {
+                    corners.push((out_of_space(side, pos2(x, e.y)), picture_uv(side, u, v)));
+                }
+            }
+            let top_left = corners.iter().min_by(|a, b| (a.0.x + a.0.y).total_cmp(&(b.0.x + b.0.y))).unwrap();
+            assert!((top_left.0 - window.min).length() < 0.5, "{side:?}");
+            assert!(top_left.1.x.abs() < 1e-4 && top_left.1.y.abs() < 1e-4, "{side:?}: uv {:?}", top_left.1);
         }
     }
 

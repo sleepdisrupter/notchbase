@@ -66,12 +66,19 @@ impl Shot {
             return self.pop(&mut gl, seconds, ppp);
         }
 
-        let size = vec2(WIDTH, WINDOW_HEIGHT);
         let mut config = config;
         config.show_names |= self.scene.starts_with("tooltip");
+        // `NOTCHBASE_DOCK_SNAPSHOT_SIDE=left` (or `right`): the dock down that side of a laptop's screen instead.
+        if let Some(side) = std::env::var("NOTCHBASE_DOCK_SNAPSHOT_SIDE").ok().and_then(|s| side_named(&s)) {
+            config.side = side;
+        }
+        let window = if config.side.vertical() { vec2(900.0, 956.0) } else { vec2(WIDTH, WINDOW_HEIGHT) };
         // Saves (a drop pins an app) go to a scratch folder, never the real config.
         let scratch = std::env::temp_dir().join("notchbase-dock-snapshot");
-        let mut dock = Dock::new(config, scratch, size);
+        let mut dock = Dock::new(config, scratch, window);
+        // The scenes below are laid out along the bottom; the frame puts their points where they are on the window.
+        let f = dock.frame();
+        let size = f.size();
         let mut running = os::running_apps();
         // The browser and player the ambient scenes show, as if running.
         let ambient = self.scene.starts_with("download") || self.scene.starts_with("pulse");
@@ -90,7 +97,7 @@ impl Shot {
         }
         dock.refresh(&running);
         dock.trash_full = os::trash_is_full();
-        let px = [(size.x * ppp) as u32, (size.y * ppp) as u32];
+        let px = [(window.x * ppp) as u32, (window.y * ppp) as u32];
         let target = Offscreen::new(&gl.gl, px);
         let liquid = Liquid::new(&gl.gl, gl.shader_version);
         let render = |gl: &mut GlWindow, dock: &mut Dock| {
@@ -123,22 +130,22 @@ impl Shot {
         match self.scene.as_str() {
             "rest" => steps(&mut gl, &mut dock, 0.5),
             "showcase" => {
-                dock.set_pointer(Some(pos2(nth_x(&dock, 3), icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, 3), icon_y))));
                 steps(&mut gl, &mut dock, 1.2);
             }
             "hover" => {
-                dock.set_pointer(Some(pos2(nth_x(&dock, 2), icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, 2), icon_y))));
                 steps(&mut gl, &mut dock, 1.2);
             }
             "tooltip-ooze" => {
-                dock.set_pointer(Some(pos2(nth_x(&dock, 2), icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, 2), icon_y))));
                 steps(&mut gl, &mut dock, 0.11);
             }
             "menu" | "menu-dark" | "menu-light" => {
                 // The first app with a menu that has dividers, in either appearance; "menu" is the second app's own.
                 dock.dark = self.scene != "menu-light";
                 let nth = if self.scene == "menu" { 1 } else { 0 };
-                dock.set_pointer(Some(pos2(nth_x(&dock, nth), icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, nth), icon_y))));
                 steps(&mut gl, &mut dock, 0.3);
                 if nth == 0 {
                     dock.show_sample_menu();
@@ -159,14 +166,14 @@ impl Shot {
                     .iter()
                     .position(|t| Provider::of(&t.path) == Some(provider))
                     .ok_or("that app isn't in the dock")?;
-                dock.set_pointer(Some(pos2(nth_x(&dock, n), icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, n), icon_y))));
                 steps(&mut gl, &mut dock, 0.3);
                 dock.press(true);
                 dock.release();
                 steps(&mut gl, &mut dock, 1.2);
             }
             "menu-ooze" => {
-                dock.set_pointer(Some(pos2(nth_x(&dock, 1), icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, 1), icon_y))));
                 steps(&mut gl, &mut dock, 0.3);
                 dock.press(true);
                 dock.release();
@@ -174,7 +181,7 @@ impl Shot {
             }
             "stack" => {
                 let n = dock.tiles.iter().position(|t| t.kind == crate::tiles::Kind::Folder).unwrap_or(0);
-                dock.set_pointer(Some(pos2(nth_x(&dock, n) + 18.0, icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, n) + 18.0, icon_y))));
                 steps(&mut gl, &mut dock, 0.3);
                 dock.press(false);
                 dock.release();
@@ -254,7 +261,7 @@ impl Shot {
                         steps(&mut gl, &mut dock, at);
                     }
                     _ => {
-                        dock.set_pointer(Some(tile));
+                        dock.set_pointer(Some(f.pt(tile)));
                         steps(&mut gl, &mut dock, 0.3);
                         dock.press(false);
                         dock.release();
@@ -310,7 +317,7 @@ impl Shot {
                 };
                 let n =
                     dock.tiles.iter().position(|t| t.pid.is_some() && t.kind == crate::tiles::Kind::App).unwrap_or(0);
-                dock.set_pointer(Some(pos2(nth_x(&dock, n), icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(nth_x(&dock, n), icon_y))));
                 steps(&mut gl, &mut dock, 0.36);
                 let more = if self.scene == "previews" { 0.9 } else { 0.1 };
                 steps(&mut gl, &mut dock, more);
@@ -324,7 +331,7 @@ impl Shot {
             "cradle" | "landing" => {
                 // An app dragged over the gap between the second and third pinned apps, and in the landing, let go.
                 let x = (nth_x(&dock, 1) + nth_x(&dock, 2)) * 0.5;
-                dock.set_pointer(Some(pos2(x, icon_y)));
+                dock.set_pointer(Some(f.pt(pos2(x, icon_y))));
                 dock.hover_file(PathBuf::from("/System/Applications/Calculator.app"));
                 steps(&mut gl, &mut dock, 0.6);
                 if self.scene == "landing" {
@@ -503,8 +510,6 @@ fn sample_downloads(count: usize) -> Result<PathBuf, String> {
         if name.ends_with(".heic") && !photos.is_empty() {
             #[cfg(unix)]
             let _ = std::os::unix::fs::symlink(&photos[n % photos.len()], &path);
-            #[cfg(windows)]
-            let _ = std::fs::copy(&photos[n % photos.len()], &path);
         } else if name.ends_with("Project Files") || name.ends_with(".app") {
             let _ = std::fs::create_dir_all(&path);
         } else {
@@ -521,4 +526,8 @@ fn sample_downloads(count: usize) -> Result<PathBuf, String> {
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+fn side_named(name: &str) -> Option<crate::side::Side> {
+    serde_json::from_value(serde_json::Value::String(name.trim().to_lowercase())).ok()
 }

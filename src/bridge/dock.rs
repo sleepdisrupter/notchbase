@@ -6,6 +6,8 @@
 pub struct DockView {
     pub found: bool,
     pub running: bool,
+    /// The edge of the screen the dock stands on.
+    pub side: DockSide,
     pub tile_size: f32,
     pub magnification: bool,
     pub show_names: bool,
@@ -42,6 +44,7 @@ impl DockView {
     pub const DEFAULT: Self = Self {
         found: false,
         running: false,
+        side: DockSide::Bottom,
         tile_size: 48.0,
         magnification: true,
         show_names: false,
@@ -60,6 +63,33 @@ impl DockView {
         stack_view: DockStackView::Automatic,
         stack_sort: DockStackSort::Added,
     };
+}
+
+/// The edge of the screen the dock stands on: along the bottom, or down the left or right side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DockSide {
+    Left,
+    #[default]
+    Bottom,
+    Right,
+}
+
+impl DockSide {
+    /// In the order they sit on the screen, as Settings lists them.
+    pub const ALL: [Self; 3] = [Self::Left, Self::Bottom, Self::Right];
+
+    /// The name `dock.json` and `dock-areas.json` use.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Bottom => "bottom",
+            Self::Right => "right",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.key() == key)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -116,6 +146,7 @@ impl DockStackSort {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DockChange {
     Running(bool),
+    Side(DockSide),
     TileSize(f32),
     Magnification(bool),
     ShowNames(bool),

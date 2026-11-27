@@ -114,7 +114,7 @@ impl Dock {
     pub(super) fn paint_tile_bar(&self, painter: &egui::Painter, key: &str, at: Pos2, tile: f32) {
         if let Some(b) = self.bars.iter().find(|b| b.key == key) {
             let fill = (!b.glide).then_some(b.fill.value.clamp(0.0, 1.0));
-            paint_bar(painter, at, tile, fill, b.shown.value.clamp(0.0, 1.0), self.time);
+            paint_bar(painter, at, tile, fill, b.shown.value.clamp(0.0, 1.0), self.time, self.side().vertical());
         }
     }
 
@@ -140,24 +140,43 @@ impl Dock {
 /// The thin bar under a tile: a track with the part done filled in, or a light gliding along it when how far along
 /// isn't known. It's [`WIDTH`] long under icons from 32 points up and half the icon under smaller ones, so it stays
 /// inside the icon's art.
-pub(super) fn paint_bar(painter: &egui::Painter, at: Pos2, tile: f32, fill: Option<f32>, alpha: f32, time: f32) {
+/// A bar centred on `at` (window points) in the strip under an icon. Beside a side dock (`standing`) that strip runs
+/// up and down, so the bar stands up in it and fills from the bottom, like a glass filling.
+pub(super) fn paint_bar(
+    painter: &egui::Painter,
+    at: Pos2,
+    tile: f32,
+    fill: Option<f32>,
+    alpha: f32,
+    time: f32,
+    standing: bool,
+) {
     if alpha <= 0.0 {
         return;
     }
     let width = bar_width(tile);
+    // Laid out lying down along x, then stood up about `at` if need be: its left end at the bottom, so a filling
+    // bar fills upward.
+    let stand = |r: Rect| {
+        if standing {
+            Rect::from_center_size(at + vec2(0.0, at.x - r.center().x), vec2(r.height(), r.width()))
+        } else {
+            r
+        }
+    };
     let track = Rect::from_center_size(at, vec2(width, HEIGHT));
-    painter.rect_filled(track, HEIGHT * 0.5, white(0.16 * alpha));
+    painter.rect_filled(stand(track), HEIGHT * 0.5, white(0.16 * alpha));
     match fill {
         Some(f) => {
             let done = Rect::from_min_size(track.min, vec2((width * f).max(HEIGHT), HEIGHT));
-            painter.rect_filled(done, HEIGHT * 0.5, white(0.8 * alpha));
+            painter.rect_filled(stand(done), HEIGHT * 0.5, white(0.8 * alpha));
         }
         None => {
             let phase = 0.5 - 0.5 * (time * std::f32::consts::TAU / 1.4).cos();
             let light = width * 0.375;
             let x = lerp(track.left() + light * 0.5, track.right() - light * 0.5, phase);
             painter.rect_filled(
-                Rect::from_center_size(pos2(x, at.y), vec2(light, HEIGHT)),
+                stand(Rect::from_center_size(pos2(x, at.y), vec2(light, HEIGHT))),
                 HEIGHT * 0.5,
                 white(0.75 * alpha),
             );

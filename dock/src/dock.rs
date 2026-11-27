@@ -15,6 +15,7 @@ use crate::layout::{self, Placed, Slot};
 use crate::liquid::Blob;
 use crate::minimized::Minimized;
 use crate::os;
+use crate::side::{Frame, Side};
 use crate::tiles::{self, Kind, Tile};
 use crate::usage::{self, Provider, Usage};
 use crate::windows::{self, Win};
@@ -281,7 +282,13 @@ pub struct Dock {
     pub config: Config,
     dir: PathBuf,
     pub tiles: Vec<Tile>,
+    /// The dock's own layout's size (`side::Frame`): the edge's length across, and how far the window reaches in.
     pub size: Vec2,
+    /// The edge the window is laid out along, and the window's size in points.
+    side: Side,
+    window: Vec2,
+    /// The pointer on the window. The bar answers it in its own layout (`at`); menus and panels, upright on the
+    /// window, answer it as it is.
     pointer: Option<Pos2>,
     press: Option<Press>,
     /// The icon lifted under the pointer.
@@ -368,12 +375,16 @@ pub struct Dock {
 }
 
 impl Dock {
-    pub fn new(config: Config, dir: PathBuf, size: Vec2) -> Self {
+    /// A dock for a window of `window` points along the edge `config.side` names.
+    pub fn new(config: Config, dir: PathBuf, window: Vec2) -> Self {
+        let side = config.side;
         Self {
             config,
             dir,
             tiles: Vec::new(),
-            size,
+            size: Frame::new(side, window).size(),
+            side,
+            window,
             pointer: None,
             press: None,
             hovered: None,
@@ -441,6 +452,44 @@ impl Dock {
 
     fn tile_size(&self) -> f32 {
         self.config.tile_size
+    }
+
+    /// The window was placed (again) along `side`, `window` points big.
+    pub fn set_window(&mut self, side: Side, window: Vec2) {
+        if side != self.side {
+            self.close_popup();
+            self.press = None;
+            self.drag = None;
+            self.resizing = None;
+        }
+        self.side = side;
+        self.window = window;
+        self.size = self.frame().size();
+    }
+
+    /// The edge the window is laid out along now.
+    pub fn side(&self) -> Side {
+        self.side
+    }
+
+    /// The window's size in points.
+    pub fn window_size(&self) -> Vec2 {
+        self.window
+    }
+
+    /// The map from the dock's own layout to its window.
+    pub fn frame(&self) -> Frame {
+        Frame::new(self.side, self.window)
+    }
+
+    /// The pointer in the dock's own layout.
+    fn at(&self) -> Option<Pos2> {
+        self.pointer.map(|p| self.frame().unpt(p))
+    }
+
+    /// How far a point on the window is from the screen's edge the dock stands on.
+    pub fn edge_distance(&self, p: Pos2) -> f32 {
+        self.size.y - self.frame().unpt(p).y
     }
 
     fn peak(&self) -> f32 {
@@ -562,6 +611,7 @@ impl Dock {
                 ]
             },
             panel: self.popup.as_ref().map(|p| p.drawn).filter(|r| r.is_positive()).map(|r| (r.top(), r.bottom())),
+            side: self.side,
         }
     }
 
@@ -698,7 +748,7 @@ impl Dock {
         } else {
             t.key.clone()
         };
-        self.tile_index(&key).map(|i| self.icon_rect(i))
+        self.tile_index(&key).map(|i| self.icon_on_window(i))
     }
 
     /// With `by_app`, clicks that window's app's icon instead.
@@ -740,12 +790,20 @@ impl Dock {
         }
     }
 
-    /// Where a window's tile's icon is now, in dock points.
+    /// Where a window's tile's icon is now, in window points.
     pub fn window_tile(&self, id: u32) -> Option<Rect> {
         let key = tiles::window_key(id);
-        self.tile_index(&key).map(|i| self.icon_rect(i))
+        self.tile_index(&key).map(|i| self.icon_on_window(i))
     }
 
+    /// Where a window's tile goes before the dock has made one: the middle of the bar, on the window.
+    pub fn spare_tile(&self) -> Rect {
+        let tile = self.tile_size();
+        let r = Rect::from_center_size(pos2(self.size.x * 0.5, self.icon_bottom() - tile * 0.5), Vec2::splat(tile));
+        self.frame().rect(r)
+    }
+
+    /// The pointer on the window, in points.
     pub fn set_pointer(&mut self, at: Option<Pos2>) {
         self.pointer = at;
     }
@@ -909,7 +967,7 @@ impl Dock {
     }
 
     pub fn press(&mut self, right: bool) {
-        let Some(at) = self.pointer else { return };
+        let (Some(at), Some(v)) = (self.pointer, self.at()) else { return };
         if self.stack_press(at, right) {
             return;
         }
@@ -930,16 +988,16 @@ impl Dock {
             self.dwell.done = true;
         }
         let (placed, refs) = self.place();
-        if self.separator_at(at, &placed, &refs) {
+        if self.separator_at(v, &placed, &refs) {
             if right {
                 self.open_separator_menu();
             } else {
-                self.resizing = Some((at.y, self.tile_size()));
+                self.resizing = Some((v.y, self.tile_size()));
             }
             self.press = Some(Press { at, when: Instant::now(), tile: None, entry: None, right, handled: true });
             return;
         }
-        let tile = self.tile_at(at, &placed, &refs).map(|i| self.tiles[i].key.clone());
+        let tile = self.tile_at(v, &placed, &refs).map(|i| self.tiles[i].key.clone());
         if right && let Some(key) = &tile {
             self.open_menu(key.clone());
             self.press = Some(Press { at, when: Instant::now(), tile, entry: None, right, handled: true });
@@ -968,7 +1026,7 @@ impl Dock {
         if press.handled || press.right {
             return;
         }
-        let Some(at) = self.pointer else { return };
+        let Some(at) = self.at() else { return };
         if self.stack_release() {
             return;
         }
@@ -1019,7 +1077,12 @@ impl Dock {
         self.icon_bottom() - self.tile_size() * scale
     }
 
-    /// Where the icon is drawn right now, in dock points.
+    /// Where the icon is drawn right now, on the window.
+    pub(crate) fn icon_on_window(&self, i: usize) -> Rect {
+        self.frame().rect(self.icon_rect(i))
+    }
+
+    /// Where the icon is drawn right now, in the dock's own layout.
     pub(crate) fn icon_rect(&self, i: usize) -> Rect {
         let (placed, refs) = self.place();
         let slot = refs.iter().position(|r| *r == Some(i)).map(|s| placed[s]);
@@ -1053,7 +1116,7 @@ impl Dock {
                     os::activate(pid);
                 }
                 os::open(&path);
-                let icon = self.icon_rect(i);
+                let icon = self.icon_on_window(i);
                 let swells = self.config.launch_effect_for(&path) != crate::config::LaunchEffect::Off;
                 let t = &mut self.tiles[i];
                 if swells {
@@ -1067,7 +1130,7 @@ impl Dock {
             }
             Kind::Window => {
                 if let Some((pid, win)) = self.tiles[i].window.clone() {
-                    let icon = self.icon_rect(i);
+                    let icon = self.icon_on_window(i);
                     self.effects.push(Effect::Restore { pid, id: win.id, icon });
                     // Its tile goes at once, as the window comes back up.
                     self.restored.push((win.id, Instant::now()));
@@ -1608,7 +1671,7 @@ impl Dock {
         if self.land(&files) {
             return;
         }
-        let Some(at) = self.pointer else { return };
+        let Some(at) = self.at() else { return };
         let over = self.tile_at(at, placed, refs);
         let apps: Vec<&PathBuf> = files.iter().filter(|f| os::is_app(f)).collect();
         match over.map(|i| (self.tiles[i].kind, self.tiles[i].path.clone(), i)) {
@@ -1740,8 +1803,8 @@ impl Dock {
             && !incoming.apps.is_empty()
             && self.away.target == 0.0
             && self.drag.is_none()
-            && self.pointer.is_some_and(|p| p.y > self.body_top() - 40.0);
-        let before = if over { self.pointer.and_then(|p| self.insertion_before(p.x)) } else { None };
+            && self.at().is_some_and(|p| p.y > self.body_top() - 40.0);
+        let before = if over { self.at().and_then(|p| self.insertion_before(p.x)) } else { None };
         let was = incoming.before;
         let open = incoming.open.value;
         if let Some(before) = before
@@ -1823,7 +1886,7 @@ impl Dock {
         self.away.step(dt);
         self.tucked.step(dt);
         // Dragging the separator up makes the icons bigger, down smaller, point for point, as in the Dock.
-        if let (Some((from, size)), Some(p)) = (self.resizing, self.pointer) {
+        if let (Some((from, size)), Some(p)) = (self.resizing, self.at()) {
             let wanted = (size + (from - p.y)).clamp(SMALLEST, LARGEST).round();
             if wanted != self.config.tile_size {
                 self.config.tile_size = wanted;
@@ -1832,7 +1895,7 @@ impl Dock {
         }
         let (placed, refs) = self.place();
         self.over_separator =
-            self.resizing.is_some() || self.pointer.is_some_and(|p| self.separator_at(p, &placed, &refs));
+            self.resizing.is_some() || self.at().is_some_and(|p| self.separator_at(p, &placed, &refs));
         self.handle_drops(&placed, &refs);
         self.update_incoming(dt);
         for b in &mut self.bursts {
@@ -1843,11 +1906,12 @@ impl Dock {
         self.step_bars(dt);
 
         // Hold to open the menu, move to drag.
-        if let (Some(press), Some(at)) = (&mut self.press, self.pointer)
+        let at_now = self.at();
+        if let (Some(press), Some(on_window), Some(at)) = (&mut self.press, self.pointer, at_now)
             && !press.handled
             && let Some(key) = press.tile.clone()
         {
-            let moved = (at - press.at).length() > DRAG_START;
+            let moved = (on_window - press.at).length() > DRAG_START;
             let is_app = self.tiles.iter().find(|t| t.key == key).is_some_and(|t| t.kind == Kind::App && !is_finder(t));
             if moved && is_app && self.drag.is_none() {
                 press.handled = true;
@@ -1865,7 +1929,7 @@ impl Dock {
                 self.open_menu(key);
             }
         }
-        if let (Some(at), true) = (self.pointer, self.drag.is_some()) {
+        if let (Some(at), true) = (self.at(), self.drag.is_some()) {
             self.update_drag(at);
         }
         if let Some(drag) = &mut self.drag {
@@ -1875,7 +1939,7 @@ impl Dock {
         }
 
         // Magnify while the pointer is over the dock.
-        let hot = self.pointer.is_some_and(|p| {
+        let hot = self.at().is_some_and(|p| {
             let top = self.icon_top(self.peak()) - PAD_TOP;
             let span = placed.first().zip(placed.last()).map(|(a, b)| (a.left - EDGE, b.right() + EDGE));
             span.is_some_and(|(l, r)| p.x >= l && p.x <= r && p.y >= top && p.y <= self.size.y)
@@ -1885,7 +1949,7 @@ impl Dock {
         // An app held over the gap is landing, not being dropped onto its neighbour.
         let landing = self.incoming.as_ref().is_some_and(|g| g.open.target > 0.0);
         let under = if (hot || self.files_over) && self.drag.is_none() && !landing {
-            self.pointer.and_then(|p| {
+            self.at().and_then(|p| {
                 // Hold on to the icon already lifted until the pointer is clearly past its edge, so a pointer
                 // resting on the line between two icons doesn't flick between them.
                 let held = self.hovered.as_deref().and_then(|key| self.tile_index(key)).filter(|&i| {
@@ -2002,6 +2066,9 @@ impl Dock {
         faded.set_opacity(self.opacity());
         let painter = &faded;
         let mut blobs = Vec::with_capacity(48);
+        // Everything of the bar is laid out along the bottom and put on the window through the frame; what's upright
+        // (icons' pictures, words, panels) is drawn where the frame puts it.
+        let f = self.frame();
         let (placed, refs) = self.place();
         let tile = self.tile_size();
         let bottom = self.bottom();
@@ -2021,23 +2088,32 @@ impl Dock {
             let slab_bottom = if p > 0.0 { self.cover_slab_bottom(radius + 2.0) } else { bottom };
             let rect = Rect::from_min_max(pos2(first.left - EDGE, top), pos2(last.right() + EDGE, slab_bottom));
             bounds = rect;
-            blobs.push(Blob::rect(rect, radius, 0.0));
+            blobs.push(f.blob(Blob::rect(rect, radius, 0.0)));
             // Wherever the system Dock actually is (its size and how far Mission Control raises it differ between
-            // Macs and macOS versions), the glass reaches over it, melting out of the slab.
-            if let Some(real) = self.real_dock.filter(|_| p > 0.0).map(|r| r.expand(COVER_REACH))
+            // Macs and macOS versions), the glass reaches over it, melting out of the slab. The system Dock stays along
+            // the bottom, so a dock on a side leaves it be.
+            if let Some(real) =
+                self.real_dock.filter(|_| p > 0.0 && !f.side.vertical()).map(|r| f.unrect(r).expand(COVER_REACH))
                 && !rect.contains_rect(real)
             {
                 let reach =
                     real.union(Rect::from_min_max(pos2(real.left(), real.top()), pos2(real.right(), slab_bottom)));
-                blobs.push(Blob::rect(reach, (reach.height() * 0.5).min(radius), 14.0 * self.cover_ease()));
+                blobs.push(f.blob(Blob::rect(reach, (reach.height() * 0.5).min(radius), 14.0 * self.cover_ease())));
             }
         }
         if let Some(sep) = placed.iter().zip(&refs).find_map(|(s, r)| (r.is_none() && !s.gap).then_some(*s)) {
             let ppp = painter.pixels_per_point();
-            let x = (sep.center() * ppp).round() / ppp + 0.5 / ppp;
             let h = tile * 0.6;
             let cy = top + body_h * 0.5;
-            painter.line_segment([pos2(x, cy - h * 0.5), pos2(x, cy + h * 0.5)], (1.0, white(0.15)));
+            // A hairline on the pixel grid, across the body.
+            let (a, b) = (f.pt(pos2(sep.center(), cy - h * 0.5)), f.pt(pos2(sep.center(), cy + h * 0.5)));
+            let grid = |v: f32| (v * ppp).round() / ppp + 0.5 / ppp;
+            let (a, b) = if f.side.vertical() {
+                (pos2(a.x, grid(a.y)), pos2(b.x, grid(b.y)))
+            } else {
+                (pos2(grid(a.x), a.y), pos2(grid(b.x), b.y))
+            };
+            painter.line_segment([a, b], (1.0, white(0.15)));
         }
 
         // The cradle: the glass swells softly where a dragged-in app will land, holding a ghost of it.
@@ -2050,7 +2126,7 @@ impl Dock {
             let rise = 5.0 * o.min(1.2);
             let w = tile * 0.92 * o.min(1.1);
             let rect = Rect::from_min_max(pos2(x - w * 0.5, top - rise), pos2(x + w * 0.5, top + body_h * 0.5));
-            blobs.push(Blob::rect(rect, tile * 0.3, 22.0 * (1.0 - (-rise / 6.0).exp())));
+            blobs.push(f.blob(Blob::rect(rect, tile * 0.3, 22.0 * (1.0 - (-rise / 6.0).exp()))));
             if g.icon.is_none()
                 && let Some(app) = g.apps.first()
                 && let Some(img) = os::icon_for_path(app, 128)
@@ -2065,7 +2141,7 @@ impl Dock {
                 let alpha = 0.45 * smoothstep(0.3, 1.0, o);
                 painter.image(
                     tex.id(),
-                    Rect::from_center_size(c, Vec2::splat(size)),
+                    Rect::from_center_size(f.pt(c), Vec2::splat(size)),
                     uv,
                     Color32::WHITE.gamma_multiply(alpha),
                 );
@@ -2086,23 +2162,25 @@ impl Dock {
                 // It buds up out of the dock's glass, still joined to it by a melting neck.
                 let c = b.at - vec2(0.0, r * BURST_RISE * grow);
                 let melt = 20.0 * (1.0 - grow * 0.6);
-                blobs.push(Blob::rect(Rect::from_center_size(c, half * 2.0), half.x.min(half.y), melt));
+                blobs.push(f.blob(Blob::rect(Rect::from_center_size(c, half * 2.0), half.x.min(half.y), melt)));
+                // The bubble on the window, where its picture and highlight stay upright.
+                let (on, half) = (f.pt(c), f.extent(half));
                 if let Some(tex) = &b.icon {
                     let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
                     let size = b.size * lerp(1.0, 0.62, grow);
                     let alpha = 1.0 - smoothstep(0.15, 0.95, k);
-                    painter.image(tex.id(), Rect::from_center_size(c, Vec2::splat(size)), uv, white(alpha));
+                    painter.image(tex.id(), Rect::from_center_size(on, Vec2::splat(size)), uv, white(alpha));
                 }
                 // The glossy rim: a thin highlight high on the left.
                 let glint: Vec<Pos2> = (0..12)
                     .map(|n| {
                         let a = lerp(-2.75, -1.75, n as f32 / 11.0);
-                        c + vec2(a.cos() * half.x, a.sin() * half.y) * 0.86
+                        on + vec2(a.cos() * half.x, a.sin() * half.y) * 0.86
                     })
                     .collect();
                 painter.add(Shape::line(glint, (1.5, white(0.5 * smoothstep(0.0, 0.4, k)))));
                 // The keyline the dock's glass has, so the black bubble reads against a dark window.
-                let rim = Shape::ellipse_stroke(c, half, (1.0, white(0.16 * smoothstep(0.0, 0.5, k))));
+                let rim = Shape::ellipse_stroke(on, half, (1.0, white(0.16 * smoothstep(0.0, 0.5, k))));
                 painter.add(rim);
                 continue;
             }
@@ -2112,7 +2190,7 @@ impl Dock {
             // What's left of the skin collapses into the middle as it snaps open.
             let core = r * 1.32 * (1.0 - smoothstep(0.0, 0.35, u)).powf(1.5);
             if core > 0.5 {
-                blobs.push(Blob::circle(c, core, 0.0));
+                blobs.push(f.blob(Blob::circle(c, core, 0.0)));
             }
             // The droplets leave from the rim and stay joined to it for a moment, like liquid tearing.
             let melt = 12.0 * (1.0 - smoothstep(0.0, 0.3, u));
@@ -2121,11 +2199,11 @@ impl Dock {
                 let at = c + out + *v * s + vec2(0.0, 0.5 * BURST_GRAVITY * s * s);
                 let size = dr * (1.0 - u).powf(0.9);
                 if size > 0.4 {
-                    blobs.push(Blob::circle(at, size, melt));
+                    blobs.push(f.blob(Blob::circle(at, size, melt)));
                 }
             }
             let ring = 1.0 - (1.0 - u).powi(2);
-            painter.circle_stroke(c, r * 1.32 + 16.0 * ring, (1.0, white(0.22 * (1.0 - ring))));
+            painter.circle_stroke(f.pt(c), r * 1.32 + 16.0 * ring, (1.0, white(0.22 * (1.0 - ring))));
         }
 
         // Running dots sit in the middle of the space under the icons' art.
@@ -2163,7 +2241,7 @@ impl Dock {
                 // barely there would still bulge the body by k/6, and the bulge would vanish in one frame when the
                 // rise is dropped.
                 let height = (top - rect.top()).max(0.0);
-                blobs.push(Blob::rect(rect, size * 0.32, 22.0 * (1.0 - (-height / 6.0).exp())));
+                blobs.push(f.blob(Blob::rect(rect, size * 0.32, 22.0 * (1.0 - (-height / 6.0).exp()))));
             }
 
             if t.popped {
@@ -2174,7 +2252,7 @@ impl Dock {
                 let rise = (1.0 - p) * tile * 1.25;
                 let r = tile * 0.5 * p.max(0.0).powf(0.55) + 0.5;
                 let c = pos2(cx, top + tile * 0.25 - rise);
-                blobs.push(Blob::circle(c, r, 22.0 * p.max(0.0).powf(1.4)));
+                blobs.push(f.blob(Blob::circle(c, r, 22.0 * p.max(0.0).powf(1.4))));
                 let icon = Rect::from_center_size(c, Vec2::splat(tile * 0.86 * p.max(0.0).powf(0.7)));
                 icons.push((i, icon, p.clamp(0.0, 1.0)));
                 continue;
@@ -2184,7 +2262,7 @@ impl Dock {
                 let bead = (p.clamp(0.0, 1.0) * std::f32::consts::PI).sin();
                 let r = tile * 0.46 * bead;
                 if r > 0.5 {
-                    blobs.push(Blob::circle(pos2(cx, top + 2.0 - bead * tile * 0.18), r, 16.0));
+                    blobs.push(f.blob(Blob::circle(pos2(cx, top + 2.0 - bead * tile * 0.18), r, 16.0)));
                 }
             }
             if dragged.as_deref() == Some(&t.key) {
@@ -2200,9 +2278,9 @@ impl Dock {
             icons.push((i, icon, smoothstep(0.0, 0.6, p)));
 
             if t.kind == Kind::Folder {
-                self.paint_progress(painter, i, pos2(cx, dot_y), tile);
+                self.paint_progress(painter, i, f.pt(pos2(cx, dot_y)), tile);
             }
-            self.paint_tile_bar(painter, &t.key, pos2(cx, dot_y), tile);
+            self.paint_tile_bar(painter, &t.key, f.pt(pos2(cx, dot_y)), tile);
             let t = &self.tiles[i];
             // A download's bar takes the running dot's place while it shows.
             let dot_alpha = 1.0 - self.bar_shown(&t.key);
@@ -2210,7 +2288,7 @@ impl Dock {
             if let Some(started) = t.launching {
                 let since = started.elapsed().as_secs_f32();
                 let breathe = 0.5 - 0.5 * (since * std::f32::consts::TAU / 1.1).cos();
-                let c = pos2(cx, dot_y);
+                let c = f.pt(pos2(cx, dot_y));
                 painter.circle_filled(c, 1.5, white((0.2 + 0.5 * breathe) * smoothstep(0.0, 0.15, since)));
             }
 
@@ -2219,10 +2297,10 @@ impl Dock {
             if d > 0.02 {
                 let stretch = (t.dot.velocity.abs() * 0.12).min(0.9);
                 let r = 1.5 * d.min(1.2);
-                let c = pos2(cx, dot_y - stretch * 2.0);
+                let c = f.pt(pos2(cx, dot_y - stretch * 2.0));
                 painter.add(Shape::ellipse_filled(
                     c,
-                    vec2(r * (1.0 - stretch * 0.3), r * (1.0 + stretch)),
+                    f.extent(vec2(r * (1.0 - stretch * 0.3), r * (1.0 + stretch))),
                     white(0.7 * d.min(1.0) * dot_alpha),
                 ));
             }
@@ -2234,15 +2312,20 @@ impl Dock {
         {
             let c = pos2(drag.at[0].value, drag.at[1].value);
             let size = tile * lerp(1.06, 0.9, drag.removing.value);
-            blobs.push(Blob::circle(c, size * 0.58, 26.0));
+            blobs.push(f.blob(Blob::circle(c, size * 0.58, 26.0)));
             let alpha = lerp(1.0, 0.55, drag.removing.value);
             icons.push((i, Rect::from_center_size(c, Vec2::splat(size)), alpha));
             if drag.removing.value > 0.05 {
                 let words = "Remove";
                 let a = drag.removing.value;
-                let at = c - vec2(0.0, size * 0.5 + 18.0);
                 let galley = painter.layout_no_wrap(words.into(), font::semibold(12.0), PEARL);
                 let w = galley.size().x + 20.0;
+                // Above the icon along the bottom; beside it, upright, on a side.
+                let at = if f.side.vertical() {
+                    f.beside(c.x, c.y - size * 0.5 - 8.0, vec2(w, 22.0), 4.0).center()
+                } else {
+                    c - vec2(0.0, size * 0.5 + 18.0)
+                };
                 blobs.push(Blob::rect(Rect::from_center_size(at, vec2(w, 22.0) * a.max(0.2)), 11.0, 10.0 * (1.0 - a)));
                 painter.text(
                     at,
@@ -2272,14 +2355,20 @@ impl Dock {
             let slot_scale = refs.iter().position(|r| *r == Some(i)).map_or(1.0, |s| placed[s].scale);
             let from_y = self.icon_top(slot_scale) - 2.0;
             let rest_y = self.icon_top(self.peak()) - PAD_TOP - 22.0;
-            let y = lerp(from_y, rest_y, o.min(1.15));
             let size =
                 vec2(lerp(16.0, self.tooltip.width.value, o.clamp(0.0, 1.1)), lerp(10.0, 26.0, o.clamp(0.0, 1.1)));
-            let rect = Rect::from_center_size(pos2(x, y), size);
+            // Its middle, in the layout: above the icon along the bottom. On a side the pill stays upright, so it
+            // reaches as far out as it is wide; its near end keeps the same air from the icon.
+            let y = if f.side.vertical() {
+                lerp(from_y + 5.0, rest_y + 13.0, o.min(1.15)) - size.x * 0.5
+            } else {
+                lerp(from_y, rest_y, o.min(1.15))
+            };
+            let rect = Rect::from_center_size(f.pt(pos2(x, y)), size);
             if o < 0.97 {
                 let neck_w = lerp(12.0, 1.0, smoothstep(0.2, 0.95, o));
                 let neck = Rect::from_min_max(pos2(x - neck_w * 0.5, y), pos2(x + neck_w * 0.5, from_y + 8.0));
-                blobs.push(Blob::rect(neck, neck_w * 0.5, 12.0));
+                blobs.push(f.blob(Blob::rect(neck, neck_w * 0.5, 12.0)));
             }
             blobs.push(Blob::rect(rect, size.y * 0.5, 14.0 * (1.0 - smoothstep(0.5, 1.0, o))));
             let a = smoothstep(0.55, 0.95, o);
@@ -2305,6 +2394,7 @@ impl Dock {
         if zone.is_positive() {
             zone.min.y = zone.min.y.min(swell_top);
             zone.max.y = self.size.y;
+            zone = f.rect(zone);
         }
         if let Some(p) = &self.popup {
             zone = zone.union(p.rect);
@@ -2319,6 +2409,7 @@ impl Dock {
         let peak = self.peak();
         let icon_top_rest = self.icon_top(1.0);
         let size_x = self.size.x;
+        let f = self.frame();
         let pointer = self.pointer;
         let icon_bottom = self.icon_bottom();
         // A floating panel clears the hovered icon's rise, not just the dock's edge.
@@ -2368,20 +2459,17 @@ impl Dock {
         };
         let o = popup.open.value;
         let gap = if float { FLOAT_GAP } else { NECK_GAP };
-        let final_rect = {
-            let half = w * 0.5 + 8.0;
-            let x = cx.clamp(half, (size_x - half).max(half));
-            let base = if float { float_bottom } else { body_top };
-            Rect::from_min_max(pos2(x - w * 0.5, base - gap - h), pos2(x + w * 0.5, base - gap))
-        };
-        let rect = panel_now(final_rect, cx, icon_top, o, float);
+        // Above the icon along the bottom, beside it on a side: upright either way.
+        let base = if float { float_bottom } else { body_top };
+        let final_rect = f.beside(cx, base - gap, vec2(w, h), 8.0);
+        let rect = panel_on(f, final_rect, cx, icon_top, o, float);
         let size = rect.size();
         popup.rect = final_rect;
         popup.drawn = rect;
         if !float {
-            blobs.extend(neck(cx, rect, body_top, tile_size));
+            blobs.extend(neck_on(f, cx, rect, body_top, tile_size));
         }
-        blobs.push(Blob::rect(rect, 15.0_f32.min(size.y * 0.5), if float { 0.0 } else { 8.0 }));
+        blobs.push(Blob::rect(rect, 15.0_f32.min(size.min_elem() * 0.5), if float { 0.0 } else { 8.0 }));
 
         // Contents only show inside the liquid as it grows.
         let clipped = painter.with_clip_rect(rect.shrink(3.0));
@@ -2481,6 +2569,7 @@ impl Dock {
             thumbs.collect(painter.ctx());
         }
         let size_x = self.size.x;
+        let f = self.frame();
         let pointer = self.pointer;
         // A floating panel clears the hovered icon's rise, not just the dock's edge.
         let float_bottom = (self.icon_top(self.peak()) - self.hover_lift() - PAD_TOP).min(self.body_top());
@@ -2513,15 +2602,16 @@ impl Dock {
         let aspects: Vec<f32> = wins.iter().map(aspect).collect();
         let n = wins.len().max(1) as f32;
         let natural: f32 = aspects.iter().sum::<f32>().max(0.7);
-        let room = size_x - 48.0 - 2.0 * PANEL_PAD - CARD_GAP * (n - 1.0);
+        let gap = if float { FLOAT_GAP } else { NECK_GAP };
+        let base = if float { float_bottom } else { body_top };
+        // The pictures shrink to fit across the screen along the bottom, or into the room beside a side dock.
+        let across = if f.side.vertical() { base - gap - 16.0 } else { size_x - 48.0 };
+        let room = across - 2.0 * PANEL_PAD - CARD_GAP * (n - 1.0);
         let thumb_h = THUMB_HEIGHT.min(room / natural).max(56.0);
         let w = natural * thumb_h + CARD_GAP * (n - 1.0) + 2.0 * PANEL_PAD;
         let h = PANEL_PAD + thumb_h + 6.0 + TITLE_HEIGHT + PANEL_PAD - 4.0;
-        let gap = if float { FLOAT_GAP } else { NECK_GAP };
-        let half = w * 0.5 + 8.0;
-        let target_x = cx.clamp(half, (size_x - half).max(half));
-        let base = if float { float_bottom } else { body_top };
-        let target = [target_x, base - gap - h * 0.5, w, h, cx];
+        let placed_at = f.beside(cx, base - gap, vec2(w, h), 8.0).center();
+        let target = [placed_at.x, placed_at.y, w, h, cx];
 
         let frame = popup.frame.get_or_insert_with(|| target.map(|v| Spring::new(v, PANEL_MOVE, POINT_PRECISION)));
         for (s, v) in frame.iter_mut().zip(target) {
@@ -2530,20 +2620,20 @@ impl Dock {
         let [fx, fy, fw, fh, stem_x] = frame.each_ref().map(|s| s.value);
         let o = popup.open.value;
         let settled = Rect::from_center_size(pos2(fx, fy), vec2(fw, fh));
-        let rect = panel_now(settled, stem_x, icon_top, o, float);
+        let rect = panel_on(f, settled, stem_x, icon_top, o, float);
         let size = rect.size();
         popup.drawn = rect;
         // The panel and the strip down to the icon, so the pointer can travel between them.
         let bridge = Rect::from_min_max(
-            pos2(stem_x - tile_size * 0.5, settled.bottom()),
+            pos2(stem_x - tile_size * 0.5, f.unrect(settled).bottom()),
             pos2(stem_x + tile_size * 0.5, icon_top + 2.0),
         );
-        popup.rect = settled.union(bridge);
+        popup.rect = settled.union(f.rect(bridge));
 
         if !float {
-            blobs.extend(neck(stem_x, rect, body_top, tile_size));
+            blobs.extend(neck_on(f, stem_x, rect, body_top, tile_size));
         }
-        blobs.push(Blob::rect(rect, 18.0_f32.min(size.y * 0.5), if float { 0.0 } else { 8.0 }));
+        blobs.push(Blob::rect(rect, 18.0_f32.min(size.min_elem() * 0.5), if float { 0.0 } else { 8.0 }));
 
         let clipped = painter.with_clip_rect(rect.shrink(3.0));
         let painter = &clipped;
@@ -2682,6 +2772,8 @@ impl Dock {
             pos2(rect.center().x - rect.width() * optical * 0.5, rect.bottom() - rect.height() * (1.0 + optical) * 0.5),
             pos2(rect.center().x + rect.width() * optical * 0.5, rect.bottom() - rect.height() * (1.0 - optical) * 0.5),
         );
+        // Laid out along the bottom, drawn upright on the window.
+        let rect = Frame::new(self.side, self.window).rect(rect);
         // Whole device pixels, so icons stay razor sharp.
         let ppp = painter.pixels_per_point();
         let snap = |v: f32| (v * ppp).round() / ppp;
@@ -2848,6 +2940,17 @@ fn neck(x: f32, popup: Rect, body_top: f32, tile: f32) -> Option<Blob> {
     let w = (tile * 0.65).min(popup.width());
     let neck = Rect::from_min_max(pos2(x - w * 0.5, popup.bottom() - 6.0), pos2(x + w * 0.5, body_top + 6.0));
     (neck.height() > 0.0 && w > 1.0).then(|| Blob::rect(neck, 4.0, 12.0))
+}
+
+/// [`panel_now`] for a panel on the window: worked out in the dock's own layout, so on a side it grows out of the
+/// icon sideways, toward the panel.
+fn panel_on(f: Frame, settled: Rect, icon_x: f32, icon_top: f32, open: f32, float: bool) -> Rect {
+    f.rect(panel_now(f.unrect(settled), icon_x, icon_top, open, float))
+}
+
+/// [`neck`] for a panel on the window.
+fn neck_on(f: Frame, x: f32, popup: Rect, body_top: f32, tile: f32) -> Option<Blob> {
+    neck(x, f.unrect(popup), body_top, tile).map(|b| f.blob(b))
 }
 
 fn is_finder(t: &Tile) -> bool {

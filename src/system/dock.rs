@@ -7,17 +7,17 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value};
 
-use crate::bridge::{DockChange, DockMissionControl, DockStackSort, DockStackView, DockView};
+use crate::bridge::{DockChange, DockMissionControl, DockSide, DockStackSort, DockStackView, DockView};
 
-/// Whether this platform has the dock at all.
-pub(crate) const SUPPORTED: bool = cfg!(any(target_os = "macos", windows));
-#[cfg_attr(windows, allow(dead_code))]
+/// Whether this platform has the dock at all: macOS only (Windows had it until 0.33).
+pub(crate) const SUPPORTED: bool = cfg!(target_os = "macos");
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const BUNDLE_ID: &str = "app.notchbase.dock";
 /// Where notchbase.app carries the dock, relative to its `Contents` folder.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const HELPER: &str = "Helpers/notchbase dock.app";
 const FILE: &str = "dock.json";
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PID_FILE: &str = "dock.pid";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Under the pid in the pid file when the dock can make way for a newer copy without showing the macOS Dock.
@@ -25,7 +25,7 @@ const CAN_HAND_OVER: &str = "handover";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The note that asks it to (the dock removes it).
 const HANDOVER_FILE: &str = "handover";
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// How long an old dock gets to quit before it's stopped outright.
 const QUIT_WAIT: Duration = Duration::from_secs(3);
 const LOOK_EVERY: Duration = Duration::from_millis(700);
@@ -123,10 +123,10 @@ impl DockLink {
     }
 }
 
-/// Each screen notchbase dock is up on (its display number) and how much of the bottom it keeps there, in points,
-/// from the `dock-areas.json` it keeps while it runs. Read at most twice a second.
-pub(crate) fn reserved_bottoms() -> Vec<(u64, f32)> {
-    type Seen = Option<(Instant, Vec<(u64, f32)>)>;
+/// Each screen notchbase dock is up on (its display number), how much of that screen it keeps in points, and from
+/// which edge, from the `dock-areas.json` it keeps while it runs. Read at most twice a second.
+pub(crate) fn reserved_edges() -> Vec<(u64, f32, DockSide)> {
+    type Seen = Option<(Instant, Vec<(u64, f32, DockSide)>)>;
     static SEEN: std::sync::Mutex<Seen> = std::sync::Mutex::new(None);
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, bottoms)) = seen.as_ref()
@@ -146,13 +146,15 @@ pub(crate) fn reserved_bottoms() -> Vec<(u64, f32)> {
 
 const AREAS_FILE: &str = "dock-areas.json";
 
-fn parse_areas(text: &str) -> Vec<(u64, f32)> {
+fn parse_areas(text: &str) -> Vec<(u64, f32, DockSide)> {
     let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
     rows.iter()
         .filter_map(|row| {
             let display = row.get("display")?.as_u64()?;
             let reserved = row.get("reserved")?.as_f64()? as f32;
-            (reserved > 0.0 && reserved < 400.0).then_some((display, reserved))
+            // Docks before 0.33 only ever stood along the bottom and didn't say.
+            let side = row.get("side").and_then(Value::as_str).and_then(DockSide::from_key).unwrap_or_default();
+            (reserved > 0.0 && reserved < 400.0).then_some((display, reserved, side))
         })
         .collect()
 }
@@ -200,6 +202,7 @@ pub(crate) fn view_of(object: Option<&Map<String, Value>>) -> DockView {
     DockView {
         found: true,
         running: false,
+        side: text("side").and_then(DockSide::from_key).unwrap_or(base.side),
         tile_size: number("tile_size", base.tile_size).clamp(16.0, 128.0),
         magnification: flag("magnification", base.magnification),
         show_names: flag("show_names", base.show_names),
@@ -238,6 +241,7 @@ pub(crate) fn write_change(o: &mut Map<String, Value>, change: &DockChange) {
     let number = |n: f32| Value::from((f64::from(n) * 100.0).round() / 100.0);
     match change {
         DockChange::Running(_) => {}
+        DockChange::Side(side) => set("side", Value::from(side.key())),
         DockChange::TileSize(size) => {
             let size = size.clamp(16.0, 128.0).round();
             set("tile_size", number(size));
@@ -270,12 +274,12 @@ pub(crate) fn write_change(o: &mut Map<String, Value>, change: &DockChange) {
     }
 }
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn pid(dir: &Path) -> Option<i32> {
     read_pid(&std::fs::read_to_string(dir.join(PID_FILE)).ok()?)
 }
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The pid on the pid file's first line.
 fn read_pid(text: &str) -> Option<i32> {
     text.lines().next()?.trim().parse().ok()
@@ -322,7 +326,7 @@ fn outdated_now(dir: &Path) -> bool {
     outdated(running.as_deref().map(canonical).as_deref(), started, &canonical(&bundled), replaced)
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(target_os = "macos"))]
 fn outdated_now(_: &Path) -> bool {
     false
 }
@@ -371,7 +375,7 @@ fn make_way(dir: &Path) -> bool {
     wait(QUIT_WAIT)
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(target_os = "macos"))]
 fn make_way(_: &Path) -> bool {
     false
 }
@@ -381,14 +385,13 @@ fn running(dir: &Path) -> bool {
     pid(dir).is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(target_os = "macos"))]
 fn running(_: &Path) -> bool {
     false
 }
 
 /// Starts the dock (it hides the macOS Dock itself): the copy inside notchbase.app when there is one, or else wherever
 /// macOS knows it, such as the standalone build in `target/release`.
-#[cfg(not(windows))]
 fn start() {
     if !SUPPORTED {
         return;
@@ -403,14 +406,13 @@ fn start() {
 }
 
 /// `notchbase.app/Contents/Helpers/notchbase dock.app`, beside the running notchbase.
-#[cfg(not(windows))]
 fn bundled() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     helper_beside(&exe).filter(|app| app.join("Contents/MacOS").is_dir())
 }
 
 /// Where the helper sits for an executable in `Contents/MacOS`.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn helper_beside(exe: &Path) -> Option<PathBuf> {
     let contents = exe.parent()?.parent()?;
     (contents.file_name()? == "Contents").then(|| contents.join(HELPER))
@@ -424,77 +426,58 @@ fn stop(dir: &Path) {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(target_os = "macos"))]
 fn stop(_: &Path) {}
 
+/// Windows had notchbase dock until 0.33, which made it a macOS thing only. A dock an older notchbase left running
+/// is asked to quit (it puts the taskbar back on its way out), the taskbar is put back if a dock was stopped with it
+/// put away, and the copies older versions wrote out are deleted. Off the main thread; nothing to do takes no time.
 #[cfg(windows)]
-use windows::{make_way, outdated_now, running, start, stop};
+pub(crate) fn retire() {
+    let _ = std::thread::Builder::new().name("old dock".into()).spawn(|| windows::retire(&data_dir()));
+}
 
-/// On Windows notchbase ships as one exe, so the dock rides inside it (when the release build put it there) and is
-/// written out next to notchbase's other files, one folder per version, the first time it's started. A dock built
-/// beside notchbase (`cargo build` puts both in `target\release`) is used before that.
 #[cfg(windows)]
 mod windows {
-    use std::os::windows::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use serde_json::Value;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, STILL_ACTIVE, TRUE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
         QueryFullProcessImageNameW, TerminateProcess,
     };
+    use windows_sys::Win32::UI::Shell::{ABM_SETSTATE, ABS_ALWAYSONTOP, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ANIMATIONINFO, EnumWindows, FindWindowW, GetClassNameW, SPI_SETANIMATION, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
+        SW_SHOWNA, ShowWindow, SystemParametersInfoW,
+    };
+    use windows_sys::core::BOOL;
 
     use super::{QUIT_WAIT, pid};
 
-    const EXE: &str = "notchbase-dock.exe";
-    /// The note the dock looks for on every tick, and quits when it finds.
+    /// The note the old dock looks for on every tick, and quits when it finds.
     const QUIT_FILE: &str = "quit";
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    /// What the old dock saved before putting the taskbar away.
+    const SAVED_TASKBAR: &str = "saved-taskbar.json";
 
-    #[cfg(bundled_dock)]
-    static BUNDLED: &[u8] = include_bytes!(env!("NOTCHBASE_BUNDLED_DOCK"));
-    #[cfg(not(bundled_dock))]
-    static BUNDLED: &[u8] = &[];
-
-    /// `%LOCALAPPDATA%\notchbase\dock`, where each version's dock is written out.
-    fn unpacked_root() -> Option<PathBuf> {
-        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-        Some(base.join("notchbase").join("dock"))
-    }
-
-    fn unpacked() -> Option<PathBuf> {
-        Some(unpacked_root()?.join(env!("CARGO_PKG_VERSION")).join(EXE))
-    }
-
-    /// The dock built next to this notchbase, for builds being tried out.
-    fn beside() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        Some(exe.parent()?.join(EXE)).filter(|p| p.is_file())
-    }
-
-    /// The dock that came with this notchbase, written out if it isn't yet.
-    fn bundled() -> Option<PathBuf> {
-        if BUNDLED.is_empty() {
-            return None;
+    pub(super) fn retire(dir: &Path) {
+        if let Some(pid) = dock_pid(dir) {
+            quit(dir, pid);
         }
-        let path = unpacked()?;
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() == BUNDLED.len() as u64) {
-            return Some(path);
+        if dock_pid(dir).is_some() {
+            return;
         }
-        std::fs::create_dir_all(path.parent()?).ok()?;
-        let partial = path.with_extension("exe.partial");
-        std::fs::write(&partial, BUNDLED).ok()?;
-        std::fs::rename(&partial, &path).ok()?;
-        Some(path)
+        restore_taskbar(dir);
+        // `%LOCALAPPDATA%\notchbase\dock`, where older versions wrote their dock out.
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            let _ = std::fs::remove_dir_all(base.join("notchbase").join("dock"));
+        }
+        let _ = std::fs::remove_file(dir.join(super::PID_FILE));
     }
 
-    fn program() -> Option<PathBuf> {
-        beside().or_else(bundled)
-    }
-
-    fn open(pid: i32, access: u32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    fn open(pid: i32, access: u32) -> Option<HANDLE> {
         if pid <= 0 {
             return None;
         }
@@ -527,39 +510,12 @@ mod windows {
         (stem == "notchbase-dock").then_some(pid)
     }
 
-    pub(in crate::system::dock) fn running(dir: &Path) -> bool {
-        dock_pid(dir).is_some()
-    }
-
-    pub(in crate::system::dock) fn start() {
-        let Some(program) = program() else { return };
-        let _ = std::process::Command::new(program).creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).spawn();
-    }
-
-    /// Asks the dock to quit: it puts the taskbar back on its way out.
-    pub(in crate::system::dock) fn stop(dir: &Path) {
+    /// Asks the dock to quit, and stops it outright if it hasn't within a few seconds.
+    fn quit(dir: &Path, pid: i32) {
         let _ = std::fs::write(dir.join(QUIT_FILE), "");
-    }
-
-    /// Whether the running dock is one this notchbase wrote out for an older version.
-    pub(in crate::system::dock) fn outdated_now(dir: &Path) -> bool {
-        if BUNDLED.is_empty() {
-            return false;
-        }
-        let (Some(pid), Some(root), Some(ours)) = (dock_pid(dir), unpacked_root(), unpacked()) else { return false };
-        let Some(running) = program_of(pid) else { return false };
-        let same = |a: &Path, b: &Path| a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy());
-        running.starts_with(&root) && !same(&running, &ours)
-    }
-
-    /// Asks the running dock to quit, and stops it outright if it hasn't within a few seconds (the next dock puts
-    /// back the taskbar it left hidden, then hides it again). True once it's gone.
-    pub(in crate::system::dock) fn make_way(dir: &Path) -> bool {
-        let Some(pid) = dock_pid(dir) else { return true };
-        stop(dir);
-        let until = Instant::now() + QUIT_WAIT;
+        let until = Instant::now() + QUIT_WAIT * 2;
         while Instant::now() < until && alive(pid) {
-            std::thread::sleep(Duration::from_millis(40));
+            std::thread::sleep(Duration::from_millis(50));
         }
         if alive(pid)
             && let Some(handle) = open(pid, PROCESS_TERMINATE)
@@ -568,7 +524,51 @@ mod windows {
             unsafe { CloseHandle(handle) };
             std::thread::sleep(Duration::from_millis(200));
         }
-        !alive(pid)
+        let _ = std::fs::remove_file(dir.join(QUIT_FILE));
+    }
+
+    /// Puts the taskbar back as the old dock found it, when it was stopped before it could do that itself.
+    fn restore_taskbar(dir: &Path) {
+        let path = dir.join(SAVED_TASKBAR);
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let saved = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+        let autohide = saved.get("autohide").and_then(Value::as_bool).unwrap_or(false);
+        let min_animate = saved.get("min_animate").and_then(Value::as_bool).unwrap_or(true);
+        for hwnd in taskbars() {
+            unsafe { ShowWindow(hwnd, SW_SHOWNA) };
+        }
+        let mut data: APPBARDATA = unsafe { std::mem::zeroed() };
+        data.cbSize = size_of::<APPBARDATA>() as u32;
+        data.hWnd = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
+        data.lParam = if autohide { ABS_AUTOHIDE as LPARAM } else { ABS_ALWAYSONTOP as LPARAM };
+        unsafe { SHAppBarMessage(ABM_SETSTATE, &mut data) };
+        let mut info = ANIMATIONINFO { cbSize: size_of::<ANIMATIONINFO>() as u32, iMinAnimate: i32::from(min_animate) };
+        let flags = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE;
+        unsafe { SystemParametersInfoW(SPI_SETANIMATION, info.cbSize, (&raw mut info).cast(), flags) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The taskbar on the main screen and the ones on the others.
+    fn taskbars() -> Vec<HWND> {
+        unsafe extern "system" fn visit(hwnd: HWND, found: LPARAM) -> BOOL {
+            let mut name = [0u16; 64];
+            let len = unsafe { GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32) }.max(0) as usize;
+            if String::from_utf16_lossy(&name[..len]) == "Shell_SecondaryTrayWnd" {
+                unsafe { &mut *(found as *mut Vec<HWND>) }.push(hwnd);
+            }
+            TRUE
+        }
+        let mut found = Vec::new();
+        let main = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
+        if !main.is_null() {
+            found.push(main);
+        }
+        unsafe { EnumWindows(Some(visit), (&raw mut found) as LPARAM) };
+        found
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 }
 
@@ -617,8 +617,8 @@ mod tests {
 
     #[test]
     fn the_docks_areas_file_reads_as_screens_and_heights() {
-        let text = r#"[{"display": 1, "reserved": 70.0}, {"display": 4, "reserved": 74.5}]"#;
-        assert_eq!(parse_areas(text), vec![(1, 70.0), (4, 74.5)]);
+        let text = r#"[{"display": 1, "reserved": 70.0}, {"display": 4, "reserved": 74.5, "side": "left"}]"#;
+        assert_eq!(parse_areas(text), vec![(1, 70.0, DockSide::Bottom), (4, 74.5, DockSide::Left)]);
         assert!(parse_areas("").is_empty() && parse_areas("{}").is_empty());
         assert_eq!(
             parse_areas(r#"[{"display": 1, "reserved": 0}, {"display": 2}]"#),

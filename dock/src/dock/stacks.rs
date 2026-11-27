@@ -520,7 +520,9 @@ impl Dock {
             self.set_listing(folder.clone(), listing);
         }
         let count = self.stacks.get(&folder).map_or(0, |s| s.items.len());
-        let layout = stack::shape(self.config.stack_view, count);
+        // A fan rises up out of a dock along the bottom; beside a side dock a folder opens as a grid, as the Dock's
+        // own stacks do there.
+        let layout = if self.side().vertical() { Layout::Grid } else { stack::shape(self.config.stack_view, count) };
         let fanned = count.min(stack::FAN_MOST);
         let paths: Vec<PathBuf> = self
             .stacks
@@ -1052,7 +1054,10 @@ impl Dock {
         let PopupKind::Stack(s) = &mut popup.kind else { return None };
         let pointer = if s.menu.is_some() { None } else { self.pointer };
         let carded = s.menu.as_ref().map(|m| m.path.clone());
-        let most_cols = (((self.size.x - 48.0 - SIDE * 2.0) / CELL.x).floor() as usize).max(3);
+        let f = self.frame();
+        // As many columns as fit across the screen along the bottom, or beside a side dock.
+        let across = if f.side.vertical() { at.base - 24.0 } else { self.size.x - 48.0 };
+        let most_cols = (((across - SIDE * 2.0) / CELL.x).floor() as usize).max(3);
         let cols = stack::grid_columns(items.len()).min(most_cols);
         let midnight = local_midnight(SystemTime::now());
         let by = self.config.stack_sort;
@@ -1073,17 +1078,14 @@ impl Dock {
         s.searching = stack_keys && (items.len() > SEARCH_FROM || !s.query.is_empty());
 
         let w = cols as f32 * CELL.x + SIDE * 2.0;
-        let room = (at.base - 8.0).min(MOST_HEIGHT);
+        let room = if f.side.vertical() { f.window.y - 16.0 } else { at.base - 8.0 }.min(MOST_HEIGHT);
         let content =
             if m.shown.is_empty() { EMPTY_HEIGHT } else { m.height.min((room - HEADER - FOOTER).max(CELL.y + 12.0)) };
         s.scroll_most = (m.height - content).max(0.0);
         let h = HEADER + content + FOOTER;
-        let final_rect = {
-            let half = w * 0.5 + 8.0;
-            let x = at.cx.clamp(half, (self.size.x - half).max(half));
-            Rect::from_min_max(pos2(x - w * 0.5, at.base - h), pos2(x + w * 0.5, at.base))
-        };
-        let mut rect = panel_now(final_rect, at.cx, at.icon_top, open, at.float);
+        let final_rect = f.beside(at.cx, at.base, vec2(w, h), 8.0);
+        // Worked out in the dock's own layout, so beside a side dock it grows out sideways.
+        let mut rect = panel_now(f.unrect(final_rect), at.cx, at.icon_top, open, at.float);
         // A floating panel opens from a third of its size; closing, it goes on shrinking into the tile, to nothing
         // by the time it's gone, rather than stopping at that third and vanishing.
         if shut && at.float {
@@ -1091,10 +1093,11 @@ impl Dock {
             let anchor = pos2(at.cx.clamp(rect.left(), rect.right()), rect.bottom());
             rect = Rect::from_min_max(anchor + (rect.min - anchor) * k, anchor + (rect.max - anchor) * k);
         }
+        let rect = f.rect(rect);
         popup.rect = final_rect;
         popup.drawn = rect;
         if !at.float {
-            blobs.extend(neck(at.cx, rect, at.body_top, self.tile_size()));
+            blobs.extend(neck(at.cx, f.unrect(rect), at.body_top, self.tile_size()).map(|b| f.blob(b)));
         }
         blobs.push(Blob::rect(rect, RADIUS.min(rect.height() * 0.5), if at.float { 0.0 } else { 8.0 }));
         let clipped = painter.with_clip_rect(rect.shrink(2.0));
@@ -1313,11 +1316,13 @@ impl Dock {
     fn compose_card(&mut self, painter: &egui::Painter, popup: &mut Popup, base: f32) {
         let dark = self.dark;
         let pointer = self.pointer;
+        let f = self.frame();
         let width = self.size.x;
         let PopupKind::Stack(s) = &mut popup.kind else { return };
         let Some(menu) = &mut s.menu else { return };
         let h = card_height();
-        let room = Rect::from_min_max(pos2(8.0, 8.0), pos2(width - 8.0, base));
+        // Anywhere on the window clear of the dock.
+        let room = f.rect(Rect::from_min_max(pos2(8.0, 8.0), pos2(width - 8.0, base)));
         // Like a context menu: its corner at the pointer, opening down and right, or the other way where there's
         // no room.
         let x = if menu.at.x + CARD_WIDTH <= room.right() { menu.at.x } else { menu.at.x - CARD_WIDTH };
@@ -1415,7 +1420,7 @@ impl Dock {
         if self.stacks.get(&self.tiles[i].path).is_none_or(|s| s.partial == 0) {
             return;
         }
-        super::ambient::paint_bar(painter, at, tile, None, 1.0, self.time);
+        super::ambient::paint_bar(painter, at, tile, None, 1.0, self.time, self.side().vertical());
     }
 }
 

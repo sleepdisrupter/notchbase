@@ -109,25 +109,48 @@ const SIZE: u32 = 2;
 /// How far down from a window's top a double-click counts as the title bar: a title bar with a toolbar under it.
 const TITLE_BAR: f64 = 52.0;
 
-/// The area windows fill: the screen under the menu bar, down to just above the dock. Global top-left points.
+/// The area windows fill: the screen under the menu bar, clear of the dock on whichever edge it stands. Global
+/// top-left points.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Area {
     pub left: f64,
     pub top: f64,
     pub right: f64,
     pub bottom: f64,
-    /// The screen's very top and bottom: a window filled by macOS reaches the bottom.
+    /// The screen's very edges: a window filled by macOS reaches them.
+    pub screen_left: f64,
     pub screen_top: f64,
+    pub screen_right: f64,
     pub screen_bottom: f64,
 }
 
 impl Area {
     /// How much of a window at `pos` of `size` is on this area's screen, in square points.
     fn overlap(&self, pos: Xy, size: Xy) -> f64 {
-        let w = (pos.x + size.x).min(self.right) - pos.x.max(self.left);
+        let w = (pos.x + size.x).min(self.screen_right) - pos.x.max(self.screen_left);
         let h = (pos.y + size.y).min(self.screen_bottom) - pos.y.max(self.screen_top);
         w.max(0.0) * h.max(0.0)
     }
+}
+
+/// A window at `pos` of `size` that runs under the dock (to the screen's edge the dock stands on, as zoom, Fill and
+/// tiling leave it), pulled back to end just clear of it: its new place and size, or `None` to leave it alone. One
+/// placed short of the edge, or that would be left a sliver, is left alone.
+fn fitted(area: &Area, pos: Xy, size: Xy) -> Option<(Xy, Xy)> {
+    let (mut at, mut to) = (pos, size);
+    let bottom = pos.y + size.y;
+    if bottom >= area.screen_bottom - 2.0 && bottom > area.bottom + 1.0 && pos.y < area.bottom - 120.0 {
+        to.y = area.bottom - pos.y;
+    }
+    if pos.x <= area.screen_left + 2.0 && pos.x < area.left - 1.0 && pos.x + size.x > area.left + 120.0 {
+        at.x = area.left;
+        to.x = pos.x + size.x - area.left;
+    }
+    let right = at.x + to.x;
+    if right >= area.screen_right - 2.0 && right > area.right + 1.0 && at.x < area.right - 120.0 {
+        to.x = area.right - at.x;
+    }
+    (at != pos || to != size).then_some((at, to))
 }
 
 /// The area a window fills: on the screen most of it is on, else the one under its middle. Global top-left points.
@@ -137,10 +160,9 @@ fn area_for(areas: &[Area], pos: Xy, size: Xy) -> Option<Area> {
         return Some(*best);
     }
     let middle = Xy { x: pos.x + size.x * 0.5, y: pos.y + size.y * 0.5 };
-    areas
-        .iter()
-        .copied()
-        .find(|a| (a.left..a.right).contains(&middle.x) && (a.screen_top..a.screen_bottom).contains(&middle.y))
+    areas.iter().copied().find(|a| {
+        (a.screen_left..a.screen_right).contains(&middle.x) && (a.screen_top..a.screen_bottom).contains(&middle.y)
+    })
 }
 
 /// The area windows fill on each screen, shared with the tap's thread. Empty leaves windows alone.
@@ -373,27 +395,29 @@ extern "C" fn on_window_change(_: AxObserver, window: AxElement, _: *const c_voi
     fit_if_filled(window, &areas);
 }
 
-/// Shortens a window that runs to the bottom of the screen, under the dock, so it ends above it.
-fn fit_if_filled(window: AxElement, areas: &[Area]) {
+/// Pulls back a window that runs under the dock, so it ends just clear of it. Returns true when it moved one.
+pub(crate) fn fit_if_filled(window: AxElement, areas: &[Area]) -> bool {
     if copy_bool(window, ns_string!("AXFullScreen")) == Some(true) {
-        return;
+        return false;
     }
     let (Some(at), Some(size)) =
         (value(window, ns_string!("AXPosition"), POINT), value(window, ns_string!("AXSize"), SIZE))
     else {
-        return;
+        return false;
     };
-    let Some(area) = area_for(areas, at, size) else { return };
+    let Some(area) = area_for(areas, at, size) else { return false };
     let middle = at.x + size.x * 0.5;
-    let bottom = at.y + size.y;
-    if !(area.left..area.right).contains(&middle)
-        || bottom < area.screen_bottom - 2.0
-        || bottom <= area.bottom + 1.0
-        || at.y >= area.bottom - 120.0
-    {
-        return;
+    if !(area.screen_left..area.screen_right).contains(&middle) {
+        return false;
     }
-    set_value(window, ns_string!("AXSize"), SIZE, Xy { x: size.x, y: area.bottom - at.y });
+    let Some((pos, to)) = fitted(&area, at, size) else { return false };
+    // Narrowed first, so moving it never pushes it past the screen; sized again for apps that clamp to the old place.
+    set_value(window, ns_string!("AXSize"), SIZE, to);
+    if pos != at {
+        set_value(window, ns_string!("AXPosition"), POINT, pos);
+        set_value(window, ns_string!("AXSize"), SIZE, to);
+    }
+    true
 }
 
 extern "C" fn on_event(_: *const c_void, kind: u32, event: *mut c_void, _: *mut c_void) -> *mut c_void {
@@ -860,7 +884,16 @@ mod tests {
     use super::*;
 
     fn area(left: f64, top: f64, w: f64, h: f64, menu: f64, dock: f64) -> Area {
-        Area { left, top: top + menu, right: left + w, bottom: top + h - dock, screen_top: top, screen_bottom: top + h }
+        Area {
+            left,
+            top: top + menu,
+            right: left + w,
+            bottom: top + h - dock,
+            screen_left: left,
+            screen_top: top,
+            screen_right: left + w,
+            screen_bottom: top + h,
+        }
     }
 
     #[test]
@@ -881,5 +914,27 @@ mod tests {
         // The monitor fills from its own menu bar to its very bottom; the laptop stops above the dock.
         assert_eq!((monitor.top, monitor.bottom), (-86.0, 1089.0));
         assert_eq!((laptop.top, laptop.bottom), (33.0, 876.0));
+    }
+
+    #[test]
+    fn a_window_under_the_dock_is_pulled_back_to_its_edge_on_whichever_side_it_stands() {
+        let at = |x, y| Xy { x, y };
+        // Along the bottom: a zoomed window is shortened to end above it.
+        let bottom = area(0.0, 0.0, 1470.0, 956.0, 33.0, 80.0);
+        assert_eq!(fitted(&bottom, at(0.0, 33.0), at(1470.0, 923.0)), Some((at(0.0, 33.0), at(1470.0, 843.0))));
+        assert_eq!(fitted(&bottom, at(100.0, 100.0), at(600.0, 400.0)), None, "placed short of the edge");
+        // On the left: the window starts just right of the dock, as wide as is left.
+        let left = Area { left: 80.0, bottom: 956.0, ..bottom };
+        assert_eq!(fitted(&left, at(0.0, 33.0), at(1470.0, 923.0)), Some((at(80.0, 33.0), at(1390.0, 923.0))));
+        assert_eq!(
+            fitted(&left, at(0.0, 33.0), at(735.0, 923.0)),
+            Some((at(80.0, 33.0), at(655.0, 923.0))),
+            "a left half"
+        );
+        assert_eq!(fitted(&left, at(735.0, 33.0), at(735.0, 923.0)), None, "the right half is clear of it");
+        // On the right: the window ends just left of it.
+        let right = Area { right: 1390.0, bottom: 956.0, ..bottom };
+        assert_eq!(fitted(&right, at(735.0, 33.0), at(735.0, 923.0)), Some((at(735.0, 33.0), at(655.0, 923.0))));
+        assert_eq!(fitted(&right, at(0.0, 33.0), at(735.0, 923.0)), None);
     }
 }

@@ -362,7 +362,7 @@ Edits here apply while notchbase runs. See [Find](Find.md).
 
 ### dock
 
-macOS only. [notchbase dock](../dock/README.md) is off for everyone until it's turned on. Until then notchbase never starts it and the macOS Dock is left as it is. The dock's own settings live in its `dock.json`, which **Settings › Dock** edits (see [Pages](Pages.md#dock-pagessettingsdockrs)).
+macOS only (Windows had it until 0.33; updating there quits an old dock and puts the taskbar back). [notchbase dock](../dock/README.md) is off for everyone until it's turned on. Until then notchbase never starts it and the macOS Dock is left as it is. The dock's own settings live in its `dock.json`, which **Settings › Dock** edits (see [Pages](Pages.md#dock-pagessettingsdockrs)).
 
 | Key | Default | Meaning |
 | --- | --- | --- |

@@ -1,7 +1,6 @@
 # notchbase dock
 
-A Dock for macOS and Windows in the notchbase style (Windows is described under [On Windows](#on-windows)). On macOS it
-is a separate app that ships inside `notchbase.app` (in
+A Dock for macOS in the notchbase style. It is a separate app that ships inside `notchbase.app` (in
 `Contents/Helpers`, signed with notchbase's certificate) and is off until someone turns it on, from the one-time
 "Meet notchbase dock" notice or **Settings › Dock** in notchbase. From then on notchbase starts it whenever notchbase
 starts. Every setting below can be changed on that page. `scripts/bundle-dock-macos.sh` still builds it on its own in
@@ -45,6 +44,12 @@ droplet, and a quitting app's slot pinches off and melts back in.
   icon. Raising a single window uses Accessibility, the same permission `avoid_windows` asks for.
 - When Mission Control, App Exposé, Launchpad or the system Dock come up, the dock fades out in place (about 200ms,
   settling 3pt) and fades back when they go.
+- **Position** (`side` in `dock.json`: `bottom`, `left` or `right`): the dock stands along the bottom of the screen or
+  down either side, centred. Everything works the same there: the hover lift, the dots and download bars, dragging the
+  separator to size it (sideways), menus, window previews and stacks (beside it, upright), minimizing and restoring
+  (the window flies sideways into its tile), coming out from that edge over a full-screen app, and keeping zoomed,
+  filled and double-clicked windows clear of it. Stacks open as a grid on a side. `side.rs` turns the dock's own
+  layout (drawn as if along the bottom) onto its window; what has to be read stays upright.
 
 ## The system Dock
 
@@ -122,7 +127,8 @@ The scenes are `rest`, `hover`, `tooltip-ooze`, `menu`, `menu-claude`, `menu-cha
 - `real_dock.rs`, `lifecycle.rs`: hiding and restoring the system Dock, the pid file, signals and the panic hook.
 - `windows.rs`: an app's windows for the previews: listing them, capturing pictures on a thread of their own, and raising
   or closing one through Accessibility.
-- `avoid.rs`: keeps zoomed, filled and tiled windows above the dock.
+- `avoid.rs`: keeps zoomed, filled and tiled windows clear of the dock, on whichever edge it stands.
+- `side.rs`: which edge the dock stands on, and the map from its layout to its window.
 - `glass.rs`: the blur behind the dark glass, masked to the liquid's outline.
 - `flight.rs`: minimizing and restoring; the liquid under the window is slices that follow its bent sides exactly
   (`Blob::slice` in `liquid.rs`), between rounded ends.
@@ -131,51 +137,12 @@ The scenes are `rest`, `hover`, `tooltip-ooze`, `menu`, `menu-claude`, `menu-cha
 Springs and fonts come from `crates/paint`, the same ones the notch uses. Frames are drawn only while something moves,
 paced by the display (120 Hz on ProMotion).
 
-Known limits: apps that zoom to fill the screen don't leave room for the dock, since only the system Dock can reserve
-space. The dock lives on the main screen only.
+Known limits: the system Dock stays along the bottom while it's hidden, so in Mission Control (where macOS shows it
+anyway) a dock on a side doesn't cover it.
 
-## On Windows
+## Windows
 
-The same dock runs on Windows as `notchbase-dock.exe`: the drawing, tiles, menus, stacks, flights and settings are
-the shared code above, and `src/win/` puts Win32 under them where `mac.rs` and friends put AppKit. It's the same stack
-as notchbase's own Windows build (winit, glutin and OpenGL through egui_glow, `windows-sys` and `windows` for Win32,
-COM and WinRT), so nothing new is needed to build it.
-
-```powershell
-cargo run -p notchbase-dock                          # run from the repo
-$env:NOTCHBASE_DOCK_KEEP_TASKBAR=1; cargo run -p notchbase-dock   # try it without hiding the taskbar
-notchbase-dock --quit                                # quit it, and put the taskbar back
-notchbase-dock --restore-taskbar                     # put the taskbar back, even after a crash
-```
-
-- **The taskbar** is put away while the dock runs: it's set to auto-hide (so it gives its space back) and its windows
-  are hidden on every screen, again every couple of seconds in case Explorer restarts. The settings it had are saved to
-  `saved-taskbar.json` in `%APPDATA%\notchbase dock` and put back on quit, `--quit`, a closed console or a panic; a dock
-  that was killed outright leaves the file behind, and the next start (or `--restore-taskbar`) puts it back first.
-  The dock keeps its own strip as an app bar, so maximized windows end above it.
-- **Every screen** gets its own dock, and each is live.
-- **First run** copies the apps pinned to the taskbar. File Explorer takes Finder's place on the left, and the Recycle
-  Bin takes the Trash's.
-- **Downloads stack**, with drag-out to any app (Windows' own drag and drop, with the shell's drag picture), Delete
-  (to the Recycle Bin) and Show in File Explorer. The folder is watched with change notifications.
-- **The download bar** follows Chrome, Edge, Brave, Firefox and the other browsers the macOS side knows.
-- **Usage** in Claude's and ChatGPT's menus, from `crates/usage`, which already reads the Windows paths.
-- **Music pulse**: the playing player comes from Windows' media controls (Spotify, Apple Music, Media Player, TIDAL,
-  Deezer, Amazon Music, MusicBee, foobar2000), and the beat from what the speakers play, through a WASAPI loopback.
-- **Minimizing and restoring** fly the window into its tile and back out. Windows' own minimize animation is turned off
-  while the dock runs (and put back after). The flight uses the window's last picture, taken with `PrintWindow` when it
-  comes to the front, every few seconds while it stays there, and the moment its minimize button is pressed.
-- Shift turns Quit into Force Quit, where Option does on macOS, and Ctrl stands in for Cmd in an open stack.
-
-Files: `win/app.rs` (the event loop, one dock window per screen and the overlay for flights), `win/os.rs` (running
-apps, icons, opening, the Recycle Bin, screens), `win/windows.rs` and `win/hooks.rs` (window lists, pictures, and the
-event hooks that catch minimizing and keys), `win/taskbar.rs`, `win/lifecycle.rs`, `win/pulse.rs`, `win/shell/`
-(Shell icons, thumbnails and drag and drop, shared in shape with notchbase's file drag).
-
-**From notchbase:** Settings › Dock turns it on and off, the same as on macOS. notchbase ships on Windows as one exe,
-so the release scripts build the dock first and carry it inside `notchbase.exe` (`NOTCHBASE_BUNDLED_DOCK` names it
-for `build.rs`). The first start writes it out to `%LOCALAPPDATA%\notchbase\dock\<version>\notchbase-dock.exe`, and
-after an update notchbase swaps a running older copy for the new one. A `notchbase-dock.exe` built beside
-`notchbase.exe` (as `cargo build` does) is used before the bundled one. notchbase stops it with the `quit` note.
-
-Not on Windows yet: the blur behind the glass (the liquid is drawn tinted without it), app menu actions and Quick Look.
+The dock ran on Windows too until notchbase 0.33, which made it macOS only. notchbase on Windows no longer carries
+it: on its first start after the update it asks a dock an older version left running to quit (the dock puts the
+taskbar back on its way out), puts the taskbar back itself if one was stopped with it hidden, and deletes the copies
+older versions wrote to `%LOCALAPPDATA%\notchbase\dock` (`system::dock::retire`).

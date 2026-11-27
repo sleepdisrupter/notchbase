@@ -8,17 +8,17 @@ use super::rows::{
 };
 #[cfg(not(windows))]
 use crate::bridge::DockMissionControl;
-use crate::bridge::{Action, DockChange, DockStackSort, DockStackView, DockView};
+use crate::bridge::{Action, DockChange, DockSide, DockStackSort, DockStackView, DockView};
 use crate::pages::PageCtx;
 use crate::ui::metrics::GAP;
 use crate::ui::segmented::segmented;
 
 /// Rows in each group under the switch: Appearance, Behaviour, Downloads, Animations, Cmd+Tab.
 #[cfg(not(windows))]
-const GROUPS: &[usize] = &[4, 5, 3, 4, 1];
+const GROUPS: &[usize] = &[5, 5, 3, 4, 1];
 /// Windows has no Mission Control or Cmd+Tab rows.
 #[cfg(windows)]
-const GROUPS: &[usize] = &[4, 4, 3, 4];
+const GROUPS: &[usize] = &[5, 4, 3, 4];
 /// The glass's three looks, lightest first.
 const GLASS: [f32; 3] = [0.3, 0.5, 0.72];
 /// The switch and the row that says what macOS asks the dock for.
@@ -93,7 +93,12 @@ pub(super) fn ui(ctx: &mut PageCtx<'_>, dock: &DockView, actions: &mut Vec<Actio
     let can = live && dock.found;
 
     let rows = group(ctx, &mut top, "Appearance", GROUPS[0]);
-    let [size, magnify, glass, names] = rows[..] else { return outcome(back) };
+    let [side, size, magnify, glass, names] = rows[..] else { return outcome(back) };
+    let current = DockSide::ALL.iter().position(|s| *s == dock.side).unwrap_or(1);
+    let row = (side, "Position", "The edge of the screen it stands on");
+    if let Some(i) = choice(ctx, row, &["Left", "Bottom", "Right"], current, can) {
+        change(DockChange::Side(DockSide::ALL[i]));
+    }
     let row = Row { rect: size, title: "Icon size", detail: "How big the icons are at rest" };
     if let Some(next) = stepper(ctx, &row, id("size"), [f64::from(dock.tile_size), 16.0, 96.0, 4.0], "pt", can) {
         change(DockChange::TileSize(next as f32));
@@ -117,7 +122,7 @@ pub(super) fn ui(ctx: &mut PageCtx<'_>, dock: &DockView, actions: &mut Vec<Actio
     if let Some(i) = choice(ctx, row, &["Main", "All"], usize::from(dock.all_displays), can) {
         change(DockChange::AllDisplays(i == 1));
     }
-    let detail = "Push the pointer on the bottom edge to bring it up";
+    let detail = "Push the pointer on its edge to bring it up";
     flag(ctx, (fullscreen, "Hide in full screen", detail), dock.hide_in_fullscreen, can)
         .then(|| change(DockChange::HideInFullscreen(!dock.hide_in_fullscreen)));
     flag(ctx, (avoid, "Keep windows clear", AVOID), dock.avoid_windows, can)

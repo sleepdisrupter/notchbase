@@ -152,10 +152,7 @@ impl Tile {
 
 pub const TRASH_KEY: &str = "::trash";
 /// The file manager, which always leads the dock: Finder, or File Explorer on Windows.
-#[cfg(not(windows))]
 pub const FINDER: &str = "/System/Library/CoreServices/Finder.app";
-#[cfg(windows)]
-pub const FINDER: &str = r"C:\Windows\explorer.exe";
 
 /// A minimized window's tile.
 pub fn window_key(id: u32) -> String {

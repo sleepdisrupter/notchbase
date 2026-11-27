@@ -2,7 +2,7 @@
 name = "notchbase-dock"
 version = "0.1.0"
 edition.workspace = true
-description = "A Dock for macOS and Windows in the notchbase style: black liquid, springs and the apps you already pinned"
+description = "A Dock for macOS in the notchbase style: black liquid, springs and the apps you already pinned"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -121,55 +121,4 @@ objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "objc2-core-graphics",
     "CALayer",
     "CATransaction",
-] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-egui.workspace = true
-egui_glow = "0.36"
-glow = "0.17"
-glutin = "0.32"
-glutin-winit = "0.5"
-libc = "0.2"
-notchbase-paint.workspace = true
-notchbase-usage.workspace = true
-notchbase-wasapi.workspace = true
-png = "0.18"
-raw-window-handle.workspace = true
-winit = "0.30"
-windows-future = "0.3"
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Globalization",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Gdi",
-    "Win32_Storage_FileSystem",
-    "Win32_Storage_Xps",
-    "Win32_System_Console",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Registry",
-    "Win32_System_SystemInformation",
-    "Win32_System_Threading",
-    "Win32_System_Time",
-    "Win32_UI_Accessibility",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
-windows = { workspace = true, features = [
-    "Foundation_Collections",
-    "Foundation",
-    "Media_Control",
-    "Win32_Foundation",
-    "Win32_Graphics_Gdi",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
-    "Win32_System_DataExchange",
-    "Win32_System_Ole",
-    "Win32_System_SystemServices",
-    "Win32_UI_Shell",
-    "Win32_UI_Shell_Common",
-    "Win32_UI_WindowsAndMessaging",
 ] }

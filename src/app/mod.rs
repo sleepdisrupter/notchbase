@@ -164,6 +164,9 @@ impl App {
         let news = whats_new::News::at_start(&config.config().updates.seen, config_problem.is_none());
         let (welcome, welcome_view) = welcome::Welcome::at_start(config.config(), config_problem.is_none());
         let dock_intro = dock::DockIntro::at_start(config.config(), config_problem.is_none());
+        // The dock is macOS only now: one an older notchbase left running on Windows makes way, taskbar and all.
+        #[cfg(windows)]
+        crate::system::dock::retire();
         let wake = events::wake(&proxy);
         let tools_wake = wake.clone();
         let (tools, mut startup_messages) = Tools::load(config.config(), &Waker::new(move || tools_wake()));
