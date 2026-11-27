@@ -204,15 +204,12 @@ impl Notch {
 
     pub(super) fn music_geometry(&self) -> Geometry {
         match self.style {
-            Style::Notch => Geometry {
-                w: self.notch.x + 2.0 * NOTCH_WING,
-                h: self.notch.y + NOTCH_DROP + self.strip_height(),
-                r: 14.0,
-                ear: 6.0,
-            },
+            Style::Notch => {
+                Geometry { w: self.notch.x + 2.0 * NOTCH_WING, h: self.notch.y + NOTCH_DROP, r: 14.0, ear: 6.0 }
+            }
             Style::Island => {
                 let head = if self.strip.is_some() { COMPACT_H } else { ISLAND_H };
-                Geometry { w: ISLAND_W, h: head + self.strip_height(), r: ISLAND_H * 0.5, ear: 0.0 }
+                Geometry { w: ISLAND_W, h: head, r: ISLAND_H * 0.5, ear: 0.0 }
             }
         }
     }

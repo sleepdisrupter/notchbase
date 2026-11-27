@@ -24,6 +24,7 @@ const GLYPH: f32 = 15.0;
 const GAP: f32 = 10.0;
 const WIDEST: &str = "100";
 const TRACK_H: f32 = 6.0;
+const DIGITS: f32 = 12.0;
 const MUTED_FILL: f32 = 0.35;
 const SAMPLE_VOLUME: f32 = 0.62;
 const SAMPLE_BRIGHTNESS: f32 = 0.75;
@@ -142,6 +143,8 @@ impl Notch {
                     y: body.center().y,
                     glyph: GLYPH,
                     column: GLYPH,
+                    track: TRACK_H,
+                    digits: DIGITS,
                 };
                 paint_indicator_row(canvas, &row, reading, indicator);
             }
@@ -151,7 +154,7 @@ impl Notch {
                 glyph::paint(canvas, indicator.glyph(), glyph_at, GLYPH, label());
                 let percent_at = pos2(body.right() - INSET, lane_y);
                 let percent = percent(indicator.level());
-                canvas.text(percent_at, Align2::RIGHT_CENTER, percent, font::mono(12.0), secondary_label());
+                canvas.text(percent_at, Align2::RIGHT_CENTER, percent, font::mono(DIGITS), secondary_label());
                 let y = body.top() + self.notch.y + NOTCH_DROP * 0.5 - 1.0;
                 let track = Rect::from_min_max(
                     pos2(body.left() + INSET, y - TRACK_H * 0.5),
@@ -169,6 +172,8 @@ pub(in crate::notch) struct IndicatorRow {
     pub(in crate::notch) y: f32,
     pub(in crate::notch) glyph: f32,
     pub(in crate::notch) column: f32,
+    pub(in crate::notch) track: f32,
+    pub(in crate::notch) digits: f32,
 }
 
 pub(in crate::notch) fn paint_indicator_row(
@@ -180,10 +185,10 @@ pub(in crate::notch) fn paint_indicator_row(
     let glyph_at = pos2(row.left + row.column * 0.5, row.y);
     glyph::paint(canvas, shown.glyph(), glyph_at, row.glyph, label());
     let percent = percent(shown.level());
-    canvas.text(pos2(row.right, row.y), Align2::RIGHT_CENTER, percent, font::mono(12.0), secondary_label());
-    let widest = canvas.text_width(WIDEST, font::mono(12.0));
+    canvas.text(pos2(row.right, row.y), Align2::RIGHT_CENTER, percent, font::mono(row.digits), secondary_label());
+    let widest = canvas.text_width(WIDEST, font::mono(row.digits));
     let (left, right) = (row.left + row.column + GAP, row.right - widest - GAP);
-    let track = Rect::from_min_max(pos2(left, row.y - TRACK_H * 0.5), pos2(right, row.y + TRACK_H * 0.5));
+    let track = Rect::from_min_max(pos2(left, row.y - row.track * 0.5), pos2(right, row.y + row.track * 0.5));
     paint_bar(canvas, track, reading, shown.muted());
 }
 
@@ -192,10 +197,10 @@ fn percent(level: f32) -> String {
 }
 
 fn paint_bar(canvas: &mut Canvas, track: Rect, reading: meter::Reading, muted: bool) {
-    if track.width() <= TRACK_H {
+    if track.width() <= track.height() {
         return;
     }
-    glass::paint(canvas, track, TRACK_H * 0.5, Glass::CONTROL);
+    glass::paint(canvas, track, track.height() * 0.5, Glass::CONTROL);
     let h = track.height();
     let width = (track.width() * reading.level.clamp(0.0, 1.0)).max(h);
     let alpha = if muted { 0.92 * MUTED_FILL } else { 0.92 };
@@ -257,7 +262,15 @@ mod tests {
     fn bar_length_ignores_digits() {
         let ctx = egui::Context::default();
         crate::ui::font::install(&ctx);
-        let row = IndicatorRow { left: 20.0, right: 260.0, y: 20.0, glyph: GLYPH, column: GLYPH };
+        let row = IndicatorRow {
+            left: 20.0,
+            right: 260.0,
+            y: 20.0,
+            glyph: GLYPH,
+            column: GLYPH,
+            track: TRACK_H,
+            digits: DIGITS,
+        };
         let mut ends = Vec::new();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             for level in [0.04, 0.4, 1.0] {

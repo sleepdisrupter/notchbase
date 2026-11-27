@@ -18,7 +18,7 @@ use crate::ui::spring::{lerp, smoothstep};
 use crate::ui::{controls, font};
 
 use super::pulse::{ArtLook, look};
-use super::strip::{Lane, STRIP_H};
+use super::strip::Lane;
 use super::warp::{Warp, paint_warped};
 use super::{COMPACT_H, ISLAND_H, Music, NOTCH_DROP};
 
@@ -33,7 +33,6 @@ const BAR_W: f32 = 3.0;
 const BAR_GAP: f32 = 2.2;
 const BAR_REST: f32 = 3.0;
 const LINE_SPREAD: f32 = 7.5;
-const STRIP_RISE: f32 = 2.5;
 const COMPACT_SIDE: f32 = 15.0;
 const SCRIM: f32 = 0.3;
 const WARP_VISIBLE: f32 = 0.01;
@@ -80,17 +79,17 @@ impl Notch {
         if reveal <= 0.01 {
             return;
         }
-        let strip_y = body.top() + self.notch.y + NOTCH_DROP * 0.5 - 1.0;
+        let title_y = body.top() + self.notch.y + NOTCH_DROP * 0.5 - 1.0;
         let detail = reveal * (1.0 - self.compactness());
-        let words = NotchWords { left: home.left(), right: bars.right, y: strip_y, reveal, detail };
+        let words = NotchWords { left: home.left(), right: bars.right, y: title_y, reveal, detail };
+        let mark = canvas.mark();
         if let Some((song, part)) = music.words.leaving(now) {
             paint_notch_words(canvas, song, &words, part, now);
         }
         paint_notch_words(canvas, &music.now, &words, music.words.arriving(now), now);
-        let top = body.top() + self.notch.y + NOTCH_DROP;
-        let lane =
-            Lane { left: home.left(), column: home.width(), right: bars.right, y: top + STRIP_H * 0.5 - STRIP_RISE };
-        self.paint_strip(canvas, body, top, &lane);
+        fade_since(canvas, mark, self.song_words_shown());
+        let lane = Lane { left: home.left(), right: bars.right, y: title_y };
+        self.paint_strip(canvas, &lane, reveal);
     }
 
     pub(super) fn paint_island_music(&self, canvas: &mut Canvas, music: &Music, full: Rect, now: Instant) {
@@ -115,6 +114,8 @@ impl Notch {
             center_y: upper,
             tallest: lerp(9.0, 12.0, open),
         };
+        let words_shown = self.song_words_shown();
+        let mark = canvas.mark();
         let bars_left = self.paint_bars(canvas, &bars, tint);
         let words = IslandWords {
             left: art.right() + TEXT_GAP,
@@ -129,9 +130,9 @@ impl Notch {
             paint_island_words(canvas, song, &words, part, now);
         }
         paint_island_words(canvas, &music.now, &words, music.words.arriving(now), now);
-        let top = body.bottom();
-        let lane = Lane { left: art.left(), column: art.width(), right: bars.right, y: top + STRIP_H - head * 0.5 };
-        self.paint_strip(canvas, full, top, &lane);
+        fade_since(canvas, mark, words_shown);
+        let lane = Lane { left: art.right() + TEXT_GAP, right: bars.right, y: center_y };
+        self.paint_strip(canvas, &lane, 1.0);
     }
 
     fn paint_bars(&self, canvas: &mut Canvas, bars: &Bars, tint: Color32) -> f32 {
@@ -188,6 +189,15 @@ fn paint_notch_words(canvas: &mut Canvas, song: &NowPlaying, at: &NotchWords, pa
         fade(shape, at.reveal);
     }
     slide_words(canvas, mark, part, at.left..=at.right);
+}
+
+fn fade_since(canvas: &mut Canvas, mark: Mark, alpha: f32) {
+    if alpha >= 1.0 {
+        return;
+    }
+    for shape in canvas.since(mark) {
+        fade(shape, alpha);
+    }
 }
 
 fn slide_words(canvas: &mut Canvas, mark: Mark, part: Part, column: std::ops::RangeInclusive<f32>) {

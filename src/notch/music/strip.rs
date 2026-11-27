@@ -1,8 +1,6 @@
-//! The strip that grows under a playing song to show a volume or brightness change.
+//! The volume or brightness bar that takes the place of a playing song's title while the level changes.
 
 use std::time::Instant;
-
-use egui::Rect;
 
 use crate::notch::activity::volume::{Indicator, IndicatorRow, paint_indicator_row};
 use crate::notch::moves::transition::Motion;
@@ -12,12 +10,15 @@ use crate::ui::spring::smoothstep;
 
 use super::super::{Mode, Notch};
 
-pub(in crate::notch) const STRIP_H: f32 = 20.0;
-const STRIP_GLYPH: f32 = 12.0;
+const SWAP_GLYPH: f32 = 12.0;
+const SWAP_TRACK: f32 = 5.0;
+const SWAP_DIGITS: f32 = 11.5;
+const WORDS_GONE: f32 = 0.6;
+const BAR_FROM: f32 = 0.35;
 
+/// The row the song's title sits on, where the bar shows instead.
 pub(super) struct Lane {
     pub(super) left: f32,
-    pub(super) column: f32,
     pub(super) right: f32,
     pub(super) y: f32,
 }
@@ -79,10 +80,6 @@ impl Notch {
         true
     }
 
-    pub(in crate::notch) fn strip_height(&self) -> f32 {
-        if self.strip.is_some() { STRIP_H } else { 0.0 }
-    }
-
     pub(in crate::notch) fn compactness(&self) -> f32 {
         self.compact.value.clamp(0.0, 1.0)
     }
@@ -101,14 +98,33 @@ impl Notch {
         }
     }
 
-    pub(super) fn paint_strip(&self, canvas: &mut Canvas, body: Rect, top: f32, lane: &Lane) {
-        let Some(indicator) = self.strip.map(|strip| strip.indicator).or(self.strip_gone) else { return };
-        let shown = smoothstep(0.35, 1.0, (body.bottom() - top) / STRIP_H);
+    fn shown_strip(&self) -> Option<Indicator> {
+        self.strip.map(|strip| strip.indicator).or(self.strip_gone)
+    }
+
+    /// How much of the song's title and bars still shows while the bar takes their place.
+    pub(super) fn song_words_shown(&self) -> f32 {
+        if self.shown_strip().is_none() {
+            return 1.0;
+        }
+        1.0 - smoothstep(0.0, WORDS_GONE, self.compactness())
+    }
+
+    pub(super) fn paint_strip(&self, canvas: &mut Canvas, lane: &Lane, reveal: f32) {
+        let Some(indicator) = self.shown_strip() else { return };
+        let shown = smoothstep(BAR_FROM, 1.0, self.compactness()) * reveal;
         if shown <= 0.01 {
             return;
         }
-        let row =
-            IndicatorRow { left: lane.left, right: lane.right, y: lane.y, glyph: STRIP_GLYPH, column: lane.column };
+        let row = IndicatorRow {
+            left: lane.left,
+            right: lane.right,
+            y: lane.y,
+            glyph: SWAP_GLYPH,
+            column: SWAP_GLYPH,
+            track: SWAP_TRACK,
+            digits: SWAP_DIGITS,
+        };
         let mark = canvas.mark();
         paint_indicator_row(canvas, &row, self.level_meter.reading(), indicator);
         for shape in canvas.since(mark) {
@@ -120,11 +136,11 @@ impl Notch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notch::music::ISLAND_H;
+    use crate::notch::music::{COMPACT_H, ISLAND_H};
     use crate::notch::tests::fixtures::{AWAY, island, settle, song};
 
     #[test]
-    fn volume_grows_strip_under_song() {
+    fn volume_takes_the_title_row() {
         let mut n = island();
         let t0 = Instant::now();
         n.set_now_playing(Some(&song(true, 10.0)));
@@ -138,8 +154,10 @@ mod tests {
         n.tick(t0, Some(AWAY));
         settle(&mut n);
         assert_eq!(n.hug.value, 0.0, "the full player comes out to hold the bar");
-        let tall = n.music_geometry();
-        assert_eq!(n.silhouette().rect(), n.body_rect(tall));
+        let shown = n.music_geometry();
+        assert_eq!(n.silhouette().rect(), n.body_rect(shown));
+        assert_eq!(shown.h, COMPACT_H, "the bar sits in the song's one row, with nothing added under it");
+        assert_eq!(n.song_words_shown(), 0.0, "the title has made way for the bar");
 
         let until = n.strip.map(|strip| strip.until).expect("strip");
         n.show_volume(0.42, false);
@@ -150,7 +168,6 @@ mod tests {
         assert!(n.strip.is_none());
         assert!(!n.shows_music(), "the song closes with the volume bar instead of leaving a pill behind");
         assert_eq!(n.music_geometry().h, ISLAND_H);
-        assert!(tall.h - STRIP_H < ISLAND_H, "the song row tucks into one line while the bar shows");
         settle(&mut n);
         assert!(n.is_collapsed());
     }
@@ -201,7 +218,7 @@ mod tests {
         let until = n.strip_wakeup().expect("a strip");
         assert!(n.expire_strip(until));
         assert!(n.strip.is_none() && n.strip_gone.is_some(), "it stays drawn while the shape folds");
-        assert_eq!(n.strip_height(), 0.0, "and the shape no longer makes room for it");
+        assert_eq!(n.music_geometry().h, ISLAND_H, "and the shape goes back to the song's");
         n.step(1.0 / 60.0);
         assert!(n.strip_gone.is_some());
         settle(&mut n);
