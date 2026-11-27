@@ -76,7 +76,18 @@ const MIDDLE: &str = "It takes the middle of the notch";
 const MINIMIZE: &str = "Minimizing stays on the screen you're on";
 const STILL: &str = "Your other displays stay still meanwhile";
 
+const TILES: &str = "Each tile shows how things are set now";
+const SEARCHED: &str = "Type a word and switch it right there";
+
 pub(super) static NOTES: &[Release] = &[
+    Release {
+        version: "0.34.0",
+        picture: None,
+        changes: &[
+            Change { glyph: Glyph::Grid, title: "Settings has a new look", caption: TILES },
+            Change { glyph: Glyph::Search, title: "Search every setting", caption: SEARCHED },
+        ],
+    },
     Release {
         version: "0.31.1",
         picture: None,
