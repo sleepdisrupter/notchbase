@@ -87,6 +87,9 @@ struct Seat {
     win: Option<DockWindow>,
     /// Tucked away below a full-screen app on its screen.
     tucked: bool,
+    /// Its own desktop picture for the glass in Mission Control, as for the live dock (see `App::follow_wallpaper`).
+    wallpaper: Option<crate::wallpaper::Source>,
+    wallpaper_built: Arc<std::sync::Mutex<Option<crate::wallpaper::Picture>>>,
 }
 
 /// Windows with a minimize or restore at work, so each runs once at a time: a second ask for the same window (a
@@ -737,7 +740,15 @@ impl App {
             dock.set_away(true);
         }
         self.needs_frame = true;
-        Ok(Seat { screen: screen.frame, display: screen.id, dock, win: Some(win), tucked: false })
+        Ok(Seat {
+            screen: screen.frame,
+            display: screen.id,
+            dock,
+            win: Some(win),
+            tucked: false,
+            wallpaper: None,
+            wallpaper_built: Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     /// Whether the live dock is at rest with nothing of its own going on, so another screen's dock can take over.
@@ -760,6 +771,9 @@ impl App {
         std::mem::swap(&mut self.win, &mut seat.win);
         std::mem::swap(&mut self.screen, &mut seat.screen);
         std::mem::swap(&mut self.display, &mut seat.display);
+        // Each window keeps the picture built for it, and goes on following its own screen's.
+        std::mem::swap(&mut self.wallpaper, &mut seat.wallpaper);
+        std::mem::swap(&mut self.wallpaper_built, &mut seat.wallpaper_built);
         seat.dock.set_pointer(None);
         seat.dock.fake_ready = false;
         if let Some(w) = &seat.win {
@@ -779,7 +793,6 @@ impl App {
         self.resize_cursor = false;
         self.last_pointer = None;
         self.move_overlay(self.screen);
-        self.wallpaper = None;
         self.needs_frame = true;
     }
 
@@ -1288,10 +1301,11 @@ impl App {
             let moving = seat.dock.animating();
             seat.dock.step(dt);
             seat.dock.effects.clear();
-            if (all || moving)
+            let picture = seat.wallpaper_built.lock().ok().and_then(|mut built| built.take());
+            if (all || moving || picture.is_some())
                 && let Some(w) = &mut seat.win
             {
-                draw_dock(w, &mut seat.dock, None);
+                draw_dock(w, &mut seat.dock, picture);
             }
         }
     }
@@ -1474,29 +1488,21 @@ impl App {
     /// Keeps the glass's Mission Control stand-in current: built again on a thread of its own whenever the desktop
     /// picture, its file or the window changes (another Space, display or wallpaper), so it's ready before Mission
     /// Control opens.
+    /// The other screens' docks get theirs too, so every dock keeps its look there.
     fn follow_wallpaper(&mut self) {
         if self.away {
             return;
         }
-        let origin = self.dock_origin() - self.screen_rect().min.to_vec2();
+        let screen = self.screen_rect();
+        let origin = self.dock_origin() - screen.min.to_vec2();
         let size = self.dock.window_size();
-        let window = [f64::from(origin.x), f64::from(origin.y), f64::from(size.x), f64::from(size.y)];
-        let source = crate::wallpaper::source(self.display, window);
-        if source == self.wallpaper {
-            return;
+        follow_picture(self.display, origin, size, &mut self.wallpaper, &self.wallpaper_built, &self.proxy);
+        for seat in &mut self.seats {
+            let screen = global_rect(seat.screen, self.primary_top);
+            let origin = seat.dock.side().window_on(screen, WINDOW_HEIGHT).min - screen.min.to_vec2();
+            let size = seat.dock.window_size();
+            follow_picture(seat.display, origin, size, &mut seat.wallpaper, &seat.wallpaper_built, &self.proxy);
         }
-        self.wallpaper = source.clone();
-        let Some(source) = source else { return };
-        let built = Arc::clone(&self.wallpaper_built);
-        let proxy = self.proxy.clone();
-        let _ = std::thread::Builder::new().name("wallpaper".into()).spawn(move || {
-            if let Some(picture) = objc2::rc::autoreleasepool(|_| crate::wallpaper::render(&source))
-                && let Ok(mut slot) = built.lock()
-            {
-                *slot = Some(picture);
-                let _ = proxy.send_event(());
-            }
-        });
     }
 
     /// Keeps a watch on every folder in the dock and hands the dock what changed: new readings of the folders and
@@ -2254,6 +2260,35 @@ fn log_pop(what: &str, path: &std::path::Path, frame: Option<Rect>) {
     if std::env::var_os("NOTCHBASE_DOCK_LOG_POP").is_some() {
         eprintln!("pop {what} {}: {frame:?}", path.display());
     }
+}
+
+/// Builds the blurred desktop picture again, on a thread of its own, for the dock window at `origin` (from its
+/// screen's top left) when that or the picture changed since `current`; it lands in `built`.
+fn follow_picture(
+    display: u32,
+    origin: Pos2,
+    size: egui::Vec2,
+    current: &mut Option<crate::wallpaper::Source>,
+    built: &Arc<std::sync::Mutex<Option<crate::wallpaper::Picture>>>,
+    proxy: &EventLoopProxy<()>,
+) {
+    let window = [f64::from(origin.x), f64::from(origin.y), f64::from(size.x), f64::from(size.y)];
+    let source = crate::wallpaper::source(display, window);
+    if source == *current {
+        return;
+    }
+    current.clone_from(&source);
+    let Some(source) = source else { return };
+    let built = Arc::clone(built);
+    let proxy = proxy.clone();
+    let _ = std::thread::Builder::new().name("wallpaper".into()).spawn(move || {
+        if let Some(picture) = objc2::rc::autoreleasepool(|_| crate::wallpaper::render(&source))
+            && let Ok(mut slot) = built.lock()
+        {
+            *slot = Some(picture);
+            let _ = proxy.send_event(());
+        }
+    });
 }
 
 /// Draws one frame of `dock` into its window, with a new desktop picture for its Mission Control glass if one came.

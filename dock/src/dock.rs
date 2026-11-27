@@ -547,10 +547,10 @@ impl Dock {
         self.config.mission_control == crate::config::MissionControl::Cover && !self.side.vertical()
     }
 
-    /// A dock on a side, set to stay over Mission Control: it stays as it is, never darkening, the blurred desktop
-    /// picture standing in for the blur the system drops there. Without that picture yet it fades, as with Fade.
+    /// A dock on a side, set to stay over Mission Control: it stays just as it is, shown and never darkening, the
+    /// blurred desktop picture standing in for the blur the system drops there (the live blur stays if it's not ready).
     fn staying(&self) -> bool {
-        self.config.mission_control == crate::config::MissionControl::Cover && self.side.vertical() && self.fake_ready
+        self.config.mission_control == crate::config::MissionControl::Cover && self.side.vertical()
     }
 
     fn bottom(&self) -> f32 {
@@ -655,7 +655,7 @@ impl Dock {
     /// glass looks just as it did and the system Dock under it never shows through.
     pub fn fake_glass(&self) -> f32 {
         if self.staying() {
-            return 1.0 - (1.0 - self.away.value.clamp(0.0, 1.0)).powi(3);
+            return if self.fake_ready { 1.0 - (1.0 - self.away.value.clamp(0.0, 1.0)).powi(3) } else { 0.0 };
         }
         if self.fake_ready { self.cover_ease() } else { 0.0 }
     }
@@ -3473,12 +3473,13 @@ mod tests {
                 }
                 assert_eq!(d.glass_band().tint, rest, "{side:?}: never darkens");
                 assert_eq!(d.cover_progress(), 0.0, "{side:?}: no cover move, nothing to cover");
+                assert_eq!(d.bottom(), bottom, "{side:?}: stays put");
+                assert!((d.opacity() - 1.0).abs() < 1e-3, "{side:?}: stays shown, never fading out");
                 if ready {
-                    assert_eq!(d.bottom(), bottom, "{side:?}: stays put");
-                    assert!((d.opacity() - 1.0).abs() < 1e-3, "{side:?}: stays shown");
                     assert!((d.fake_glass() - 1.0).abs() < 1e-3, "{side:?}: the picture stands in for the blur");
                 } else {
-                    assert!(d.opacity() < 0.01, "{side:?}: without a picture it fades out instead: {}", d.opacity());
+                    assert_eq!(d.fake_glass(), 0.0);
+                    assert!((d.blur_opacity() - 1.0).abs() < 1e-3, "{side:?}: without it the live blur stays");
                 }
                 d.set_away(false);
                 for _ in 0..120 {

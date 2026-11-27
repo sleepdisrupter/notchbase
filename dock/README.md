@@ -138,8 +138,8 @@ Springs and fonts come from `crates/paint`, the same ones the notch uses. Frames
 paced by the display (120 Hz on ProMotion).
 
 Known limits: the system Dock stays along the bottom while it's hidden, so in Mission Control (where macOS shows it
-anyway) a dock on a side doesn't cover it. A dock on a side keeps its look in Mission Control, its glass showing the
-blurred desktop picture, and never turns black; until that picture is ready it fades out instead.
+anyway) a dock on a side doesn't cover it. A dock on a side stays just as it is in Mission Control, on every screen: its
+glass shows the blurred desktop picture in place of the blur macOS drops there, and it never fades or turns black.
 
 ## Windows
 
