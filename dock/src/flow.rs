@@ -73,9 +73,15 @@ fn wait_for(limit: Duration, poll: Duration, done: &mut dyn FnMut() -> bool) -> 
     }
 }
 
-/// Parks the window at `spot` (low on the main screen, under the cover) and minimizes it, asking twice if the app is
-/// slow. An app that never minimizes it gets it back at `home`.
-pub fn go_down(ax: &dyn Ax, spot: Pos2, home: Pos2, limits: Limits, trace: &Trace) -> Down {
+/// Parks the window at `spot` (just under a screen's bottom, under the cover) and minimizes it, asking twice if the
+/// app is slow. A window too tall for that screen is first made `fit`: macOS pulls a window taller than the screen
+/// it's moved to right up under that screen's menu bar, in plain sight, and its own minimize then plays from there.
+/// An app that never minimizes it gets it back at `home`, as it was.
+pub fn go_down(ax: &dyn Ax, spot: Pos2, fit: Option<Vec2>, home: Rect, limits: Limits, trace: &Trace) -> Down {
+    if let Some(fit) = fit {
+        ax.resize(fit);
+        trace.step(|| format!("shrunk to {fit:?} to park"));
+    }
     ax.move_to(spot);
     trace.step(|| format!("parked {:?}", ax.frame().map(|f| f.min)));
     ax.set_minimized(true);
@@ -90,18 +96,23 @@ pub fn go_down(ax: &dyn Ax, spot: Pos2, home: Pos2, limits: Limits, trace: &Trac
         trace.step(|| "minimized".into());
         return Down::Minimized;
     }
-    ax.move_to(home);
+    if fit.is_some() {
+        ax.resize(home.size());
+    }
+    ax.move_to(home.min);
     trace.step(|| "never minimized: put back".into());
     Down::Refused
 }
 
-/// Brings the window up at `spot` (under the cover), waits in `corner` (a point of it on screen) until the picture
-/// has landed, then puts it in `place` and raises it. Bounded throughout: a window that won't come up, or won't
-/// stay put, is raised as it is.
+/// Brings the window up at `spot` (under the cover; made `fit` first when it's too tall to stay there, as in
+/// `go_down`), waits in `corner` (a point of it on screen) until the picture has landed, then puts it in `place`, at
+/// its own size, and raises it. Bounded throughout: a window that won't come up, or won't stay put, is raised as it
+/// is.
 #[allow(clippy::too_many_arguments)]
 pub fn come_up(
     ax: &dyn Ax,
     spot: Pos2,
+    fit: Option<Vec2>,
     corner: Pos2,
     place: Rect,
     landed: &AtomicBool,
@@ -109,6 +120,10 @@ pub fn come_up(
     limits: Limits,
     trace: &Trace,
 ) -> Up {
+    if let Some(fit) = fit {
+        ax.resize(fit);
+        trace.step(|| format!("shrunk to {fit:?} to park"));
+    }
     ax.move_to(spot);
     ax.set_minimized(false);
     let mut is_up = || ax.minimized() == Some(false);
@@ -315,11 +330,38 @@ mod tests {
 
     const SPOT: Pos2 = Pos2 { x: 600.0, y: 860.0 };
     const HOME: Pos2 = Pos2 { x: 200.0, y: 150.0 };
+    const HOME_FRAME: Rect = Rect { min: HOME, max: Pos2 { x: 1000.0, y: 650.0 } };
+
+    #[test]
+    fn a_window_too_tall_for_the_screen_it_parks_under_is_made_to_fit_first_and_comes_back_whole() {
+        let ax = Fake::new(false);
+        let fit = vec2(800.0, 300.0);
+        let trace = Trace::quiet();
+        assert_eq!(go_down(&ax, SPOT, Some(fit), HOME_FRAME, FAST, &trace), Down::Minimized);
+        let calls = ax.calls.lock().unwrap().clone();
+        let (resize, park) = (calls.iter().position(|c| *c == "resize"), calls.iter().position(|c| *c == "move"));
+        assert!(resize.is_some() && resize < park, "made to fit before it moves: {calls:?}");
+        assert_eq!(ax.state.lock().unwrap().0, Rect::from_min_size(SPOT, fit));
+        // Coming back up: shrunk again under the cover (a window minimized some other way is still tall), then
+        // placed at its own size.
+        let landed = AtomicBool::new(true);
+        let up = come_up(&ax, SPOT, Some(fit), pos2(1469.0, 955.0), HOME_FRAME, &landed, &|| {}, FAST, &trace);
+        assert_eq!(up, Up { up: true, placed: true });
+        assert_eq!(ax.state.lock().unwrap().0, HOME_FRAME, "back where it was, as big as it was");
+    }
+
+    #[test]
+    fn a_tall_window_an_app_never_minimizes_gets_its_size_back_too() {
+        let ax = Fake::new(false);
+        *ax.ignore.lock().unwrap() = 99;
+        assert_eq!(go_down(&ax, SPOT, Some(vec2(800.0, 300.0)), HOME_FRAME, FAST, &Trace::quiet()), Down::Refused);
+        assert_eq!(ax.state.lock().unwrap().0, HOME_FRAME);
+    }
 
     #[test]
     fn a_window_goes_down_parked_out_of_sight() {
         let ax = Fake::new(false);
-        assert_eq!(go_down(&ax, SPOT, HOME, FAST, &Trace::quiet()), Down::Minimized);
+        assert_eq!(go_down(&ax, SPOT, None, HOME_FRAME, FAST, &Trace::quiet()), Down::Minimized);
         let (frame, down) = *ax.state.lock().unwrap();
         assert!(down);
         assert_eq!(frame.min, SPOT);
@@ -330,7 +372,7 @@ mod tests {
         let ax = Fake::new(false);
         *ax.ignore.lock().unwrap() = 1;
         let trace = Trace::quiet();
-        assert_eq!(go_down(&ax, SPOT, HOME, FAST, &trace), Down::Minimized);
+        assert_eq!(go_down(&ax, SPOT, None, HOME_FRAME, FAST, &trace), Down::Minimized);
         assert!(trace.steps().iter().any(|s| s.contains("asked again")));
     }
 
@@ -339,7 +381,7 @@ mod tests {
         let ax = Fake::new(false);
         *ax.ignore.lock().unwrap() = 99;
         let started = Instant::now();
-        assert_eq!(go_down(&ax, SPOT, HOME, FAST, &Trace::quiet()), Down::Refused);
+        assert_eq!(go_down(&ax, SPOT, None, HOME_FRAME, FAST, &Trace::quiet()), Down::Refused);
         assert!(started.elapsed() < FAST.answer + FAST.again + Duration::from_millis(150));
         assert_eq!(ax.state.lock().unwrap().0.min, HOME, "never left parked at the bottom");
     }
@@ -350,12 +392,12 @@ mod tests {
         let mut ax = Fake::new(false);
         ax.lag = Duration::from_millis(40);
         let started = Instant::now();
-        assert_eq!(go_down(&ax, SPOT, HOME, FAST, &Trace::quiet()), Down::Minimized);
+        assert_eq!(go_down(&ax, SPOT, None, HOME_FRAME, FAST, &Trace::quiet()), Down::Minimized);
         assert!(started.elapsed() < Duration::from_millis(400));
         let landed = AtomicBool::new(true);
         let place = Rect::from_min_size(HOME, vec2(800.0, 500.0));
         let started = Instant::now();
-        let up = come_up(&ax, SPOT, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &Trace::quiet());
+        let up = come_up(&ax, SPOT, None, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &Trace::quiet());
         assert_eq!(up, Up { up: true, placed: true });
         assert!(started.elapsed() < Duration::from_millis(600));
     }
@@ -371,7 +413,7 @@ mod tests {
             later.store(true, Ordering::Relaxed);
         });
         let trace = Trace::quiet();
-        let up = come_up(&ax, SPOT, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &trace);
+        let up = come_up(&ax, SPOT, None, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &trace);
         lands.join().unwrap();
         assert_eq!(up, Up { up: true, placed: true });
         assert_eq!(ax.state.lock().unwrap().0, place);
@@ -388,7 +430,7 @@ mod tests {
         *ax.wanders.lock().unwrap() = 1;
         let place = Rect::from_min_size(HOME, vec2(800.0, 500.0));
         let landed = AtomicBool::new(true);
-        let up = come_up(&ax, SPOT, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &Trace::quiet());
+        let up = come_up(&ax, SPOT, None, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &Trace::quiet());
         assert!(up.placed);
         assert_eq!(ax.state.lock().unwrap().0, place);
     }
@@ -400,7 +442,7 @@ mod tests {
         let place = Rect::from_min_size(HOME, vec2(800.0, 500.0));
         let landed = AtomicBool::new(true);
         let started = Instant::now();
-        let up = come_up(&ax, SPOT, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &Trace::quiet());
+        let up = come_up(&ax, SPOT, None, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &Trace::quiet());
         assert!(!up.up);
         assert!(ax.calls.lock().unwrap().contains(&"raise"));
         assert!(started.elapsed() < FAST.answer + FAST.again + FAST.placing + Duration::from_millis(200));
@@ -412,7 +454,7 @@ mod tests {
         let place = Rect::from_min_size(HOME, vec2(800.0, 500.0));
         let landed = AtomicBool::new(false);
         let trace = Trace::quiet();
-        let up = come_up(&ax, SPOT, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &trace);
+        let up = come_up(&ax, SPOT, None, pos2(1469.0, 955.0), place, &landed, &|| {}, FAST, &trace);
         assert!(up.placed);
         assert!(trace.steps().iter().any(|s| s.contains("picture late")));
     }

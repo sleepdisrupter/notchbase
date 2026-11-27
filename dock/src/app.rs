@@ -1812,6 +1812,7 @@ impl App {
         self.parked.insert(id, (pid, frame, Instant::now()));
         // The screen's bottom without the window, taken now so it's in the very first frame with the picture.
         let (spot, park) = self.park(frame.size(), self.screen_rect());
+        let fit = fit_under(frame.size(), park);
         let until = self.cover_bottom(id, park);
         trace.step(|| format!("cover {} parked at {spot:?}", self.cover.is_some()));
         let refused = Arc::clone(&self.refused);
@@ -1819,7 +1820,7 @@ impl App {
             let _done = done;
             trace.step(|| "covered".into());
             let outcome = match windows::Handle::find(pid, id) {
-                Some(ax) => crate::flow::go_down(&ax, spot, frame.min, crate::flow::LIMITS, &trace),
+                Some(ax) => crate::flow::go_down(&ax, spot, fit, frame, crate::flow::LIMITS, &trace),
                 None => {
                     trace.step(|| "window not found: minimized plainly".into());
                     windows::set_minimized(pid, id, true);
@@ -2016,7 +2017,13 @@ impl App {
         // app won't move a minimized window, bring it back plainly.
         if ours.is_none() {
             let size = windows::frame_of(pid, id).map_or(window.size(), |f| f.size());
-            let (spot, _) = self.park(size, self.screen_rect());
+            let (spot, park) = self.park(size, self.screen_rect());
+            if let Some(fit) = fit_under(size, park)
+                && let Some(ax) = windows::Handle::find(pid, id)
+            {
+                use crate::flow::Ax as _;
+                ax.resize(fit);
+            }
             windows::move_to(pid, id, spot);
             // macOS keeps a sliver of a window on screen, so it may end up a little higher than asked.
             let moved =
@@ -2048,6 +2055,7 @@ impl App {
         flight.trace = Some(trace.clone());
         self.flights.push(flight);
         let (spot, park) = self.park(window.size(), self.screen_rect());
+        let fit = fit_under(window.size(), park);
         // While it waits for the picture, it sits in a corner, where only a point of it shows.
         let corner = self.waiting_corner(window.size());
         let until = self.cover_bottom(id, park);
@@ -2063,6 +2071,7 @@ impl App {
                     let up = crate::flow::come_up(
                         &ax,
                         spot,
+                        fit,
                         corner,
                         window,
                         &landed,
@@ -2154,6 +2163,13 @@ impl App {
             if down.iter().any(|m| m.win.id == *id) || flying.contains(id) || at.elapsed() < Duration::from_millis(1500)
             {
                 return true;
+            }
+            // Made to fit while it waited: its own size back too.
+            if let Some(ax) = windows::Handle::find(*pid, *id) {
+                use crate::flow::Ax as _;
+                if ax.frame().is_some_and(|now| (now.size() - frame.size()).length() >= 2.0) {
+                    ax.resize(frame.size());
+                }
             }
             windows::move_to(*pid, *id, frame.min);
             false
@@ -2321,6 +2337,18 @@ fn reveal_dwell(screen: Rect, screens: &[Rect], at: Pos2, side: Side) -> Option<
     let (band, dwell, past) =
         if shared { (SHARED_EDGE_BAND, SHARED_EDGE_DWELL, 0.0) } else { (EDGE_BAND, EDGE_DWELL, 1.0) };
     (at.y > screen.bottom() - band && at.y <= screen.bottom() + past).then_some(dwell)
+}
+
+/// Room a parked window leaves on the screen it waits under: its menu bar and a little more.
+const PARK_ROOM: f32 = 80.0;
+
+/// The size a window of `size` takes while it waits under `screen`, when it's too tall for it: macOS pulls a window
+/// taller than the screen it's moved to right up under that screen's menu bar, in plain sight (on John's desk a
+/// window from the monitor showed across the laptop below it, where the system Dock is), so it's made a little
+/// shorter than the screen first. `None` when it fits as it is.
+fn fit_under(size: egui::Vec2, screen: Rect) -> Option<egui::Vec2> {
+    let tallest = (screen.height() - PARK_ROOM).max(120.0).round();
+    (size.y > tallest).then(|| vec2(size.x, tallest))
 }
 
 /// The dock window's frame on a screen (AppKit's, from the bottom left): along its bottom, or down one of its sides
@@ -2887,6 +2915,18 @@ mod tests {
         assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, 0.0), Side::Bottom), Some(EDGE_DWELL));
         assert_eq!(reveal_dwell(monitor, &two, pos2(-30.0, -2.0), Side::Bottom), Some(EDGE_DWELL));
         assert_eq!(reveal_dwell(monitor, &two, pos2(1700.0, -10.0), Side::Bottom), None);
+    }
+
+    #[test]
+    fn a_window_taller_than_the_screen_it_parks_under_is_made_shorter_first() {
+        // The monitor is main and the laptop sits below it, with the system Dock: a 1920 x 1001 window from the
+        // monitor parks under the laptop, which is only 956 tall.
+        let laptop = Rect::from_min_size(pos2(0.0, 1080.0), vec2(1470.0, 956.0));
+        assert_eq!(fit_under(vec2(1920.0, 1001.0), laptop), Some(vec2(1920.0, 876.0)));
+        assert_eq!(fit_under(vec2(1141.0, 700.0), laptop), None, "one that fits stays as it is");
+        assert_eq!(fit_under(vec2(800.0, 876.0), laptop), None);
+        let tiny = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 150.0));
+        assert_eq!(fit_under(vec2(300.0, 400.0), tiny), Some(vec2(300.0, 120.0)), "never squashed flat");
     }
 
     #[test]
