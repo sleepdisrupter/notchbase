@@ -124,3 +124,24 @@ fn nothing_found_says_so() {
     assert!(!drawn(&rig, tile("Popups")) && !drawn(&rig, Id::new(("notchbase.settings.chip", "Notch"))));
     assert!(drawn(&rig, Id::new(("notchbase.settings.chip", "All"))));
 }
+
+#[test]
+fn every_group_found_gets_a_chip() {
+    let rig = Rig::new();
+    for n in [island(), notch()] {
+        let mut n = opened(&rig, n);
+        press(&rig, &mut n, Id::new(SEARCH));
+        typed(&rig, &mut n, vec![Event::Text("e".into())]);
+        let field = rig.ctx.read_response(Id::new(SEARCH)).expect("the field is drawn").rect;
+        let groups = ["All", "Popups", "Notch", "Windows", "Find", "Assistant", "Tools", "notchbase"];
+        for title in groups {
+            let chip = rig.ctx.read_response(Id::new(("notchbase.settings.chip", title)));
+            let chip = chip.unwrap_or_else(|| panic!("{title} has a chip")).rect;
+            assert!(chip.left() >= field.left() && chip.right() <= field.right(), "{title} fits the page");
+        }
+        let last = at(&rig, Id::new(("notchbase.settings.chip", "notchbase")));
+        assert!(last.y > at(&rig, Id::new(("notchbase.settings.chip", "All"))).y, "the chips go on a second line");
+        press(&rig, &mut n, Id::new(("notchbase.settings.chip", "notchbase")));
+        assert!(!drawn(&rig, Id::new("notchbase.settings.displays")), "the last chip picks its group too");
+    }
+}

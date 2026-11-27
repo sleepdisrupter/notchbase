@@ -1,7 +1,7 @@
 //! The Settings home: a search field over a grid of tiles, one per group. Typing turns the grid into the settings
 //! that match, with chips to narrow them to one group.
 
-use egui::{Align2, Id, Rect, Sense, Stroke, Vec2, pos2, vec2};
+use egui::{Align2, Id, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
 
 use super::editing::Editing;
 use super::group::Group;
@@ -10,6 +10,7 @@ use super::rows::{INSET, INTERACTIVE_FROM, ROW_H, Row, card, paint_lines};
 use super::search::{self, Found, Search, Spot};
 use crate::bridge::{Action, PanelData};
 use crate::pages::PageCtx;
+use crate::ui::canvas::Canvas;
 use crate::ui::color::{self, INK, label, secondary_label, white};
 use crate::ui::field::bare::{Bare, bare};
 use crate::ui::field::{self, Edit};
@@ -51,10 +52,11 @@ pub(super) enum Go {
     Went(Went),
 }
 
-pub(super) fn height(search: &Search, data: &PanelData) -> f32 {
+pub(super) fn height(search: &Search, data: &PanelData, width: f32, canvas: &Canvas) -> f32 {
     let below = if search.is_on() {
-        let shown = shown(&search::find(&search.query, data), search.only).len();
-        CHIP_H + BELOW_FIELD + shown.max(1) as f32 * ROW_H
+        let found = search::find(&search.query, data);
+        let chips = chips_height(&laid_chips(canvas, &found, pos2(0.0, 0.0), width));
+        chips + BELOW_FIELD + shown(&found, search.only).len().max(1) as f32 * ROW_H
     } else {
         grid_height(cells(Group::tiles().len()))
     };
@@ -232,8 +234,7 @@ fn results(
     actions: &mut Vec<Action>,
 ) -> Option<Went> {
     let found = search::find(&search.query, data);
-    chips(ctx, top, &found, search, live);
-    let top = top + CHIP_H + BELOW_FIELD;
+    let top = top + chips(ctx, top, &found, search, live) + BELOW_FIELD;
     let shown = shown(&found, search.only);
     if shown.is_empty() {
         let rect = card(ctx, top, 1)[0];
@@ -251,43 +252,69 @@ fn results(
     went
 }
 
-/// "All" and then each group with something found, as far as they fit. A chip picks its group, again lets it go.
-fn chips(ctx: &mut PageCtx<'_>, top: f32, found: &[Found], search: &mut Search, live: bool) {
-    let mut chips = vec![(None, Glyph::Search, "All", found.len())];
+struct Chip {
+    group: Option<Group>,
+    glyph: Glyph,
+    text: String,
+    title: &'static str,
+}
+
+/// "All" and then each group with something found, as many to a line as fit and the rest on the lines under them, so
+/// every group can be picked.
+fn laid_chips(canvas: &Canvas, found: &[Found], at: Pos2, width: f32) -> Vec<(Chip, Rect)> {
+    let mut chips =
+        vec![Chip { group: None, glyph: Glyph::Search, text: format!("All {}", found.len()), title: "All" }];
     for group in Group::tiles() {
         let count = found.iter().filter(|found| found.group == group).count();
         if count > 0 {
-            chips.push((Some(group), group.glyph(), group.title(), count));
+            let text = format!("{} {count}", group.title());
+            chips.push(Chip { group: Some(group), glyph: group.glyph(), text, title: group.title() });
         }
     }
-    let mut left = ctx.rect.left();
-    for (group, glyph_, title, count) in chips {
-        let text = format!("{title} {count}");
-        let width = ctx.canvas.text_width(&text, font::callout()) + 2.0 * CHIP_PAD + CHIP_GLYPH + 5.0;
-        if left + width > ctx.rect.right() {
-            break;
-        }
-        let rect = Rect::from_min_size(pos2(left, top), vec2(width, CHIP_H));
-        let id = Id::new(("notchbase.settings.chip", title));
-        let response = ctx.ui.interact(rect, id, if live { Sense::click() } else { Sense::hover() });
+    let mut cursor = at;
+    chips
+        .into_iter()
+        .map(|chip| {
+            let size = vec2(canvas.text_width(&chip.text, font::callout()) + 2.0 * CHIP_PAD + CHIP_GLYPH + 5.0, CHIP_H);
+            if cursor.x > at.x && cursor.x + size.x > at.x + width {
+                cursor = pos2(at.x, cursor.y + CHIP_H + CHIP_GAP);
+            }
+            let rect = Rect::from_min_size(cursor, size);
+            cursor.x = rect.right() + CHIP_GAP;
+            (chip, rect)
+        })
+        .collect()
+}
+
+fn chips_height(chips: &[(Chip, Rect)]) -> f32 {
+    let top = chips.first().map_or(0.0, |(_, rect)| rect.top());
+    chips.iter().map(|(_, rect)| rect.bottom()).fold(top + CHIP_H, f32::max) - top
+}
+
+/// Paints the chips and returns how tall they are. A chip picks its group, again lets it go.
+fn chips(ctx: &mut PageCtx<'_>, top: f32, found: &[Found], search: &mut Search, live: bool) -> f32 {
+    let laid = laid_chips(ctx.canvas, found, pos2(ctx.rect.left(), top), ctx.rect.width());
+    for (chip, rect) in &laid {
+        let id = Id::new(("notchbase.settings.chip", chip.title));
+        let response = ctx.ui.interact(*rect, id, if live { Sense::click() } else { Sense::hover() });
         let hover = controls::animate(ctx.ui, id.with("hover"), live && response.hovered());
-        let picked = search.only == group;
+        let picked = search.only == chip.group;
         let ink = if picked {
-            ctx.canvas.rect(rect, CHIP_H * 0.5, white(CHIP_PICKED));
+            ctx.canvas.rect(*rect, CHIP_H * 0.5, white(CHIP_PICKED));
             INK
         } else {
-            glass::paint(ctx.canvas, rect, CHIP_H * 0.5, Glass::lerp(Glass::CONTROL, Glass::TILE_HOVER, hover));
+            glass::paint(ctx.canvas, *rect, CHIP_H * 0.5, Glass::lerp(Glass::CONTROL, Glass::TILE_HOVER, hover));
             label()
         };
         let glyph_at = pos2(rect.left() + CHIP_PAD + CHIP_GLYPH * 0.5 - 2.0, rect.center().y);
-        glyph::paint(ctx.canvas, glyph_, glyph_at, CHIP_GLYPH, ink);
+        glyph::paint(ctx.canvas, chip.glyph, glyph_at, CHIP_GLYPH, ink);
         let text_at = pos2(glyph_at.x + CHIP_GLYPH * 0.5 + 5.0, rect.center().y);
-        ctx.canvas.text(text_at, Align2::LEFT_CENTER, text, font::callout(), ink);
+        ctx.canvas.text(text_at, Align2::LEFT_CENTER, chip.text.clone(), font::callout(), ink);
         if live && response.clicked() {
-            search.only = if picked { None } else { group };
+            search.only = if picked { None } else { chip.group };
         }
-        left = rect.right() + CHIP_GAP;
     }
+    chips_height(&laid)
 }
 
 #[cfg(test)]

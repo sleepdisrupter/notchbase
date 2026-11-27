@@ -81,7 +81,7 @@ impl Pages {
             (Page::Sound, self.mixer.height(data.mixer, width)),
             (Page::Stats, self.stats.height(data.stats, data.assistant)),
             (Page::Agents, self.agents.height(data.agents)),
-            (Page::Settings, self.settings.height(data)),
+            (Page::Settings, self.settings.height(data, width, measure.canvas)),
             (Page::Notifications, self.notifications.height(data)),
             (Page::Find, self.find.height(data)),
             (

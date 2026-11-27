@@ -92,9 +92,9 @@ pub struct SettingsPage {
 }
 
 impl SettingsPage {
-    pub fn height(&self, data: &PanelData) -> f32 {
+    pub fn height(&self, data: &PanelData, width: f32, canvas: &Canvas) -> f32 {
         match &self.view {
-            View::Home => home::height(&self.search, data),
+            View::Home => home::height(&self.search, data, width, canvas),
             View::Group(group) => group::height(*group, data),
             View::Tool(id) => self.tool_rows.height(data.tools.iter().find(|tool| tool.id == *id)),
         }
