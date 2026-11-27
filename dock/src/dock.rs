@@ -541,8 +541,16 @@ impl Dock {
         self.covering() && !self.away.is_settled()
     }
 
+    /// Covering the system Dock as it rises in Mission Control: only a dock along the bottom, where the system Dock
+    /// shows. One on a side has nothing to cover and keeps its look instead (see `staying`).
     fn covering(&self) -> bool {
-        self.config.mission_control == crate::config::MissionControl::Cover
+        self.config.mission_control == crate::config::MissionControl::Cover && !self.side.vertical()
+    }
+
+    /// A dock on a side, set to stay over Mission Control: it stays as it is, never darkening, the blurred desktop
+    /// picture standing in for the blur the system drops there. Without that picture yet it fades, as with Fade.
+    fn staying(&self) -> bool {
+        self.config.mission_control == crate::config::MissionControl::Cover && self.side.vertical() && self.fake_ready
     }
 
     fn bottom(&self) -> f32 {
@@ -550,6 +558,9 @@ impl Dock {
         let tuck = self.tucked.value.max(0.0) * (self.body_height() + BOTTOM_GAP + 16.0);
         if self.covering() {
             return self.size.y - BOTTOM_GAP + self.cover_ease() * COVER_SETTLE + tuck;
+        }
+        if self.staying() {
+            return self.size.y - BOTTOM_GAP + tuck;
         }
         self.size.y - BOTTOM_GAP + self.away.value.clamp(0.0, 1.0) * AWAY_SETTLE + tuck
     }
@@ -586,7 +597,7 @@ impl Dock {
             self.press = None;
             self.drag = None;
         }
-        let spring = if self.covering() { COVER } else { AWAY };
+        let spring = if self.covering() || self.staying() { COVER } else { AWAY };
         self.away.animate_to(if away { 1.0 } else { 0.0 }, spring);
     }
 
@@ -617,7 +628,7 @@ impl Dock {
 
     /// How opaque the dock is as it fades for Mission Control.
     pub fn opacity(&self) -> f32 {
-        if self.covering() {
+        if self.covering() || self.staying() {
             return 1.0;
         }
         1.0 - smoothstep(0.0, 0.85, self.away.value)
@@ -643,6 +654,9 @@ impl Dock {
     /// How much the blurred desktop picture stands in for the live blur: it rides the cover move in and out, so the
     /// glass looks just as it did and the system Dock under it never shows through.
     pub fn fake_glass(&self) -> f32 {
+        if self.staying() {
+            return 1.0 - (1.0 - self.away.value.clamp(0.0, 1.0)).powi(3);
+        }
         if self.fake_ready { self.cover_ease() } else { 0.0 }
     }
 
@@ -3441,6 +3455,39 @@ mod tests {
             } else {
                 assert!(d.glass_band().tint[0] > rest[0], "without a picture it darkens, as before");
                 assert_eq!(d.fake_glass(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_dock_on_a_side_never_turns_black_in_mission_control() {
+        for side in [Side::Left, Side::Right] {
+            for ready in [true, false] {
+                let mut d = dock();
+                d.set_window(side, vec2(900.0, 956.0));
+                d.fake_ready = ready;
+                let (rest, bottom) = (d.glass_band().tint, d.bottom());
+                d.set_away(true);
+                for _ in 0..120 {
+                    d.step(DT);
+                }
+                assert_eq!(d.glass_band().tint, rest, "{side:?}: never darkens");
+                assert_eq!(d.cover_progress(), 0.0, "{side:?}: no cover move, nothing to cover");
+                if ready {
+                    assert_eq!(d.bottom(), bottom, "{side:?}: stays put");
+                    assert!((d.opacity() - 1.0).abs() < 1e-3, "{side:?}: stays shown");
+                    assert!((d.fake_glass() - 1.0).abs() < 1e-3, "{side:?}: the picture stands in for the blur");
+                } else {
+                    assert!(d.opacity() < 0.01, "{side:?}: without a picture it fades out instead: {}", d.opacity());
+                }
+                d.set_away(false);
+                for _ in 0..120 {
+                    d.step(DT);
+                }
+                assert!(
+                    (d.opacity() - 1.0).abs() < 1e-3 && d.fake_glass() < 1e-3,
+                    "{side:?}: and comes back as it was"
+                );
             }
         }
     }
